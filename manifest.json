@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.cristosolar.waassistant",
+  "name": "WhatsApp Assistant",
+  "version": "0.1.0",
+  "author": "CristoSolar",
+  "license": "MIT",
+  "description": "Queues incoming WhatsApp messages and drafts replies. You give the idea in one line, Claude writes the message, and nothing is sent until you confirm. The bridge runs in Docker on loopback only.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "WhatsApp Assistant",
+    "description": "Pending WhatsApp replies; click to open the queue.",
+    "category": "Communication",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}
