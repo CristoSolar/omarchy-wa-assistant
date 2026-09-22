@@ -152,12 +152,19 @@ docker logs omarchy-wa-sink
 ```
 
 Every group message it drops because the group isn't in `groups_enabled`
-yet prints one line naming the JID and the group's display name, for
-example:
+yet prints one line, for example:
 
 ```
-skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' name='Familia'
+skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' sender='Familia'
 ```
+
+The JID is what you copy into `groups_enabled` — that part is stable.
+`sender` is **not** the group's name or subject; there's no such field
+available here. It's the display name of whoever happened to post the
+message that triggered the log line, so it will change from one message to
+the next as different people post. Use it only as a rough clue about which
+group you're looking at, never as a stable title, and rely on the JID to
+tell two groups apart.
 
 It logs each JID only once per process, not once per message, so a busy
 group won't flood the log — if you don't see the line, send another

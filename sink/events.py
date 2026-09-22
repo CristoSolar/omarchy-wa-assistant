@@ -73,4 +73,8 @@ def describe_skipped_group(event: dict, groups_enabled) -> dict | None:
     if jid in (groups_enabled or []):
         return None
 
-    return {"jid": jid, "name": info.get("PushName") or jid}
+    # PushName is the display name of whoever posted this particular
+    # message (same field extract() reads as push_name for the sender),
+    # not the group's subject/title — there is no group-subject field
+    # here to read. Key it "sender" so callers don't mistake it for one.
+    return {"jid": jid, "sender": info.get("PushName") or jid}

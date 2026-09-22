@@ -161,11 +161,19 @@ docker logs omarchy-wa-sink
 ```
 
 Cada mensaje de grupo que descarta por no estar en `groups_enabled` todavía
-imprime una línea con el JID y el nombre del grupo, por ejemplo:
+imprime una línea, por ejemplo:
 
 ```
-skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' name='Familia'
+skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' sender='Familia'
 ```
+
+El JID es lo que copiás a `groups_enabled` — esa parte es estable.
+`sender` **no** es el nombre ni el asunto del grupo; no hay ningún campo
+así disponible acá. Es el nombre visible de quien haya mandado el mensaje
+que disparó esa línea, así que va a cambiar de un mensaje a otro según
+quién escriba. Usalo solo como pista aproximada de qué grupo es, nunca
+como un título estable, y confiá en el JID para distinguir un grupo de
+otro.
 
 Registra cada JID una sola vez por proceso, no por mensaje, así que un
 grupo con mucho tráfico no inunda el log — si no ves la línea, esperá otro

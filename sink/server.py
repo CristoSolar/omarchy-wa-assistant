@@ -46,7 +46,7 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
         if skipped and skipped["jid"] not in _logged_group_jids:
             _logged_group_jids.add(skipped["jid"])
             print(f"skipping messages from group not in groups_enabled: "
-                 f"jid={skipped['jid']!r} name={skipped['name']!r}",
+                 f"jid={skipped['jid']!r} sender={skipped['sender']!r}",
                  file=sys.stderr, flush=True)
         return False
     store.append_context(data_dir, entry["jid"],

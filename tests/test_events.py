@@ -74,10 +74,10 @@ def test_missing_push_name_falls_back_to_the_jid():
     assert out["push_name"] == "56911111111@s.whatsapp.net"
 
 
-def test_describe_skipped_group_reports_jid_and_name_for_unenabled_group():
+def test_describe_skipped_group_reports_jid_and_sender_for_unenabled_group():
     ev = _ev(Chat="123@g.us", IsGroup=True, PushName="Familia")
     out = describe_skipped_group(ev, [])
-    assert out == {"jid": "123@g.us", "name": "Familia"}
+    assert out == {"jid": "123@g.us", "sender": "Familia"}
 
 
 def test_describe_skipped_group_is_none_for_an_enabled_group():
