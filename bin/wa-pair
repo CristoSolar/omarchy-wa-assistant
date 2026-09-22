@@ -70,7 +70,22 @@ for _ in $(seq 1 40); do
     # loggedIn flips at the END of the pairing handshake, before whatsmeow
     # starts streaming history-sync blobs. Wait for rows to appear and then
     # stop growing; saw_rows tells us whether any ever appeared at all.
-    read -r PRE_PURGE SETTLED SAW_ROWS < <(wait_for_history)
+    # `read < <(...)` reports the READ's status, not the subshell's, so a
+    # crashing wait_for_history would leave these empty and fall into the
+    # "no rows were ever observed" branch — reporting a crash to the user
+    # as uncertainty, with exit 0. Capture first, check, then split.
+    if ! WAIT_OUT=$(wait_for_history); then
+      echo "error: could not read wuzapi's history table while waiting for the" >&2
+      echo "  history dump. NOTHING was purged and nothing was verified." >&2
+      echo "  Check 'docker logs omarchy-wa-sink' and the database at:" >&2
+      echo "    $DB" >&2
+      exit 1
+    fi
+    read -r PRE_PURGE SETTLED SAW_ROWS <<<"$WAIT_OUT"
+    if [[ -z "${SAW_ROWS:-}" ]]; then
+      echo "error: unexpected output from the history wait: ${WAIT_OUT@Q}" >&2
+      exit 1
+    fi
 
     docker restart omarchy-wa-sink >/dev/null
 
@@ -79,12 +94,19 @@ for _ in $(seq 1 40); do
     # that is too short fires the warning on the happy path — which trains
     # the user to ignore the one warning that protects their history. Poll
     # instead, with a bound.
-    POST_PURGE=$(count_history)
+    if ! POST_PURGE=$(count_history); then
+      echo "error: could not re-count wuzapi's history table after the purge." >&2
+      exit 1
+    fi
     for _ in $(seq 1 45); do
       [[ "$POST_PURGE" == "0" ]] && break
       sleep 2
-      POST_PURGE=$(count_history)
+      POST_PURGE=$(count_history) || POST_PURGE=""
     done
+    if [[ -z "$POST_PURGE" ]]; then
+      echo "error: could not re-count wuzapi's history table after the purge." >&2
+      exit 1
+    fi
 
     if [[ "$SAW_ROWS" != "True" ]]; then
       # Honest uncertainty. We cannot tell "this account has no history"

@@ -129,5 +129,16 @@ def test_a_new_message_does_reset_a_failed_entry_to_pending():
         assert q[0]["status"] == "pending"
 
 
+def test_a_new_message_does_not_clear_an_interrupted_send():
+    # "sending" left behind by a wa-reply that was killed mid-POST is the
+    # same ambiguity as "unknown"; an inbound message must not clear it.
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry())
+        store.set_status(d, _entry()["id"], "sending")
+        q = store.upsert_queue(d, _entry(text="seguis ahi?"))
+        assert q[0]["text"] == "seguis ahi?"
+        assert q[0]["status"] == "sending"
+
+
 if __name__ == "__main__":
     run(dict(globals()))

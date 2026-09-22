@@ -200,7 +200,9 @@ Every send goes through `bin/wa-reply`, and by default it does nothing but
 report what it *would* have sent. No request ever reaches wuzapi, and
 nothing in the queue changes: the panel shows "DRY RUN — no se envió nada.
 La entrada sigue pendiente en la cola.", the entry stays open, and its
-status stays `pending`, so you can keep iterating on the draft. This is the
+stored status is left exactly as it was — including an `unknown` or
+`sending` guard, which a dry run must never clear — so you can keep
+iterating on the draft. This is the
 tool's default state on every fresh install, not something you have to
 remember to enable.
 
@@ -216,12 +218,19 @@ harmless drafting tool into something that messages real people on your
 behalf, on a bridge that can get your number banned. Flip it only once
 you're comfortable with both of those facts.
 
-## The "unknown" send outcome
+## Sends whose outcome nobody knows
 
-If a send times out or the connection drops mid-request, `wa-reply` cannot
-tell whether wuzapi received it before the failure. Rather than guessing,
-it records `status: "unknown"` on that entry in `queue.json` and the panel
-shows:
+Two things can leave an entry in a state where the message may already have
+reached WhatsApp and nothing recorded the answer:
+
+- **`unknown`** — the POST timed out or the connection dropped mid-request.
+- **`sending`** — `wa-reply` was killed between starting the POST and
+  learning its result: a bar restart, a logout, an OOM kill. The request
+  can take up to 20 seconds, so this window is real.
+
+Both get the same treatment, because both have the same consequence.
+`wa-reply` records the status on that entry in `queue.json` and the panel
+shows (wording adjusted for which of the two it was):
 
 > sin confirmación: puede que el mensaje ya se haya enviado — revisá
 > WhatsApp antes de reintentar
@@ -229,17 +238,20 @@ shows:
 That record is durable, and it is what both halves of the protection read:
 
 - `bin/wa-reply send` **refuses** an entry whose stored status is
-  `unknown` and returns `{"ok": false, "needs_ack": true, ...}` unless it
-  is called with `--acknowledged`.
-- The panel marks the entry in the queue list itself ("⚠ sin confirmar"),
-  not just once you open it, and keeps **Enviar** disabled until you press
-  *"Revisé WhatsApp, quiero reenviar"*. Pressing that is what passes
-  `--acknowledged`.
+  `unknown` or `sending` and returns
+  `{"ok": false, "needs_ack": true, "status": "...", ...}` unless it is
+  called with `--acknowledged`.
+- The panel marks the entry in the queue list itself ("⚠ sin confirmar" or
+  "⚠ envío interrumpido"), not just once you open it, and keeps **Enviar**
+  disabled until you press *"Revisé WhatsApp, quiero reenviar"*. Pressing
+  that is what passes `--acknowledged`.
+- A new incoming message in the same chat does **not** clear either status.
 
-Closing the popup, restarting the bar, or letting the queue refresh does
-**not** clear the block — the warning is recomputed from what is on disk
-every time, so it cannot be lost by reopening the panel. Check WhatsApp
-yourself to see whether the message went out before you acknowledge.
+Closing the popup, restarting the bar, letting the queue refresh, or doing
+a dry run does **not** clear the block — the warning is recomputed from
+what is on disk every time, so it cannot be lost by reopening the panel or
+by pressing Enviar while dry-run is still on. Check WhatsApp yourself to
+see whether the message went out before you acknowledge.
 
 ## A message that arrives while you're drafting
 

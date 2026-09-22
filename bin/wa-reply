@@ -28,6 +28,24 @@ AGENT = Path(__file__).resolve().parents[1] / "agents" / "respuesta.md"
 FENCE = re.compile(r"```[^\n]*\n(.*?)\n?```", re.S)
 
 
+# Statuses whose entry may ALREADY have reached the recipient, and which
+# therefore must not be re-sent without a human saying they checked.
+#   unknown — the POST timed out or the connection dropped mid-request.
+#   sending — wa-reply was killed between writing this and finishing the
+#             POST (a bar restart, a logout, an OOM kill). The request may
+#             have completed on wuzapi's side; nothing recorded the answer.
+UNCONFIRMED_STATUSES = ("unknown", "sending")
+
+NEEDS_ACK_MESSAGE = {
+    "unknown": ("este envío quedó sin confirmación: el mensaje puede haberse "
+                "enviado ya. Revisá WhatsApp y confirmá antes de reintentar "
+                "(--acknowledged)."),
+    "sending": ("un envío anterior de esta entrada quedó interrumpido a mitad "
+                "de camino: el mensaje puede haberse enviado ya. Revisá "
+                "WhatsApp y confirmá antes de reintentar (--acknowledged)."),
+}
+
+
 class SendOutcomeUnknown(Exception):
     """The request may or may not have reached wuzapi.
 
@@ -186,17 +204,18 @@ def cmd_send(args):
                          ensure_ascii=False))
         return
 
-    # The durable record is authoritative. An entry left at "unknown" by an
-    # earlier send may ALREADY have reached the recipient; the QML guard
-    # that used to be the only thing standing here is volatile and a bar
-    # restart clears it. Refuse until the caller says, explicitly, that the
-    # human checked WhatsApp.
-    if entry.get("status") == "unknown" and not getattr(args, "acknowledged", False):
+    # The durable record is authoritative. An entry left at "unknown" or
+    # stranded at "sending" may ALREADY have reached the recipient; the QML
+    # guard that used to be the only thing standing here is volatile and a
+    # bar restart clears it. Refuse until the caller says, explicitly, that
+    # the human checked WhatsApp.
+    status_at_start = entry.get("status")
+    if (status_at_start in UNCONFIRMED_STATUSES
+            and not getattr(args, "acknowledged", False)):
         print(json.dumps({
             "ok": False, "needs_ack": True,
-            "error": ("este envío quedó sin confirmación: el mensaje puede haberse "
-                      "enviado ya. Revisá WhatsApp y confirmá antes de reintentar "
-                      "(--acknowledged)."),
+            "status": status_at_start,
+            "error": NEEDS_ACK_MESSAGE[status_at_start],
         }, ensure_ascii=False))
         return
 
@@ -209,9 +228,12 @@ def cmd_send(args):
     try:
         result = send(entry["jid"], args.text)
         if _is_dry_run(result):
-            # A dry run sent nothing, so it must change nothing: the entry
-            # stays in the queue, back at "pending", exactly as it was.
-            store.set_status(d, entry["id"], "pending")
+            # A dry run sent nothing, so it must change nothing — including
+            # the guard. Writing a literal "pending" here erased a stored
+            # "unknown"/"sending" and permanently dropped the double-send
+            # protection for an entry nothing was ever sent for. Put back
+            # exactly the status the entry had.
+            store.set_status(d, entry["id"], status_at_start)
             print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
         elif _is_confirmed_sent(result):
             fresh = _entry(d, entry["id"])

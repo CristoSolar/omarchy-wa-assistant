@@ -33,7 +33,8 @@ PopupWindow {
     // time. `wa-reply send` refuses such an entry too, so the two halves of
     // the defence agree.
     readonly property bool needsAck: panel.current !== null
-                                     && panel.current.status === "unknown"
+                                     && (panel.current.status === "unknown"
+                                         || panel.current.status === "sending")
     // The user's deliberate acknowledgement for the current selection. It
     // is intentionally volatile — reselecting, reopening or restarting
     // drops it, and `needsAck` comes straight back from the stored status.
@@ -155,8 +156,13 @@ PopupWindow {
                 radius: 4
                 // An entry whose last send outcome is unknown must be
                 // visible AS SUCH in the list, not only once it is opened.
-                border.color: row.modelData.status === "unknown" ? "#e06c75" : "transparent"
-                border.width: row.modelData.status === "unknown" ? 1 : 0
+                // "sending" is an entry whose wa-reply was killed mid-POST:
+                // the same ambiguity as "unknown", so the same marker.
+                border.color: (row.modelData.status === "unknown"
+                               || row.modelData.status === "sending")
+                              ? "#e06c75" : "transparent"
+                border.width: (row.modelData.status === "unknown"
+                               || row.modelData.status === "sending") ? 1 : 0
                 ColumnLayout {
                     anchors.fill: parent; anchors.margins: 6; spacing: 2
                     RowLayout {
@@ -169,7 +175,9 @@ PopupWindow {
                         }
                         Text {
                             visible: row.modelData.status === "unknown"
-                            text: "⚠ sin confirmar"
+                                     || row.modelData.status === "sending"
+                            text: row.modelData.status === "sending"
+                                  ? "⚠ envío interrumpido" : "⚠ sin confirmar"
                             color: "#e06c75"; font.pixelSize: 11
                         }
                         Text {
@@ -217,10 +225,14 @@ PopupWindow {
                     anchors.margins: 6
                     spacing: 6
                     Text {
-                        text: "⚠ El envío anterior quedó sin confirmación: puede que este "
-                              + "mensaje YA se haya enviado. Revisá WhatsApp antes de "
-                              + "reintentar — si lo reenviás sin mirar, la persona puede "
-                              + "recibirlo dos veces."
+                        text: (panel.current && panel.current.status === "sending"
+                               ? "⚠ Un envío anterior de esta entrada quedó interrumpido "
+                                 + "a mitad de camino (se cerró wa-reply antes de saber "
+                                 + "el resultado): "
+                               : "⚠ El envío anterior quedó sin confirmación: ")
+                              + "puede que este mensaje YA se haya enviado. Revisá "
+                              + "WhatsApp antes de reintentar — si lo reenviás sin "
+                              + "mirar, la persona puede recibirlo dos veces."
                         color: "#e6e6e6"; font.pixelSize: 11
                         wrapMode: Text.Wrap; Layout.fillWidth: true
                     }

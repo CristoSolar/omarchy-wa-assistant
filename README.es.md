@@ -209,7 +209,9 @@ Todo envío pasa por `bin/wa-reply`, y por defecto no hace nada más que
 reportar lo que *habría* enviado. Ninguna petición llega a wuzapi y nada
 cambia en la cola: el panel muestra "DRY RUN — no se envió nada. La
 entrada sigue pendiente en la cola.", la entrada queda abierta y su
-estado sigue siendo `pending`, así que podés seguir iterando el borrador.
+estado guardado queda tal cual estaba — incluido un `unknown` o un
+`sending`, que un dry run nunca debe borrar — así que podés seguir
+iterando el borrador.
 Este es el estado por defecto de la herramienta en cada instalación nueva,
 no algo que haya que acordarse de activar.
 
@@ -225,12 +227,20 @@ herramienta de redacción inofensiva en algo que le manda mensajes a
 personas reales en tu nombre, sobre un puente que puede hacer que te baneen
 el número. Activala solo cuando estés cómodo con ambos hechos.
 
-## El resultado de envío "unknown"
+## Envíos cuyo resultado nadie conoce
 
-Si un envío se cae por timeout o se corta la conexión a mitad de camino,
-`wa-reply` no puede saber si wuzapi lo recibió antes de la falla. En vez de
-adivinar, escribe `status: "unknown"` en esa entrada de `queue.json`, y el
-panel muestra:
+Hay dos cosas que pueden dejar una entrada en un estado donde el mensaje
+quizás ya llegó a WhatsApp y nadie registró la respuesta:
+
+- **`unknown`** — el POST se cayó por timeout o se cortó la conexión a
+  mitad de camino.
+- **`sending`** — `wa-reply` murió entre que empezó el POST y que supo el
+  resultado: un reinicio de la barra, un logout, un OOM kill. La petición
+  puede tardar hasta 20 segundos, así que esa ventana es real.
+
+Los dos reciben el mismo tratamiento, porque los dos tienen la misma
+consecuencia. `wa-reply` escribe el estado en esa entrada de `queue.json`,
+y el panel muestra (con la redacción ajustada a cuál de los dos fue):
 
 > sin confirmación: puede que el mensaje ya se haya enviado — revisá
 > WhatsApp antes de reintentar
@@ -239,17 +249,21 @@ Ese registro es durable, y es lo que leen las dos mitades de la
 protección:
 
 - `bin/wa-reply send` **se niega** a enviar una entrada cuyo estado
-  guardado sea `unknown` y devuelve `{"ok": false, "needs_ack": true, ...}`
-  salvo que se lo llame con `--acknowledged`.
-- El panel marca la entrada en la lista de la cola ("⚠ sin confirmar"), no
-  solo cuando la abrís, y deja **Enviar** deshabilitado hasta que apretés
-  *"Revisé WhatsApp, quiero reenviar"*. Apretar eso es lo que pasa
-  `--acknowledged`.
+  guardado sea `unknown` o `sending`, y devuelve
+  `{"ok": false, "needs_ack": true, "status": "...", ...}` salvo que se lo
+  llame con `--acknowledged`.
+- El panel marca la entrada en la lista de la cola ("⚠ sin confirmar" o
+  "⚠ envío interrumpido"), no solo cuando la abrís, y deja **Enviar**
+  deshabilitado hasta que apretés *"Revisé WhatsApp, quiero reenviar"*.
+  Apretar eso es lo que pasa `--acknowledged`.
+- Un mensaje nuevo en el mismo chat **no** limpia ninguno de los dos
+  estados.
 
-Cerrar el popup, reiniciar la barra o dejar que la cola se refresque **no**
-levanta el bloqueo: la advertencia se recalcula desde lo que hay en disco
-cada vez, así que no se pierde reabriendo el panel. Revisá WhatsApp vos
-mismo para ver si salió antes de confirmar.
+Cerrar el popup, reiniciar la barra, dejar que la cola se refresque o hacer
+un dry run **no** levanta el bloqueo: la advertencia se recalcula desde lo
+que hay en disco cada vez, así que no se pierde reabriendo el panel ni
+apretando Enviar con el dry-run todavía activo. Revisá WhatsApp vos mismo
+para ver si salió antes de confirmar.
 
 ## Un mensaje que llega mientras estás redactando
 

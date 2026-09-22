@@ -451,5 +451,90 @@ def test_claude_exiting_clean_with_no_output_reports_an_error():
         assert out["error"], "an empty draft must come with an explanation"
 
 
+def test_a_dry_run_does_not_erase_a_stored_unknown_guard():
+    # Restoring a literal "pending" after a dry run permanently dropped the
+    # C3 double-send guard for an entry nothing was ever sent for — and
+    # dry-run is the default mode.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        store.set_status(d, entry["id"], "unknown")
+        original, wa.send = wa.send, lambda jid, text: {"dry_run": True}
+        try:
+            out = _run_cmd_send(d, entry["id"], acknowledged=True)
+        finally:
+            wa.send = original
+        assert out == {"ok": True, "dry_run": True}
+        q = store.load_queue(d)
+        assert len(q) == 1
+        assert q[0]["status"] == "unknown", \
+            "a dry run sends nothing, so it must not clear the resend guard"
+
+        # And the guard is still enforced on the next unacknowledged attempt.
+        again = _run_cmd_send(d, entry["id"])
+        assert again["needs_ack"] is True
+
+
+def test_a_dry_run_leaves_a_failed_entry_failed():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        store.set_status(d, entry["id"], "failed")
+        original, wa.send = wa.send, lambda jid, text: {"dry_run": True}
+        try:
+            _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert store.load_queue(d)[0]["status"] == "failed"
+
+
+def test_an_entry_stranded_at_sending_refuses_to_send_without_an_acknowledgement():
+    # wa-reply writes "sending" before a POST that can take 20 seconds. If
+    # it is killed mid-request (bar restart, logout), the entry stays there
+    # and the message may well have reached WhatsApp — the same ambiguity
+    # as "unknown", so the same guard.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        store.set_status(d, entry["id"], "sending")
+
+        called = []
+        original, wa.send = wa.send, lambda jid, text: called.append((jid, text))
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+
+        assert out["ok"] is False
+        assert out["needs_ack"] is True
+        assert out["status"] == "sending"
+        assert "interrumpido" in out["error"]
+        assert called == [], "a stranded 'sending' entry must not be re-sent blind"
+        assert store.load_queue(d)[0]["status"] == "sending"
+
+
+def test_an_entry_stranded_at_sending_sends_once_acknowledged():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        store.set_status(d, entry["id"], "sending")
+
+        called = []
+
+        def _ok(jid, text):
+            called.append((jid, text))
+            return {"data": {"Details": "Sent"}}
+
+        original, wa.send = wa.send, _ok
+        try:
+            out = _run_cmd_send(d, entry["id"], acknowledged=True)
+        finally:
+            wa.send = original
+
+        assert out == {"ok": True, "dry_run": False}
+        assert called == [(entry["jid"], "hola")]
+        assert store.load_queue(d) == []
+
+
 if __name__ == "__main__":
     run(dict(globals()))
