@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# bin/wa-pair — link a WhatsApp account by 8-digit code.
+# Pairing makes WhatsApp dump the account history into wuzapi's SQLite;
+# days_to_sync_history cannot prevent it, so we purge right afterwards.
+set -euo pipefail
+
+NUMBER="${1:?usage: wa-pair <number, international, no +>}"
+STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
+source "$STATE/secrets.env"
+API=http://127.0.0.1:8080
+
+curl -s -X POST "$API/admin/users" -H "Authorization: $WUZAPI_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"omarchy\",\"token\":\"$WA_TOKEN\",\"events\":\"Message\"}" >/dev/null || true
+
+curl -s -X POST "$API/session/connect" -H "token: $WA_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"Subscribe":["Message"],"Immediate":true}' >/dev/null
+sleep 3
+
+curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"webhookurl":"http://omarchy-wa-sink:8099","events":["Message"]}' >/dev/null
+
+CODE=$(curl -s -X POST "$API/session/pairphone" -H "token: $WA_TOKEN" \
+  -H "Content-Type: application/json" -d "{\"Phone\":\"$NUMBER\"}" \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['LinkingCode'])")
+
+echo "Linking code: $CODE"
+echo "WhatsApp > Linked devices > Link device > Link with phone number"
+
+for _ in $(seq 1 40); do
+  if curl -s "$API/session/status" -H "token: $WA_TOKEN" \
+     | grep -q '"loggedIn":true'; then
+    echo "linked."
+    docker restart omarchy-wa-sink >/dev/null
+    echo "sink restarted; history purged."
+    exit 0
+  fi
+  sleep 5
+done
+echo "timed out waiting for the link" >&2
+exit 1
