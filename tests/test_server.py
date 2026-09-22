@@ -1,7 +1,9 @@
-import json, sys, urllib.parse
+import io, json, sys, urllib.parse
+from contextlib import redirect_stderr
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
+import sink.server as server
 from sink.server import handle_payload, purge_or_warn
 from sink import store
 
@@ -44,6 +46,21 @@ def test_discarded_event_touches_nothing():
 def test_garbage_body_does_not_raise():
     with tmpdir() as d:
         assert handle_payload(b"<<<not json>>>", "application/json", d) is False
+
+
+def test_an_unenabled_group_jid_is_logged_only_once():
+    with tmpdir() as d:
+        server._logged_group_jids.clear()
+        ev = json.loads(json.dumps(EV))
+        ev["event"]["Info"]["IsGroup"] = True
+        ev["event"]["Info"]["Chat"] = "999@g.us"
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+        output = buf.getvalue()
+        assert output.count("999@g.us") == 1, \
+            "the same unenabled group JID must be logged only once per process"
 
 
 def test_a_corrupt_wuzapi_db_does_not_stop_the_sink_from_starting():

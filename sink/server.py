@@ -10,10 +10,15 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sink import store
-from sink.events import extract
+from sink.events import describe_skipped_group, extract
 from sink.purge import purge_history
 
 PORT = 8099
+
+# JIDs of not-yet-enabled groups already logged, so a busy group chat
+# doesn't flood the log with the same JID on every message. Process-lifetime
+# only — it does not need to survive a restart.
+_logged_group_jids = set()
 
 
 def _decode(raw: bytes, content_type: str):
@@ -34,8 +39,15 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     if event is None:
         return False
     config = store.load_config(data_dir)
-    entry = extract(event, config.get("groups_enabled", []))
+    groups_enabled = config.get("groups_enabled", [])
+    entry = extract(event, groups_enabled)
     if entry is None:
+        skipped = describe_skipped_group(event, groups_enabled)
+        if skipped and skipped["jid"] not in _logged_group_jids:
+            _logged_group_jids.add(skipped["jid"])
+            print(f"skipping messages from group not in groups_enabled: "
+                 f"jid={skipped['jid']!r} name={skipped['name']!r}",
+                 file=sys.stderr, flush=True)
         return False
     store.append_context(data_dir, entry["jid"],
                          {"from": entry["push_name"], "text": entry["text"],

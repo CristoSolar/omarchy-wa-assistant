@@ -51,3 +51,26 @@ def extract(event: dict, groups_enabled) -> dict | None:
         "text": _text_of(message),
         "ts": info.get("Timestamp", ""),
     }
+
+
+def describe_skipped_group(event: dict, groups_enabled) -> dict | None:
+    """Identify a group message dropped only because its JID isn't enabled.
+
+    Separate from `extract` on purpose: `extract` returns `None` for every
+    kind of discard (own message, no info, group not enabled, ...) and
+    callers that only see that `None` cannot tell them apart. This gives
+    the sink a way to answer "what is the JID of that group" without
+    changing `extract`'s contract or its tests.
+    """
+    info = (event or {}).get("event", {}).get("Info", {})
+    if not info or info.get("IsFromMe"):
+        return None
+
+    jid = info.get("Chat", "")
+    if not jid or not info.get("IsGroup"):
+        return None
+
+    if jid in (groups_enabled or []):
+        return None
+
+    return {"jid": jid, "name": info.get("PushName") or jid}

@@ -151,16 +151,25 @@ Los cambios se aplican al instante — el sink relee `config.json` en cada
 mensaje entrante, así que no hace falta reiniciar nada después de
 editarlo.
 
-En este MVP es un archivo que se edita a mano; no hay ningún comando que te
-liste los JID de tus grupos. El sink no registra el JID de los mensajes que
-descarta (que se descarte un mensaje de un grupo que todavía no habilitaste
-no es algo que trate como digno de loguear), así que si no tenés ya el
-JID, en este MVP no hay un camino fácil: hay que conseguirlo de wuzapi
-directamente, usando tu `WA_TOKEN` contra lo que sea que la API de wuzapi
-ofrezca para listar tus grupos (consultá la documentación de
-[asternic/wuzapi](https://github.com/asternic/wuzapi) — este proyecto no
-envuelve ni reexpone ese endpoint). Una vez que tengas el JID, agregalo al
-arreglo de arriba.
+Es un archivo que se edita a mano en este MVP, así que necesitás el JID del
+grupo antes de poder habilitarlo. Para conseguirlo: pedile a alguien que
+escriba en el grupo (o esperá el próximo mensaje ahí), y después revisá el
+log del sink:
+
+```sh
+docker logs omarchy-wa-sink
+```
+
+Cada mensaje de grupo que descarta por no estar en `groups_enabled` todavía
+imprime una línea con el JID y el nombre del grupo, por ejemplo:
+
+```
+skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' name='Familia'
+```
+
+Registra cada JID una sola vez por proceso, no por mensaje, así que un
+grupo con mucho tráfico no inunda el log — si no ves la línea, esperá otro
+mensaje. Copiá el JID al arreglo de arriba.
 
 ## Desactivar el dry-run
 

@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run
-from sink.events import extract
+from sink.events import describe_skipped_group, extract
 
 TS = "2026-09-22T16:00:00Z"
 
@@ -72,6 +72,26 @@ def test_unknown_message_shape_does_not_raise():
 def test_missing_push_name_falls_back_to_the_jid():
     out = extract(_ev(PushName=""), [])
     assert out["push_name"] == "56911111111@s.whatsapp.net"
+
+
+def test_describe_skipped_group_reports_jid_and_name_for_unenabled_group():
+    ev = _ev(Chat="123@g.us", IsGroup=True, PushName="Familia")
+    out = describe_skipped_group(ev, [])
+    assert out == {"jid": "123@g.us", "name": "Familia"}
+
+
+def test_describe_skipped_group_is_none_for_an_enabled_group():
+    ev = _ev(Chat="123@g.us", IsGroup=True)
+    assert describe_skipped_group(ev, ["123@g.us"]) is None
+
+
+def test_describe_skipped_group_is_none_for_a_direct_message():
+    assert describe_skipped_group(_ev(), []) is None
+
+
+def test_describe_skipped_group_is_none_for_the_users_own_group_message():
+    ev = _ev(Chat="123@g.us", IsGroup=True, IsFromMe=True)
+    assert describe_skipped_group(ev, []) is None
 
 
 if __name__ == "__main__":

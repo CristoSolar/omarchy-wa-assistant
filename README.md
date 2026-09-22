@@ -143,15 +143,25 @@ Group chats are ignored by default. To let one through, add its JID to
 Changes take effect immediately — the sink re-reads `config.json` on every
 incoming message, so there's no need to restart anything after editing it.
 
-This is a hand-edited file in this MVP; there is no command that lists
-group JIDs for you. The sink doesn't log the JIDs of messages it drops
-(dropping a message from a group you haven't enabled yet is not something
-it treats as noteworthy), so if you don't already have the JID, this MVP has
-no easy path to it: you'll need to get it from wuzapi itself, using your
-`WA_TOKEN` against whatever wuzapi's own API offers for listing your groups
-(see the [asternic/wuzapi](https://github.com/asternic/wuzapi) docs — this
-project doesn't wrap or re-expose that endpoint). Once you have the JID,
-add it to the array above.
+This is a hand-edited file in this MVP, so you need the group's JID before
+you can enable it. To find it: have someone post in the group (or wait for
+the next message there), then check the sink's log:
+
+```sh
+docker logs omarchy-wa-sink
+```
+
+Every group message it drops because the group isn't in `groups_enabled`
+yet prints one line naming the JID and the group's display name, for
+example:
+
+```
+skipping messages from group not in groups_enabled: jid='120363012345678901@g.us' name='Familia'
+```
+
+It logs each JID only once per process, not once per message, so a busy
+group won't flood the log — if you don't see the line, send another
+message. Copy the JID into the array above.
 
 ## Turning off dry-run
 
