@@ -110,5 +110,24 @@ def test_the_secrets_path_has_its_own_override():
                 os.environ["WA_SECRETS_FILE"] = previous_file
 
 
+def test_a_new_message_does_not_clear_an_unconfirmed_send():
+    # The "unknown" status is the durable half of the double-send guard.
+    # An incoming message must not unlock it from the outside.
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry())
+        store.set_status(d, _entry()["id"], "unknown")
+        q = store.upsert_queue(d, _entry(text="seguis ahi?"))
+        assert q[0]["text"] == "seguis ahi?"
+        assert q[0]["status"] == "unknown"
+
+
+def test_a_new_message_does_reset_a_failed_entry_to_pending():
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry())
+        store.set_status(d, _entry()["id"], "failed")
+        q = store.upsert_queue(d, _entry(text="seguis ahi?"))
+        assert q[0]["status"] == "pending"
+
+
 if __name__ == "__main__":
     run(dict(globals()))

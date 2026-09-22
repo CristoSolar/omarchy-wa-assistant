@@ -96,7 +96,12 @@ def upsert_queue(d, entry) -> list:
             existing["text"] = entry["text"]
             existing["ts"] = entry["ts"]
             existing["push_name"] = entry.get("push_name") or existing.get("push_name")
-            existing["status"] = "pending"
+            # A new inbound message does not resolve an unconfirmed send:
+            # the reply we may already have delivered is still unconfirmed,
+            # and clearing the status here would silently unlock the resend
+            # guard from the outside. Everything else goes back to pending.
+            if existing.get("status") != "unknown":
+                existing["status"] = "pending"
             return _save_queue(d, queue)
     queue.append(dict(entry))
     return _save_queue(d, queue)
