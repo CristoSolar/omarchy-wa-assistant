@@ -1,15 +1,39 @@
-import importlib.util, os, sys
+import importlib.util, io, json, os, sys
+from contextlib import redirect_stdout
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from tests.runner import run
+from tests.runner import run, tmpdir
+from sink import store
 
 # bin/wa-reply has no .py extension, so spec_from_file_location returns None.
 # Name the loader explicitly instead.
 _loader = SourceFileLoader("wa_reply", str(ROOT / "bin" / "wa-reply"))
 wa = importlib.util.module_from_spec(importlib.util.spec_from_loader("wa_reply", _loader))
 _loader.exec_module(wa)
+
+
+def _queue_entry(entry_id="1@s.whatsapp.net"):
+    return {"id": entry_id, "jid": entry_id, "push_name": "Ana", "text": "hola",
+            "count": 1, "ts": "2026-09-22T10:00:00", "status": "pending"}
+
+
+def _run_cmd_send(d, entry_id, text="hola"):
+    """Run cmd_send with WA_DATA_DIR pointed at d; return its one JSON line."""
+    previous_dir = os.environ.get("WA_DATA_DIR")
+    os.environ["WA_DATA_DIR"] = str(d)
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            wa.cmd_send(SimpleNamespace(id=entry_id, text=text))
+    finally:
+        if previous_dir is None:
+            os.environ.pop("WA_DATA_DIR", None)
+        else:
+            os.environ["WA_DATA_DIR"] = previous_dir
+    return json.loads(buf.getvalue())
 
 
 def test_fences_are_stripped_from_the_draft():
@@ -58,6 +82,124 @@ def test_dry_run_does_not_call_the_api():
             os.environ.pop("WA_DRY_RUN", None)
         else:
             os.environ["WA_DRY_RUN"] = previous
+
+
+def test_dry_run_is_the_default_when_the_env_var_is_entirely_absent():
+    # The panel's Process spawns this script with a bare environment: no
+    # WA_DRY_RUN key at all, not even "1". An implementation that read
+    # os.environ.get("WA_DRY_RUN", "0") would pass every other test here
+    # and then send for real on first real use.
+    called = []
+    original, wa._post = wa._post, lambda *a, **k: called.append(a)
+    previous = os.environ.pop("WA_DRY_RUN", None)
+    try:
+        assert "WA_DRY_RUN" not in os.environ
+        out = wa.send("56911111111@s.whatsapp.net", "hola")
+        assert out["dry_run"] is True
+        assert called == [], "a bare environment must still default to dry-run"
+    finally:
+        wa._post = original
+        if previous is not None:
+            os.environ["WA_DRY_RUN"] = previous
+
+
+def test_api_must_stay_on_loopback():
+    # secrets.env is read for WA_TOKEN; if it could also move WA_API, a
+    # compromised or misconfigured secrets file could redirect a real send
+    # to an attacker-controlled host. Refuse anything but 127.0.0.1.
+    original_api = wa.API
+    wa.API = "http://evil.example.com:8080"
+    try:
+        wa.send("56911111111@s.whatsapp.net", "hola")
+    except ValueError as exc:
+        assert "127.0.0.1" in str(exc)
+    else:
+        raise AssertionError("a non-loopback API must be refused")
+    finally:
+        wa.API = original_api
+
+
+def test_fenced_block_after_a_preamble_is_extracted():
+    # A real `claude -p` reply often wraps the fence in commentary; the
+    # backticks and the preamble must never reach the recipient.
+    raw = "Claro, aca va:\n```\nHola Ana\n```"
+    assert wa.clean_draft(raw) == "Hola Ana"
+
+
+def test_draft_with_no_fence_at_all_is_unchanged():
+    assert wa.clean_draft("Hola Ana, todo bien") == "Hola Ana, todo bien"
+
+
+def test_a_successful_send_removes_the_queue_entry_and_reports_ok():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        original, wa.send = wa.send, lambda jid, text: {"data": {"Details": "Sent"}}
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert out == {"ok": True, "dry_run": False}
+        assert store.load_queue(d) == [], "a confirmed send must clear the queue entry"
+
+
+def test_a_raised_send_leaves_the_entry_recoverable_as_failed():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+
+        def _boom(jid, text):
+            raise RuntimeError("wuzapi said no")
+
+        original, wa.send = wa.send, _boom
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert out["ok"] is False
+        q = store.load_queue(d)
+        assert len(q) == 1, "a failed send must never remove the entry"
+        assert q[0]["status"] == "failed"
+
+
+def test_an_unconfirmed_response_leaves_the_entry_recoverable_as_failed():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        # A response shape that proves nothing — including the AttributeError
+        # trap of a `data` key that is null rather than a dict.
+        original, wa.send = wa.send, lambda jid, text: {"data": None}
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert out["ok"] is False
+        q = store.load_queue(d)
+        assert len(q) == 1, "an unconfirmed send must never remove the entry"
+        assert q[0]["status"] == "failed"
+
+
+def test_a_timeout_leaves_the_entry_as_unknown_not_failed():
+    # The single most dangerous case: if the request timed out after wuzapi
+    # already accepted it, marking this "failed" invites a retry that sends
+    # the same message twice to a real person.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+
+        def _timeout(jid, text):
+            raise wa.SendOutcomeUnknown("timed out waiting for wuzapi")
+
+        original, wa.send = wa.send, _timeout
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert out == {"ok": False, "unknown": True,
+                       "error": "timed out waiting for wuzapi"}
+        q = store.load_queue(d)
+        assert len(q) == 1, "an unknown outcome must never remove the entry"
+        assert q[0]["status"] == "unknown"
 
 
 def test_secrets_file_supplies_the_token_when_the_env_lacks_it():

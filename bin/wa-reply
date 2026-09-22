@@ -10,8 +10,10 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -20,7 +22,20 @@ from sink import store  # noqa: E402
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 AGENT = Path(__file__).resolve().parents[1] / "agents" / "respuesta.md"
-FENCE = re.compile(r"^\s*```[^\n]*\n(.*?)\n?```\s*$", re.S)
+# Not anchored: a real `claude -p` reply often wraps the fenced block in a
+# preamble ("Claro, aca va:\n```\nHola\n```"), and the backticks must never
+# reach the recipient.
+FENCE = re.compile(r"```[^\n]*\n(.*?)\n?```", re.S)
+
+
+class SendOutcomeUnknown(Exception):
+    """The request may or may not have reached wuzapi.
+
+    Raised on a timeout or connection error, where the message could
+    already have been delivered. Never treat this the same as a definite
+    failure: a caller that reacts by resending risks a double-send to a
+    real person.
+    """
 
 
 def _load_secrets() -> None:
@@ -44,8 +59,9 @@ def _load_secrets() -> None:
 
 
 def clean_draft(raw: str) -> str:
-    m = FENCE.match(raw or "")
-    return (m.group(1) if m else (raw or "")).strip()
+    raw = raw or ""
+    m = FENCE.search(raw)
+    return (m.group(1) if m else raw).strip()
 
 
 def build_prompt(agent_text, context, idea, push_name) -> str:
@@ -63,8 +79,31 @@ def _post(url, payload, token):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "token": token})
-    with urllib.request.urlopen(req, timeout=20) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError:
+        # The server answered (with an error status): that is a definite
+        # outcome, not an unknown one.
+        raise
+    except (TimeoutError, socket.timeout, urllib.error.URLError,
+            ConnectionError) as exc:
+        raise SendOutcomeUnknown(str(exc)) from exc
+
+
+def _is_confirmed_sent(result) -> bool:
+    """True only for a response that proves the message went out.
+
+    Tolerates any shape wuzapi might return — including a `data` field that
+    is `null` instead of a dict — so a surprising response never crashes
+    the caller and strands the queue entry in status "sending".
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("dry_run"):
+        return True
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("Details") == "Sent"
 
 
 def send(jid: str, text: str) -> dict:
@@ -74,6 +113,9 @@ def send(jid: str, text: str) -> dict:
     if "@" not in (jid or ""):
         raise ValueError(
             "recipient must be a full JID with '@'; a bare number is ambiguous")
+    if not API.startswith("http://127.0.0.1:"):
+        raise ValueError(
+            f"refusing to send: WA_API must stay on 127.0.0.1, got {API!r}")
     _load_secrets()
     if os.environ.get("WA_DRY_RUN", "1") != "0":
         return {"dry_run": True, "jid": jid, "text": text}
@@ -88,7 +130,7 @@ def _entry(d, entry_id):
     for e in store.load_queue(d):
         if e["id"] == entry_id:
             return e
-    raise SystemExit(f"no queue entry with id {entry_id}")
+    return None
 
 
 def cmd_list(args):
@@ -98,6 +140,13 @@ def cmd_list(args):
 def cmd_draft(args):
     d = store.data_dir()
     entry = _entry(d, args.id)
+    if entry is None:
+        # A stale id is a normal race, not a bug: the panel holds a queue
+        # snapshot that a new message or a completed send can change
+        # between `list` and `draft`.
+        print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
+                         ensure_ascii=False))
+        return
     agent_text = AGENT.read_text() if AGENT.exists() else ""
     prompt = build_prompt(agent_text, store.load_context(d, entry["jid"]),
                           args.idea, entry["push_name"])
@@ -114,19 +163,33 @@ def cmd_draft(args):
 def cmd_send(args):
     d = store.data_dir()
     entry = _entry(d, args.id)
+    if entry is None:
+        # Same race as cmd_draft: the entry may already be gone.
+        print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
+                         ensure_ascii=False))
+        return
     store.set_status(d, entry["id"], "sending")
     try:
         result = send(entry["jid"], args.text)
+        if _is_confirmed_sent(result):
+            store.remove_queue(d, entry["id"])
+            print(json.dumps({"ok": True, "dry_run": bool(result.get("dry_run"))},
+                             ensure_ascii=False))
+        else:
+            store.set_status(d, entry["id"], "failed")
+            print(json.dumps({"ok": False, "error": json.dumps(result)},
+                             ensure_ascii=False))
+    except SendOutcomeUnknown as exc:
+        # The request may have reached wuzapi before the timeout/connection
+        # error hit. Do not mark this "failed" — that invites a retry that
+        # sends the same message twice to a real person. Surface "unknown"
+        # so the panel can tell the user to check WhatsApp first.
+        store.set_status(d, entry["id"], "unknown")
+        print(json.dumps({"ok": False, "unknown": True, "error": str(exc)},
+                         ensure_ascii=False))
     except Exception as exc:
         store.set_status(d, entry["id"], "failed")
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
-        return
-    if result.get("dry_run") or result.get("data", {}).get("Details") == "Sent":
-        store.remove_queue(d, entry["id"])
-        print(json.dumps({"ok": True, "dry_run": bool(result.get("dry_run"))}))
-    else:
-        store.set_status(d, entry["id"], "failed")
-        print(json.dumps({"ok": False, "error": json.dumps(result)}))
 
 
 def main():
