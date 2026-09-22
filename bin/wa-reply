@@ -43,9 +43,12 @@ def _load_secrets() -> None:
 
     QML's Process spawns this script with a bare environment, so WA_TOKEN
     written by wa-up would otherwise never reach us.
+
+    The path comes from store.secrets_path(), which is resolved from
+    WA_SECRETS_FILE / the state root — not from WA_DATA_DIR, which now
+    points at the directory bind-mounted into the sink container.
     """
-    path = Path(os.environ.get("WA_DATA_DIR",
-                               Path.home() / ".local/share/omarchy-wa")) / "secrets.env"
+    path = store.secrets_path()
     try:
         lines = path.read_text().splitlines()
     except OSError:

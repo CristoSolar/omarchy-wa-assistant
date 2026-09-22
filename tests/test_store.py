@@ -74,5 +74,41 @@ def test_set_status_and_remove():
         assert store.load_queue(d) == []
 
 
+def test_the_sink_data_dir_is_a_subdirectory_of_the_state_root():
+    # I2: the sink's bind mount is WA_DATA_DIR, so it must not be the same
+    # directory that holds secrets.env.
+    import os
+    previous_root = os.environ.get("WA_STATE_ROOT")
+    previous_dir = os.environ.pop("WA_DATA_DIR", None)
+    with tmpdir() as d:
+        os.environ["WA_STATE_ROOT"] = str(d)
+        try:
+            assert store.state_root() == d
+            assert store.data_dir() == d / "state"
+            assert store.secrets_path() == d / "secrets.env"
+            assert store.secrets_path().parent != store.data_dir()
+        finally:
+            if previous_dir is not None:
+                os.environ["WA_DATA_DIR"] = previous_dir
+            if previous_root is None:
+                os.environ.pop("WA_STATE_ROOT", None)
+            else:
+                os.environ["WA_STATE_ROOT"] = previous_root
+
+
+def test_the_secrets_path_has_its_own_override():
+    import os
+    previous_file = os.environ.get("WA_SECRETS_FILE")
+    with tmpdir() as d:
+        os.environ["WA_SECRETS_FILE"] = str(d / "elsewhere.env")
+        try:
+            assert store.secrets_path() == d / "elsewhere.env"
+        finally:
+            if previous_file is None:
+                os.environ.pop("WA_SECRETS_FILE", None)
+            else:
+                os.environ["WA_SECRETS_FILE"] = previous_file
+
+
 if __name__ == "__main__":
     run(dict(globals()))

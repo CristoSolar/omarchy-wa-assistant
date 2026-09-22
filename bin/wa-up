@@ -1,15 +1,42 @@
 #!/usr/bin/env bash
 # bin/wa-up — bring the bridge and the sink up.
 # wuzapi is published on loopback only; the sink publishes nothing.
+#
+# Layout (see sink/store.py for the same comment):
+#   $STATE/              0700, host only
+#     secrets.env        0600 — NEVER mounted into a container
+#     state/             queue.json, ctx/, config.json -> mounted at /state
+#     wuzdata/           wuzapi's SQLite          -> mounted at /wuzdata
+# The sink is the internet-facing side. It must not be handed the API token
+# as well as the network route; keeping secrets.env out of its mounts makes
+# that boundary structural rather than a property of the sink's imports.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
-SECRETS="$STATE/secrets.env"
-mkdir -p "$STATE/ctx" "$STATE/wuzdata"
-chmod 700 "$STATE"
+STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
+SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
+DATA="${WA_DATA_DIR:-$STATE/state}"
+mkdir -p "$DATA/ctx" "$STATE/wuzdata"
+chmod 700 "$STATE" "$DATA"
+
+# Migrate the pre-split layout, where the sink-visible files sat next to
+# secrets.env at the state root.
+for f in queue.json config.json; do
+  if [[ -f "$STATE/$f" && ! -e "$DATA/$f" ]]; then
+    mv "$STATE/$f" "$DATA/$f"
+    echo "moved $f into $DATA/"
+  fi
+done
+if [[ -d "$STATE/ctx" && "$STATE/ctx" != "$DATA/ctx" ]]; then
+  if compgen -G "$STATE/ctx/*.json" >/dev/null; then
+    mv "$STATE"/ctx/*.json "$DATA/ctx/"
+    echo "moved per-chat context into $DATA/ctx/"
+  fi
+  rmdir "$STATE/ctx" 2>/dev/null || true
+fi
 
 if [[ ! -f "$SECRETS" ]]; then
+  mkdir -p "$(dirname "$SECRETS")"
   {
     echo "WUZAPI_ADMIN_TOKEN=$(openssl rand -hex 16)"
     echo "WUZAPI_GLOBAL_ENCRYPTION_KEY=$(openssl rand -hex 16)"
@@ -47,7 +74,7 @@ docker run -d --name omarchy-wuzapi --network omarchy-wa \
 docker run -d --name omarchy-wa-sink --network omarchy-wa \
   -e WA_DATA_DIR=/state \
   -e WA_WUZAPI_DB=/wuzdata/users.db \
-  -v "$STATE:/state" \
+  -v "$DATA:/state" \
   -v "$STATE/wuzdata:/wuzdata" \
   omarchy-wa-sink >/dev/null
 

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # bin/wa-status — one JSON line for the bar widget.
 set -uo pipefail
-STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
-PENDING=$(python3 -c "
-import json,sys
-try: print(len(json.load(open('$STATE/queue.json'))))
+STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
+SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
+DATA="${WA_DATA_DIR:-$STATE/state}"
+# The path goes in as an argument, not interpolated into the source: a
+# state directory containing a quote would otherwise break the program.
+PENDING=$(python3 -c '
+import json, sys
+try: print(len(json.load(open(sys.argv[1]))))
 except Exception: print(0)
-")
-if [[ -f "$STATE/secrets.env" ]]; then source "$STATE/secrets.env"; fi
+' "$DATA/queue.json")
+# shellcheck disable=SC1090
+if [[ -f "$SECRETS" ]]; then source "$SECRETS"; fi
 ST=$(curl -s --max-time 3 http://127.0.0.1:8080/session/status -H "token: ${WA_TOKEN:-}" || echo '{}')
 LOGGED=$(echo "$ST" | python3 -c "
 import json,sys

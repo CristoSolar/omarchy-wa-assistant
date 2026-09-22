@@ -11,14 +11,43 @@ from pathlib import Path
 
 CONTEXT_LIMIT = 10
 
+# The layout is split on purpose:
+#
+#   <state root>/            0700, host only
+#     secrets.env            0600, WA_TOKEN et al — NEVER mounted anywhere
+#     state/                 queue.json, ctx/, config.json — mounted into
+#                            the sink, which is the internet-facing side
+#     wuzdata/               wuzapi's SQLite — mounted into both
+#
+# The sink imports urllib.parse and never urllib.request, so it cannot send
+# anything today; but handing the internet-facing container both the
+# credential and the network route would make that boundary behavioural
+# rather than structural. It only ever sees `state/` and `wuzdata/`.
+DEFAULT_STATE_ROOT = Path.home() / ".local/share/omarchy-wa"
+
+
+def state_root() -> Path:
+    return Path(os.environ.get("WA_STATE_ROOT", DEFAULT_STATE_ROOT))
+
 
 def data_dir() -> Path:
-    d = Path(os.environ.get("WA_DATA_DIR",
-                            Path.home() / ".local/share/omarchy-wa"))
+    """The sink-visible state directory: queue.json, ctx/, config.json."""
+    d = Path(os.environ.get("WA_DATA_DIR", state_root() / "state"))
     d.mkdir(parents=True, exist_ok=True)
     os.chmod(d, 0o700)
     (d / "ctx").mkdir(exist_ok=True)
     return d
+
+
+def secrets_path() -> Path:
+    """Where WA_TOKEN lives.
+
+    Resolved from its own environment variable and its own default, never
+    derived from WA_DATA_DIR: the credential and the sink's mount must be
+    able to move independently, and deriving one from the other is how the
+    secret ended up inside the container's bind mount in the first place.
+    """
+    return Path(os.environ.get("WA_SECRETS_FILE", state_root() / "secrets.env"))
 
 
 def atomic_write(path, text: str) -> None:

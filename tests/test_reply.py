@@ -259,11 +259,12 @@ def test_cmd_send_with_a_stale_id_reports_an_error_without_raising():
 
 def test_secrets_file_supplies_the_token_when_the_env_lacks_it():
     import tempfile
-    previous_dir = os.environ.get("WA_DATA_DIR")
+    previous_file = os.environ.get("WA_SECRETS_FILE")
     previous_token = os.environ.pop("WA_TOKEN", None)
     with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "secrets.env").write_text("WA_TOKEN=fromfile\n")
-        os.environ["WA_DATA_DIR"] = tmp
+        secrets = Path(tmp) / "secrets.env"
+        secrets.write_text("WA_TOKEN=fromfile\n")
+        os.environ["WA_SECRETS_FILE"] = str(secrets)
         try:
             wa._load_secrets()
             assert os.environ["WA_TOKEN"] == "fromfile"
@@ -271,10 +272,41 @@ def test_secrets_file_supplies_the_token_when_the_env_lacks_it():
             os.environ.pop("WA_TOKEN", None)
             if previous_token is not None:
                 os.environ["WA_TOKEN"] = previous_token
+            if previous_file is None:
+                os.environ.pop("WA_SECRETS_FILE", None)
+            else:
+                os.environ["WA_SECRETS_FILE"] = previous_file
+
+
+def test_the_secret_is_not_looked_for_inside_the_sink_mounted_data_dir():
+    # I2: the sink container bind-mounts WA_DATA_DIR. If the token were
+    # resolved from there, handing the sink its state would also hand it the
+    # credential. The two paths must move independently.
+    import tempfile
+    previous_dir = os.environ.get("WA_DATA_DIR")
+    previous_file = os.environ.pop("WA_SECRETS_FILE", None)
+    previous_root = os.environ.get("WA_STATE_ROOT")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "state").mkdir()
+        os.environ["WA_STATE_ROOT"] = str(root)
+        os.environ["WA_DATA_DIR"] = str(root / "state")
+        try:
+            secret = store.secrets_path()
+            assert secret == root / "secrets.env"
+            assert str(root / "state") not in str(secret), \
+                "secrets.env must not live inside the sink's bind mount"
+        finally:
+            if previous_file is not None:
+                os.environ["WA_SECRETS_FILE"] = previous_file
             if previous_dir is None:
                 os.environ.pop("WA_DATA_DIR", None)
             else:
                 os.environ["WA_DATA_DIR"] = previous_dir
+            if previous_root is None:
+                os.environ.pop("WA_STATE_ROOT", None)
+            else:
+                os.environ["WA_STATE_ROOT"] = previous_root
 
 
 def test_prompt_carries_context_idea_and_agent_rules():
