@@ -8,10 +8,19 @@ NUMBER="${1:?usage: wa-pair <number, international, no +>}"
 STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
 source "$STATE/secrets.env"
 API=http://127.0.0.1:8080
+DB="$STATE/wuzdata/users.db"
 
-curl -s -X POST "$API/admin/users" -H "Authorization: $WUZAPI_ADMIN_TOKEN" \
+# Create user; "already exists" is not an error
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/users" \
+  -H "Authorization: $WUZAPI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"omarchy\",\"token\":\"$WA_TOKEN\",\"events\":\"Message\"}" >/dev/null || true
+  -d "{\"name\":\"omarchy\",\"token\":\"$WA_TOKEN\",\"events\":\"Message\"}")
+HTTP_CODE=$(echo "$RESP" | tail -1)
+BODY=$(echo "$RESP" | sed '$d')
+if [[ "$HTTP_CODE" != "200" && ! "$BODY" =~ "already" ]]; then
+  echo "error: failed to create wuzapi user (HTTP $HTTP_CODE): $BODY" >&2
+  exit 1
+fi
 
 curl -s -X POST "$API/session/connect" -H "token: $WA_TOKEN" \
   -H "Content-Type: application/json" \
@@ -33,9 +42,40 @@ for _ in $(seq 1 40); do
   if curl -s "$API/session/status" -H "token: $WA_TOKEN" \
      | grep -q '"loggedIn":true'; then
     echo "linked."
+    echo "waiting for WhatsApp to finish sending history..."
+
+    # Wait for history sync to stabilize before purging
+    WAIT_RESULT=$(python3 -c "
+import sys
+sys.path.insert(0, '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)')
+from sink.purge import wait_until_stable
+count, settled = wait_until_stable('$DB')
+print(f'{count},{settled}')
+")
+    PRE_PURGE=$(echo "$WAIT_RESULT" | cut -d, -f1)
+    SETTLED=$(echo "$WAIT_RESULT" | cut -d, -f2)
+
     docker restart omarchy-wa-sink >/dev/null
-    echo "sink restarted; history purged."
-    exit 0
+    sleep 1
+
+    # Check what actually got purged
+    POST_PURGE=$(python3 -c "
+import sys
+sys.path.insert(0, '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)')
+from sink.purge import count_history
+print(count_history('$DB'))
+")
+
+    if [[ "$SETTLED" == "True" ]] && [[ "$POST_PURGE" == "0" ]]; then
+      echo "history purged: $PRE_PURGE rows deleted, table now empty."
+      exit 0
+    else
+      echo "WARNING: history may NOT have been fully cleared." >&2
+      echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
+      echo "  Rows before restart: $PRE_PURGE, rows remaining: $POST_PURGE" >&2
+      echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
+      exit 1
+    fi
   fi
   sleep 5
 done
