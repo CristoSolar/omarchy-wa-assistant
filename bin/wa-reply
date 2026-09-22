@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+# bin/wa-reply
+"""Draft a WhatsApp reply with claude -p and send it through wuzapi.
+
+The only component in this project that can send a message. It refuses to
+send an empty draft, refuses a recipient that is not a full JID, and does
+nothing at all unless WA_DRY_RUN is explicitly set to 0.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sink import store  # noqa: E402
+
+API = os.environ.get("WA_API", "http://127.0.0.1:8080")
+AGENT = Path(__file__).resolve().parents[1] / "agents" / "respuesta.md"
+FENCE = re.compile(r"^\s*```[^\n]*\n(.*?)\n?```\s*$", re.S)
+
+
+def _load_secrets() -> None:
+    """Read secrets.env into the environment when it is not already there.
+
+    QML's Process spawns this script with a bare environment, so WA_TOKEN
+    written by wa-up would otherwise never reach us.
+    """
+    path = Path(os.environ.get("WA_DATA_DIR",
+                               Path.home() / ".local/share/omarchy-wa")) / "secrets.env"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def clean_draft(raw: str) -> str:
+    m = FENCE.match(raw or "")
+    return (m.group(1) if m else (raw or "")).strip()
+
+
+def build_prompt(agent_text, context, idea, push_name) -> str:
+    lines = [f"{c.get('from', '?')}: {c.get('text', '')}" for c in context]
+    return (
+        f"{agent_text}\n\n"
+        f"Estás redactando una respuesta de WhatsApp para {push_name}.\n\n"
+        f"Últimos mensajes del chat:\n" + ("\n".join(lines) or "(sin contexto)") +
+        f"\n\nLa idea que hay que transmitir:\n{idea}\n\n"
+        "Devolvé únicamente el texto del mensaje, sin comillas ni explicaciones."
+    )
+
+
+def _post(url, payload, token):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "token": token})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read())
+
+
+def send(jid: str, text: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("refusing to send an empty draft")
+    if "@" not in (jid or ""):
+        raise ValueError(
+            "recipient must be a full JID with '@'; a bare number is ambiguous")
+    _load_secrets()
+    if os.environ.get("WA_DRY_RUN", "1") != "0":
+        return {"dry_run": True, "jid": jid, "text": text}
+    try:
+        token = os.environ["WA_TOKEN"]
+    except KeyError:
+        raise ValueError("WA_TOKEN is not set and secrets.env has no entry for it")
+    return _post(f"{API}/chat/send/text", {"Phone": jid, "Body": text}, token)
+
+
+def _entry(d, entry_id):
+    for e in store.load_queue(d):
+        if e["id"] == entry_id:
+            return e
+    raise SystemExit(f"no queue entry with id {entry_id}")
+
+
+def cmd_list(args):
+    print(json.dumps(store.load_queue(store.data_dir()), ensure_ascii=False))
+
+
+def cmd_draft(args):
+    d = store.data_dir()
+    entry = _entry(d, args.id)
+    agent_text = AGENT.read_text() if AGENT.exists() else ""
+    prompt = build_prompt(agent_text, store.load_context(d, entry["jid"]),
+                          args.idea, entry["push_name"])
+    try:
+        out = subprocess.run(["claude", "-p", prompt], capture_output=True,
+                             text=True, timeout=120)
+        draft = clean_draft(out.stdout) if out.returncode == 0 else ""
+        error = "" if out.returncode == 0 else (out.stderr or "claude failed").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        draft, error = "", str(exc)
+    print(json.dumps({"draft": draft, "error": error}, ensure_ascii=False))
+
+
+def cmd_send(args):
+    d = store.data_dir()
+    entry = _entry(d, args.id)
+    store.set_status(d, entry["id"], "sending")
+    try:
+        result = send(entry["jid"], args.text)
+    except Exception as exc:
+        store.set_status(d, entry["id"], "failed")
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return
+    if result.get("dry_run") or result.get("data", {}).get("Details") == "Sent":
+        store.remove_queue(d, entry["id"])
+        print(json.dumps({"ok": True, "dry_run": bool(result.get("dry_run"))}))
+    else:
+        store.set_status(d, entry["id"], "failed")
+        print(json.dumps({"ok": False, "error": json.dumps(result)}))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    p = sub.add_parser("draft"); p.add_argument("id"); p.add_argument("--idea", required=True)
+    p.set_defaults(fn=cmd_draft)
+    p = sub.add_parser("send"); p.add_argument("id"); p.add_argument("--text", required=True)
+    p.set_defaults(fn=cmd_send)
+    args = ap.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
