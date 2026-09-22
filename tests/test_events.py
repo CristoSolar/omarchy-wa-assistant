@@ -94,5 +94,20 @@ def test_describe_skipped_group_is_none_for_the_users_own_group_message():
     assert describe_skipped_group(ev, []) is None
 
 
+def test_an_empty_conversation_string_is_not_treated_as_text():
+    # An empty body produced a queue entry with nothing in it, which the
+    # user cannot act on and cannot tell apart from a real short message.
+    e = extract({"event": {"Info": {"Chat": "1@s.whatsapp.net"},
+                           "Message": {"conversation": ""}}}, [])
+    assert e["text"] == "[mensaje no soportado]"
+
+
+def test_an_empty_conversation_still_falls_through_to_a_placeholder():
+    e = extract({"event": {"Info": {"Chat": "1@s.whatsapp.net"},
+                           "Message": {"conversation": "",
+                                       "audioMessage": {}}}}, [])
+    assert e["text"] == "[audio]"
+
+
 if __name__ == "__main__":
     run(dict(globals()))

@@ -19,10 +19,12 @@ PLACEHOLDERS = {
 def _text_of(message: dict) -> str:
     if not isinstance(message, dict):
         return "[mensaje no soportado]"
-    if isinstance(message.get("conversation"), str):
+    # An empty `conversation` is not text: treating it as one produced a
+    # queue entry with a blank body that the user could not act on.
+    if isinstance(message.get("conversation"), str) and message["conversation"]:
         return message["conversation"]
     ext = message.get("extendedTextMessage")
-    if isinstance(ext, dict) and isinstance(ext.get("text"), str):
+    if isinstance(ext, dict) and isinstance(ext.get("text"), str) and ext["text"]:
         return ext["text"]
     for key, label in PLACEHOLDERS.items():
         if key in message:
