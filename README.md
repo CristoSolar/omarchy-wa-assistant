@@ -102,13 +102,17 @@ published, and only to `127.0.0.1`.
 This prints an 8-digit linking code and tells you where to enter it:
 **WhatsApp > Linked devices > Link device > Link with phone number**. Once
 WhatsApp reports the session as logged in, `wa-pair` does *not* stop there:
-it watches the row count in wuzapi's history table until it stops growing,
-restarts the sink container (which purges that table on startup), and then
-checks that the table is actually empty. Expect this whole step to take a
-minute or two after you enter the code — that's the history dump arriving
-and being cleared, not a hang.
+it watches the row count in wuzapi's history table until rows have
+actually appeared and then stopped growing, restarts the sink container
+(which purges that table on startup), polls until the purge finishes, and
+then checks that the table is really empty. Expect this whole step to take
+a couple of minutes after you enter the code — that's the history dump
+arriving and being cleared, not a hang.
 
-On success you'll see something like:
+There are exactly three things it can tell you, and they mean different
+things.
+
+**1. It worked.**
 
 ```
 linked.
@@ -116,7 +120,7 @@ waiting for WhatsApp to finish sending history...
 history purged: 14832 rows deleted, table now empty.
 ```
 
-If instead you see:
+**2. It did not work.**
 
 ```
 WARNING: history may NOT have been fully cleared.
@@ -125,16 +129,36 @@ WARNING: history may NOT have been fully cleared.
   Please run 'docker restart omarchy-wa-sink' in a minute and check again.
 ```
 
-do exactly that: wait a minute, run `docker restart omarchy-wa-sink`
+Do exactly that: wait a minute, run `docker restart omarchy-wa-sink`
 yourself, and re-check. The sink purges the history table every time it
 starts, so a second restart after the dump has actually finished should
 leave the table empty. Don't consider pairing done until you've confirmed
 that.
 
+**3. It cannot tell.**
+
+```
+history: no rows were ever observed in wuzapi's message_history table.
+  That may mean this account has no history to sync, or it may mean
+  WhatsApp had not started sending it yet. This run cannot tell which.
+  Nothing was confirmed purged, because nothing was ever seen.
+```
+
+This is **not** a success message, even though the command exits 0.
+`loggedIn` flips at the end of the pairing handshake, *before* whatsmeow
+starts streaming history, so an empty table is genuinely ambiguous and
+nothing in the database can resolve it. If you want certainty, wait a few
+minutes and then:
+
+```sh
+docker restart omarchy-wa-sink
+docker logs omarchy-wa-sink   # look for the "purged N history rows" line
+```
+
 ## Enabling a group
 
 Group chats are ignored by default. To let one through, add its JID to
-`groups_enabled` in `~/.local/share/omarchy-wa/config.json`:
+`groups_enabled` in `~/.local/share/omarchy-wa/state/config.json`:
 
 ```json
 {"groups_enabled": ["120363012345678901@g.us"]}
@@ -173,9 +197,12 @@ message. Copy the JID into the array above.
 ## Turning off dry-run
 
 Every send goes through `bin/wa-reply`, and by default it does nothing but
-report what it *would* have sent — the panel will show "DRY RUN — no se
-envió" and no request ever reaches wuzapi. This is the tool's default state
-on every fresh install, not something you have to remember to enable.
+report what it *would* have sent. No request ever reaches wuzapi, and
+nothing in the queue changes: the panel shows "DRY RUN — no se envió nada.
+La entrada sigue pendiente en la cola.", the entry stays open, and its
+status stays `pending`, so you can keep iterating on the draft. This is the
+tool's default state on every fresh install, not something you have to
+remember to enable.
 
 To let it actually send messages to real people, add this line to
 `~/.local/share/omarchy-wa/secrets.env`:
@@ -193,29 +220,75 @@ you're comfortable with both of those facts.
 
 If a send times out or the connection drops mid-request, `wa-reply` cannot
 tell whether wuzapi received it before the failure. Rather than guessing,
-it reports the outcome as unknown, and the panel shows:
+it records `status: "unknown"` on that entry in `queue.json` and the panel
+shows:
 
 > sin confirmación: puede que el mensaje ya se haya enviado — revisá
 > WhatsApp antes de reintentar
 
-and disables the **Enviar** button for that entry. This is intentional:
-retrying blind risks sending the same person the same message twice. Check
-WhatsApp yourself to see whether it went out, then go back to the queue
-(**Volver**) and re-select the entry — that's what re-arms the send button.
+That record is durable, and it is what both halves of the protection read:
+
+- `bin/wa-reply send` **refuses** an entry whose stored status is
+  `unknown` and returns `{"ok": false, "needs_ack": true, ...}` unless it
+  is called with `--acknowledged`.
+- The panel marks the entry in the queue list itself ("⚠ sin confirmar"),
+  not just once you open it, and keeps **Enviar** disabled until you press
+  *"Revisé WhatsApp, quiero reenviar"*. Pressing that is what passes
+  `--acknowledged`.
+
+Closing the popup, restarting the bar, or letting the queue refresh does
+**not** clear the block — the warning is recomputed from what is on disk
+every time, so it cannot be lost by reopening the panel. Check WhatsApp
+yourself to see whether the message went out before you acknowledge.
+
+## A message that arrives while you're drafting
+
+If someone writes again in the same chat between the moment you open an
+entry and the moment the send is confirmed, the entry is **not** removed —
+it stays in the queue carrying the newer message, and the panel says so:
+
+> enviado. Llegó un mensaje nuevo en este chat mientras redactabas, así que
+> la entrada sigue en la cola.
+
+Your reply did go out. The queue is just not throwing away the thing you
+haven't read yet.
 
 ## Where state lives, and how to wipe it
 
 Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
 
+```
+~/.local/share/omarchy-wa/
+├── secrets.env     mode 600 — mounted into NO container
+├── state/          mounted into the sink at /state
+│   ├── queue.json
+│   ├── ctx/
+│   └── config.json
+└── wuzdata/        mounted into both containers
+```
+
 - `secrets.env` — the admin token, encryption key, API token, and (if you
-  set it) `WA_DRY_RUN=0`. Mode 600.
-- `queue.json` — pending messages shown in the panel.
-- `ctx/` — one small JSON file per chat, the last 10 messages of context
-  used when drafting.
-- `config.json` — `groups_enabled` and any other hand-edited settings.
+  set it) `WA_DRY_RUN=0`. Mode 600. It sits **outside** `state/` on
+  purpose: the sink is the container that receives whatever arrives from
+  the internet, and it has no business holding the credential that can
+  send messages as you. It is not bind-mounted anywhere.
+- `state/queue.json` — pending messages shown in the panel.
+- `state/ctx/` — one small JSON file per chat, the last 10 messages of
+  context used when drafting.
+- `state/config.json` — `groups_enabled` and any other hand-edited
+  settings.
 - `wuzdata/` — wuzapi's own SQLite database and session data, bind-mounted
   into both containers. This is where the history dump lands before
   `wa-pair`/the sink purge it.
+
+Three environment variables override these independently, which is the
+point of splitting them: `WA_STATE_ROOT` (the root above), `WA_DATA_DIR`
+(the directory mounted into the sink, default `$WA_STATE_ROOT/state`) and
+`WA_SECRETS_FILE` (default `$WA_STATE_ROOT/secrets.env`). The secrets path
+is never derived from `WA_DATA_DIR`.
+
+If you installed an earlier version, `wa-up` moves `queue.json`,
+`config.json` and `ctx/` down into `state/` for you on the next run.
 
 To wipe everything and start clean:
 
