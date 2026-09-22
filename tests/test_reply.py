@@ -202,6 +202,60 @@ def test_a_timeout_leaves_the_entry_as_unknown_not_failed():
         assert q[0]["status"] == "unknown"
 
 
+def test_post_maps_a_timeout_to_send_outcome_unknown():
+    # This is the mapping the whole double-send protection rests on: prove
+    # _post itself turns a timeout into SendOutcomeUnknown, not just that
+    # cmd_send knows what to do once it receives one. The stub replaces the
+    # function object, so no socket is ever opened.
+    original_urlopen = wa.urllib.request.urlopen
+
+    def _timeout(*a, **k):
+        raise TimeoutError("timed out")
+
+    wa.urllib.request.urlopen = _timeout
+    try:
+        try:
+            wa._post("http://127.0.0.1:8080/chat/send/text",
+                     {"Phone": "x", "Body": "y"}, "tok")
+        except wa.SendOutcomeUnknown:
+            pass
+        else:
+            raise AssertionError("a timeout must be mapped to SendOutcomeUnknown")
+    finally:
+        wa.urllib.request.urlopen = original_urlopen
+
+
+def test_post_does_not_map_an_http_error_to_send_outcome_unknown():
+    # The server answering (even with an error status) is a definite
+    # outcome, not an unknown one; only "no answer at all" is unknown.
+    from email.message import Message
+    original_urlopen = wa.urllib.request.urlopen
+
+    def _refused(*a, **k):
+        raise wa.urllib.error.HTTPError(
+            "http://127.0.0.1:8080/chat/send/text", 500, "boom", Message(), None)
+
+    wa.urllib.request.urlopen = _refused
+    try:
+        try:
+            wa._post("http://127.0.0.1:8080/chat/send/text",
+                     {"Phone": "x", "Body": "y"}, "tok")
+        except wa.SendOutcomeUnknown:
+            raise AssertionError(
+                "a definite HTTP error response must not be treated as unknown")
+        except wa.urllib.error.HTTPError:
+            pass
+    finally:
+        wa.urllib.request.urlopen = original_urlopen
+
+
+def test_cmd_send_with_a_stale_id_reports_an_error_without_raising():
+    with tmpdir() as d:
+        out = _run_cmd_send(d, "does-not-exist@s.whatsapp.net")
+        assert out == {"ok": False,
+                       "error": "no queue entry with id does-not-exist@s.whatsapp.net"}
+
+
 def test_secrets_file_supplies_the_token_when_the_env_lacks_it():
     import tempfile
     previous_dir = os.environ.get("WA_DATA_DIR")
