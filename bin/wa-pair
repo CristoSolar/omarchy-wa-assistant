@@ -5,10 +5,33 @@
 set -euo pipefail
 
 NUMBER="${1:?usage: wa-pair <number, international, no +>}"
-STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
-source "$STATE/secrets.env"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
+SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
+# shellcheck disable=SC1090
+source "$SECRETS"
 API=http://127.0.0.1:8080
 DB="$STATE/wuzdata/users.db"
+
+wait_for_history() {
+  # Prints "<count> <settled> <saw_rows>".
+  python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink.purge import wait_until_stable
+count, settled, saw_rows = wait_until_stable(sys.argv[2])
+print(count, settled, saw_rows)
+' "$ROOT" "$DB"
+}
+
+count_history() {
+  python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink.purge import count_history
+print(count_history(sys.argv[2]))
+' "$ROOT" "$DB"
+}
 
 # Create user; "already exists" is not an error
 RESP=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/users" \
@@ -44,38 +67,49 @@ for _ in $(seq 1 40); do
     echo "linked."
     echo "waiting for WhatsApp to finish sending history..."
 
-    # Wait for history sync to stabilize before purging
-    WAIT_RESULT=$(python3 -c "
-import sys
-sys.path.insert(0, '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)')
-from sink.purge import wait_until_stable
-count, settled = wait_until_stable('$DB')
-print(f'{count},{settled}')
-")
-    PRE_PURGE=$(echo "$WAIT_RESULT" | cut -d, -f1)
-    SETTLED=$(echo "$WAIT_RESULT" | cut -d, -f2)
+    # loggedIn flips at the END of the pairing handshake, before whatsmeow
+    # starts streaming history-sync blobs. Wait for rows to appear and then
+    # stop growing; saw_rows tells us whether any ever appeared at all.
+    read -r PRE_PURGE SETTLED SAW_ROWS < <(wait_for_history)
 
     docker restart omarchy-wa-sink >/dev/null
-    sleep 1
 
-    # Check what actually got purged
-    POST_PURGE=$(python3 -c "
-import sys
-sys.path.insert(0, '$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)')
-from sink.purge import count_history
-print(count_history('$DB'))
-")
+    # The sink purges on startup. Container start + Python + deleting ~15k
+    # rows + VACUUM does not fit in a fixed one-second sleep, and a sleep
+    # that is too short fires the warning on the happy path — which trains
+    # the user to ignore the one warning that protects their history. Poll
+    # instead, with a bound.
+    POST_PURGE=$(count_history)
+    for _ in $(seq 1 45); do
+      [[ "$POST_PURGE" == "0" ]] && break
+      sleep 2
+      POST_PURGE=$(count_history)
+    done
 
-    if [[ "$SETTLED" == "True" ]] && [[ "$POST_PURGE" == "0" ]]; then
+    if [[ "$SAW_ROWS" != "True" ]]; then
+      # Honest uncertainty. We cannot tell "this account has no history"
+      # from "the dump has not started" by looking at the database, so we
+      # do not claim either. This is NOT a success message.
+      echo "history: no rows were ever observed in wuzapi's message_history table."
+      echo "  That may mean this account has no history to sync, or it may mean"
+      echo "  WhatsApp had not started sending it yet. This run cannot tell which."
+      echo "  Nothing was confirmed purged, because nothing was ever seen."
+      echo "  If you want certainty, wait a few minutes and then run:"
+      echo "    docker restart omarchy-wa-sink"
+      echo "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line"
+      exit 0
+    fi
+
+    if [[ "$SETTLED" == "True" && "$POST_PURGE" == "0" ]]; then
       echo "history purged: $PRE_PURGE rows deleted, table now empty."
       exit 0
-    else
-      echo "WARNING: history may NOT have been fully cleared." >&2
-      echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
-      echo "  Rows before restart: $PRE_PURGE, rows remaining: $POST_PURGE" >&2
-      echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
-      exit 1
     fi
+
+    echo "WARNING: history may NOT have been fully cleared." >&2
+    echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
+    echo "  Rows before restart: $PRE_PURGE, rows remaining: $POST_PURGE" >&2
+    echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
+    exit 1
   fi
   sleep 5
 done
