@@ -94,16 +94,22 @@ def _post(url, payload, token):
 def _is_confirmed_sent(result) -> bool:
     """True only for a response that proves the message went out.
 
+    A dry run is deliberately NOT confirmed here: it never touched the
+    network, so nothing about the queue entry may be treated as done.
+    Callers handle `dry_run` before asking this question.
+
     Tolerates any shape wuzapi might return — including a `data` field that
     is `null` instead of a dict — so a surprising response never crashes
     the caller and strands the queue entry in status "sending".
     """
     if not isinstance(result, dict):
         return False
-    if result.get("dry_run"):
-        return True
     data = result.get("data")
     return isinstance(data, dict) and data.get("Details") == "Sent"
+
+
+def _is_dry_run(result) -> bool:
+    return isinstance(result, dict) and bool(result.get("dry_run"))
 
 
 def send(jid: str, text: str) -> dict:
@@ -153,8 +159,16 @@ def cmd_draft(args):
     try:
         out = subprocess.run(["claude", "-p", prompt], capture_output=True,
                              text=True, timeout=120)
-        draft = clean_draft(out.stdout) if out.returncode == 0 else ""
-        error = "" if out.returncode == 0 else (out.stderr or "claude failed").strip()
+        if out.returncode != 0:
+            draft, error = "", (out.stderr or "claude failed").strip()
+        else:
+            draft = clean_draft(out.stdout)
+            # A clean exit with nothing on stdout used to give the panel an
+            # empty draft AND an empty error, i.e. a blank box with no
+            # explanation. Say what happened instead.
+            error = "" if draft else (
+                (out.stderr or "").strip()
+                or "claude devolvió una respuesta vacía; escribí la respuesta a mano")
     except (OSError, subprocess.TimeoutExpired) as exc:
         draft, error = "", str(exc)
     print(json.dumps({"draft": draft, "error": error}, ensure_ascii=False))
@@ -168,22 +182,54 @@ def cmd_send(args):
         print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
                          ensure_ascii=False))
         return
+
+    # The durable record is authoritative. An entry left at "unknown" by an
+    # earlier send may ALREADY have reached the recipient; the QML guard
+    # that used to be the only thing standing here is volatile and a bar
+    # restart clears it. Refuse until the caller says, explicitly, that the
+    # human checked WhatsApp.
+    if entry.get("status") == "unknown" and not getattr(args, "acknowledged", False):
+        print(json.dumps({
+            "ok": False, "needs_ack": True,
+            "error": ("este envío quedó sin confirmación: el mensaje puede haberse "
+                      "enviado ya. Revisá WhatsApp y confirmá antes de reintentar "
+                      "(--acknowledged)."),
+        }, ensure_ascii=False))
+        return
+
+    # I3: a message that arrives while the draft is being written bumps the
+    # entry's ts (and count). Removing the entry on success would destroy
+    # it silently and the user would never learn it existed.
+    ts_at_start = entry.get("ts")
+
     store.set_status(d, entry["id"], "sending")
     try:
         result = send(entry["jid"], args.text)
-        if _is_confirmed_sent(result):
-            store.remove_queue(d, entry["id"])
-            print(json.dumps({"ok": True, "dry_run": bool(result.get("dry_run"))},
-                             ensure_ascii=False))
+        if _is_dry_run(result):
+            # A dry run sent nothing, so it must change nothing: the entry
+            # stays in the queue, back at "pending", exactly as it was.
+            store.set_status(d, entry["id"], "pending")
+            print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
+        elif _is_confirmed_sent(result):
+            fresh = _entry(d, entry["id"])
+            if fresh is not None and fresh.get("ts") != ts_at_start:
+                store.set_status(d, entry["id"], "pending")
+                print(json.dumps({"ok": True, "dry_run": False, "superseded": True},
+                                 ensure_ascii=False))
+            else:
+                store.remove_queue(d, entry["id"])
+                print(json.dumps({"ok": True, "dry_run": False}, ensure_ascii=False))
         else:
             store.set_status(d, entry["id"], "failed")
-            print(json.dumps({"ok": False, "error": json.dumps(result)},
+            print(json.dumps({"ok": False,
+                              "error": json.dumps(result, ensure_ascii=False)},
                              ensure_ascii=False))
     except SendOutcomeUnknown as exc:
         # The request may have reached wuzapi before the timeout/connection
         # error hit. Do not mark this "failed" — that invites a retry that
         # sends the same message twice to a real person. Surface "unknown"
-        # so the panel can tell the user to check WhatsApp first.
+        # so the panel can tell the user to check WhatsApp first, and so a
+        # later cmd_send on this entry refuses without an acknowledgement.
         store.set_status(d, entry["id"], "unknown")
         print(json.dumps({"ok": False, "unknown": True, "error": str(exc)},
                          ensure_ascii=False))
@@ -199,6 +245,9 @@ def main():
     p = sub.add_parser("draft"); p.add_argument("id"); p.add_argument("--idea", required=True)
     p.set_defaults(fn=cmd_draft)
     p = sub.add_parser("send"); p.add_argument("id"); p.add_argument("--text", required=True)
+    p.add_argument("--acknowledged", action="store_true",
+                   help="the user confirmed they checked WhatsApp after an "
+                        "unconfirmed ('unknown') send; required to retry one")
     p.set_defaults(fn=cmd_send)
     args = ap.parse_args()
     args.fn(args)

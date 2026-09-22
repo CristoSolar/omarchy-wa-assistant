@@ -20,14 +20,15 @@ def _queue_entry(entry_id="1@s.whatsapp.net"):
             "count": 1, "ts": "2026-09-22T10:00:00", "status": "pending"}
 
 
-def _run_cmd_send(d, entry_id, text="hola"):
+def _run_cmd_send(d, entry_id, text="hola", acknowledged=False):
     """Run cmd_send with WA_DATA_DIR pointed at d; return its one JSON line."""
     previous_dir = os.environ.get("WA_DATA_DIR")
     os.environ["WA_DATA_DIR"] = str(d)
     buf = io.StringIO()
     try:
         with redirect_stdout(buf):
-            wa.cmd_send(SimpleNamespace(id=entry_id, text=text))
+            wa.cmd_send(SimpleNamespace(id=entry_id, text=text,
+                                        acknowledged=acknowledged))
     finally:
         if previous_dir is None:
             os.environ.pop("WA_DATA_DIR", None)
@@ -283,6 +284,139 @@ def test_prompt_carries_context_idea_and_agent_rules():
     assert "podes el martes?" in p
     assert "despues de las 4" in p
     assert "Ana" in p
+
+
+def test_a_dry_run_send_leaves_the_queue_entry_exactly_as_it_was():
+    # C2: _is_confirmed_sent used to return True for {"dry_run": True}, so
+    # cmd_send removed the entry and the panel refreshed it away. Dry-run is
+    # the DEFAULT, so every first-run user lost their queue this way.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        original, wa.send = wa.send, lambda jid, text: {"dry_run": True, "jid": jid,
+                                                        "text": text}
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+        assert out == {"ok": True, "dry_run": True}
+        q = store.load_queue(d)
+        assert len(q) == 1, "a dry run sends nothing, so it must remove nothing"
+        assert q[0]["status"] == "pending", "a dry run must leave the entry pending"
+        assert q[0]["text"] == entry["text"]
+        assert q[0]["jid"] == entry["jid"]
+
+
+def test_a_dry_run_never_confirms_a_send():
+    assert wa._is_confirmed_sent({"dry_run": True}) is False
+
+
+def test_an_unknown_entry_refuses_to_send_without_an_acknowledgement():
+    # C3: the persisted status used to be write-only. A send that timed out
+    # is recorded "unknown"; reopening the panel later showed a fresh-looking
+    # pending entry with a live send button, and a real person got the same
+    # message twice.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        entry["status"] = "unknown"
+        store.upsert_queue(d, entry)
+        # upsert_queue forces "pending" only on an update; this is an insert.
+        store.set_status(d, entry["id"], "unknown")
+
+        called = []
+        original, wa.send = wa.send, lambda jid, text: called.append((jid, text))
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+
+        assert out["ok"] is False
+        assert out["needs_ack"] is True
+        assert called == [], "an unacknowledged 'unknown' entry must not be sent"
+        q = store.load_queue(d)
+        assert len(q) == 1
+        assert q[0]["status"] == "unknown", "the refusal must not clear the record"
+
+
+def test_an_unknown_entry_sends_once_the_acknowledgement_flag_is_passed():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        store.set_status(d, entry["id"], "unknown")
+
+        called = []
+
+        def _ok(jid, text):
+            called.append((jid, text))
+            return {"data": {"Details": "Sent"}}
+
+        original, wa.send = wa.send, _ok
+        try:
+            out = _run_cmd_send(d, entry["id"], acknowledged=True)
+        finally:
+            wa.send = original
+
+        assert out == {"ok": True, "dry_run": False}
+        assert called == [(entry["jid"], "hola")]
+        assert store.load_queue(d) == []
+
+
+def test_a_message_that_arrived_mid_draft_survives_a_successful_send():
+    # I3: removing the whole chat entry on success destroyed a message that
+    # landed after the draft began, and the user never learned it existed.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+
+        def _send_then_new_message(jid, text):
+            store.upsert_queue(d, {**entry, "text": "y otra cosa",
+                                   "ts": "2026-09-22T10:05:00"})
+            return {"data": {"Details": "Sent"}}
+
+        original, wa.send = wa.send, _send_then_new_message
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+
+        assert out["ok"] is True
+        assert out["superseded"] is True
+        q = store.load_queue(d)
+        assert len(q) == 1, "a newer message must not be silently destroyed"
+        assert q[0]["text"] == "y otra cosa"
+        assert q[0]["status"] == "pending"
+
+
+def _run_cmd_draft(d, entry_id, idea="decile que si"):
+    previous_dir = os.environ.get("WA_DATA_DIR")
+    os.environ["WA_DATA_DIR"] = str(d)
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            wa.cmd_draft(SimpleNamespace(id=entry_id, idea=idea))
+    finally:
+        if previous_dir is None:
+            os.environ.pop("WA_DATA_DIR", None)
+        else:
+            os.environ["WA_DATA_DIR"] = previous_dir
+    return json.loads(buf.getvalue())
+
+
+def test_claude_exiting_clean_with_no_output_reports_an_error():
+    # I5: an empty draft AND an empty error gave the panel a blank box with
+    # no explanation of why.
+    with tmpdir() as d:
+        entry = _queue_entry()
+        store.upsert_queue(d, entry)
+        original = wa.subprocess.run
+        wa.subprocess.run = lambda *a, **k: SimpleNamespace(
+            returncode=0, stdout="   \n", stderr="")
+        try:
+            out = _run_cmd_draft(d, entry["id"])
+        finally:
+            wa.subprocess.run = original
+        assert out["draft"] == ""
+        assert out["error"], "an empty draft must come with an explanation"
 
 
 if __name__ == "__main__":
