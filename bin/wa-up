@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# bin/wa-up — bring the bridge and the sink up.
+# wuzapi is published on loopback only; the sink publishes nothing.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
+SECRETS="$STATE/secrets.env"
+mkdir -p "$STATE/ctx" "$STATE/wuzdata"
+chmod 700 "$STATE"
+
+if [[ ! -f "$SECRETS" ]]; then
+  {
+    echo "WUZAPI_ADMIN_TOKEN=$(openssl rand -hex 16)"
+    echo "WUZAPI_GLOBAL_ENCRYPTION_KEY=$(openssl rand -hex 16)"
+    echo "WA_TOKEN=$(openssl rand -hex 12)"
+  } > "$SECRETS"
+  chmod 600 "$SECRETS"
+fi
+# shellcheck disable=SC1090
+source "$SECRETS"
+
+docker network create omarchy-wa >/dev/null 2>&1 || true
+
+if ! docker image inspect omarchy-wa-sink >/dev/null 2>&1; then
+  docker build -t omarchy-wa-sink -f "$ROOT/docker/sink.Dockerfile" "$ROOT"
+fi
+
+if ! docker image inspect omarchy-wuzapi >/dev/null 2>&1; then
+  echo "Missing image omarchy-wuzapi. Build it from asternic/wuzapi:" >&2
+  echo "  git clone --depth 1 https://github.com/asternic/wuzapi /tmp/wuzapi" >&2
+  echo "  docker build -t omarchy-wuzapi /tmp/wuzapi" >&2
+  exit 1
+fi
+
+docker rm -f omarchy-wuzapi omarchy-wa-sink >/dev/null 2>&1 || true
+
+docker run -d --name omarchy-wuzapi --network omarchy-wa \
+  -p 127.0.0.1:8080:8080 \
+  -e WUZAPI_ADMIN_TOKEN="$WUZAPI_ADMIN_TOKEN" \
+  -e WUZAPI_GLOBAL_ENCRYPTION_KEY="$WUZAPI_GLOBAL_ENCRYPTION_KEY" \
+  -e WEBHOOK_FORMAT=json \
+  -e TZ="${TZ:-America/Santiago}" \
+  -v "$STATE/wuzdata:/app/dbdata" \
+  omarchy-wuzapi >/dev/null
+
+docker run -d --name omarchy-wa-sink --network omarchy-wa \
+  -e WA_DATA_DIR=/state \
+  -e WA_WUZAPI_DB=/wuzdata/users.db \
+  -v "$STATE:/state" \
+  -v "$STATE/wuzdata:/wuzdata" \
+  omarchy-wa-sink >/dev/null
+
+echo "up. wuzapi on 127.0.0.1:8080 (loopback only), sink on the private network."
+echo "Pair with:  wa-pair <number>"

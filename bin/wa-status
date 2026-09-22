@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# bin/wa-status — one JSON line for the bar widget.
+set -uo pipefail
+STATE="${WA_DATA_DIR:-$HOME/.local/share/omarchy-wa}"
+PENDING=$(python3 -c "
+import json,sys
+try: print(len(json.load(open('$STATE/queue.json'))))
+except Exception: print(0)
+")
+if [[ -f "$STATE/secrets.env" ]]; then source "$STATE/secrets.env"; fi
+ST=$(curl -s --max-time 3 http://127.0.0.1:8080/session/status -H "token: ${WA_TOKEN:-}" || echo '{}')
+LOGGED=$(echo "$ST" | python3 -c "
+import json,sys
+try: print('true' if json.load(sys.stdin)['data']['loggedIn'] else 'false')
+except Exception: print('false')
+")
+OK=$([[ "$ST" == "{}" || -z "$ST" ]] && echo false || echo true)
+echo "{\"ok\": $OK, \"logged_in\": $LOGGED, \"pending\": $PENDING}"
