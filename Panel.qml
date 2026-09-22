@@ -26,6 +26,14 @@ PopupWindow {
     // obvious reflex of hitting "Enviar" again, which would risk a real
     // double-send.
     property bool sendBlocked: false
+    // Guards the whole duration of a single "send" round trip, independent
+    // of `sendBlocked`: without it a rapid double-click while "enviando…"
+    // is showing re-runs `wa-reply send` on the same in-flight Process
+    // (reassigning proc.command/proc.done under it), which is a
+    // double-send with no timeout involved at all. Cleared as the very
+    // first statement of the send completion handler, before any parsing
+    // that could throw, so it can never get stuck true.
+    property bool inFlight: false
 
     // BarWidget hands this in after loading the popup: PopupWindow has no
     // default position without an anchor.item/window to position against.
@@ -164,12 +172,17 @@ PopupWindow {
                 spacing: 8
                 Button {
                     text: "Enviar"
-                    enabled: draftBox.text.trim().length > 0 && !panel.sendBlocked
+                    enabled: draftBox.text.trim().length > 0 && !panel.sendBlocked && !panel.inFlight
                     onClicked: {
                         panel.status = "enviando…"
                         panel.statusWarn = false
+                        panel.inFlight = true
                         panel.run(["send", panel.current.id, "--text", draftBox.text],
                                   function (out) {
+                            // Cleared first, before anything that can throw,
+                            // so a malformed response never leaves the
+                            // button permanently disabled.
+                            panel.inFlight = false
                             try {
                                 const r = JSON.parse(out)
                                 if (r.ok) {
@@ -195,7 +208,22 @@ PopupWindow {
                                     panel.status = "falló: " + r.error
                                     panel.statusWarn = true
                                 }
-                            } catch (e) { panel.status = "falló"; panel.statusWarn = true }
+                            } catch (e) {
+                                // A send whose response could not be parsed
+                                // (wa-reply crashed or was truncated
+                                // mid-write) is exactly as ambiguous as an
+                                // `unknown` outcome — it may already have
+                                // reached WhatsApp — so it gets the same
+                                // treatment, not a plain "falló" that
+                                // invites an immediate retry. Scoped to the
+                                // send path only: list/draft/status parse
+                                // failures keep their own fail-closed
+                                // handling above and elsewhere.
+                                panel.status = "sin confirmación: puede que el mensaje ya se haya enviado — revisá WhatsApp antes de reintentar"
+                                panel.statusWarn = true
+                                panel.sendBlocked = true
+                                panel.refresh()
+                            }
                         })
                     }
                 }
