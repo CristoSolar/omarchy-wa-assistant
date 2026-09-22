@@ -55,6 +55,15 @@ def test_atomic_write_leaves_no_partial_file():
         assert list(d.glob("*.tmp*")) == [], "temp file must not survive"
 
 
+def test_upsert_tolerates_an_entry_without_a_push_name():
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry(name="Ana"))
+        e2 = _entry(text="de nuevo")
+        del e2["push_name"]
+        q = store.upsert_queue(d, e2)
+        assert q[0]["push_name"] == "Ana", "existing display name must survive a missing push_name"
+
+
 def test_set_status_and_remove():
     with tmpdir() as d:
         e = _entry()

@@ -66,7 +66,7 @@ def upsert_queue(d, entry) -> list:
             existing["count"] = existing.get("count", 1) + 1
             existing["text"] = entry["text"]
             existing["ts"] = entry["ts"]
-            existing["push_name"] = entry["push_name"] or existing["push_name"]
+            existing["push_name"] = entry.get("push_name") or existing.get("push_name")
             existing["status"] = "pending"
             return _save_queue(d, queue)
     queue.append(dict(entry))
