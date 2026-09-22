@@ -66,10 +66,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def purge_or_warn(db_path) -> int:
+    """Purge wuzapi's history table, but never let a corrupt DB stop the sink.
+
+    The purge is the only thing keeping the user's WhatsApp history off disk.
+    If it fails we must not silently continue as if it worked: we shout a
+    loud warning to stderr so the failure is visible, then let the sink keep
+    serving anyway (staying up beats a crash-loop with no webhook sink at
+    all).
+    """
+    try:
+        return purge_history(db_path)
+    except Exception as exc:
+        print("!" * 70, file=sys.stderr)
+        print("WARNING: history purge FAILED — wuzapi DB may still hold "
+              "the user's WhatsApp message history unencrypted on disk.",
+              file=sys.stderr)
+        print(f"WARNING: purge_history({db_path!r}) raised: {exc}",
+              file=sys.stderr)
+        print("!" * 70, file=sys.stderr, flush=True)
+        return 0
+
+
 def main():
     Handler.data_dir = store.data_dir()
     wuz_db = os.environ.get("WA_WUZAPI_DB", "/wuzdata/users.db")
-    print(f"purged {purge_history(wuz_db)} history rows", flush=True)
+    print(f"purged {purge_or_warn(wuz_db)} history rows", flush=True)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

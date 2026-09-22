@@ -2,7 +2,7 @@ import json, sys, urllib.parse
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
-from sink.server import handle_payload
+from sink.server import handle_payload, purge_or_warn
 from sink import store
 
 EV = {"event": {"Info": {"Chat": "56911111111@s.whatsapp.net", "IsFromMe": False,
@@ -44,6 +44,13 @@ def test_discarded_event_touches_nothing():
 def test_garbage_body_does_not_raise():
     with tmpdir() as d:
         assert handle_payload(b"<<<not json>>>", "application/json", d) is False
+
+
+def test_a_corrupt_wuzapi_db_does_not_stop_the_sink_from_starting():
+    with tmpdir() as d:
+        p = d / "users.db"
+        p.write_bytes(b"this is not a sqlite database")
+        assert purge_or_warn(p) == 0
 
 
 if __name__ == "__main__":
