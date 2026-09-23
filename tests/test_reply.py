@@ -645,6 +645,57 @@ def test_quick_refuses_an_entry_whose_account_is_unknown():
             assert exc.payload["unknown_account"] == "fantasma"
 
 
+def _run_cmd_accounts(d):
+    """Run cmd_accounts with WA_DATA_DIR pointed at d; return its one JSON line."""
+    buf = io.StringIO()
+    with _reply_env(d):
+        with redirect_stdout(buf):
+            wa.cmd_accounts(SimpleNamespace())
+    return json.loads(buf.getvalue())
+
+
+def test_accounts_prints_id_and_label_for_every_configured_account():
+    # Panel.qml labels each queue entry's `account` id (list badge, and the
+    # "sale desde" line) by asking this, rather than the entry carrying a
+    # denormalised copy of the label that a later rename could disagree
+    # with.
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        assert _run_cmd_accounts(d) == [
+            {"id": "personal", "label": "Personal"},
+            {"id": "trabajo", "label": "Trabajo"},
+        ]
+
+
+def test_accounts_never_leaks_a_token_or_the_wuzapi_user_or_quick_replies():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        out = _run_cmd_accounts(d)
+        assert out == [{"id": "personal", "label": "Personal"}]
+        assert "wuzapi_user" not in out[0]
+        assert "quick_replies" not in out[0]
+        assert "agent" not in out[0]
+
+
+def test_accounts_prints_an_empty_list_when_none_are_configured():
+    # No accounts.json at all — a fresh or not-yet-migrated install —
+    # reads as no accounts (accounts.load's own contract), not an error.
+    with tmpdir() as d:
+        with _reply_env(d):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                wa.cmd_accounts(SimpleNamespace())
+            assert json.loads(buf.getvalue()) == []
+
+
+def test_accounts_falls_back_to_the_id_when_a_label_is_missing():
+    with tmpdir() as d:
+        account = dict(PERSONAL)
+        del account["label"]
+        _prepare(d, (account,))
+        assert _run_cmd_accounts(d) == [{"id": "personal", "label": "personal"}]
+
+
 def test_quick_reports_a_store_read_error_the_same_way_other_subcommands_do():
     # cmd_list, cmd_draft and cmd_send never catch store.StoreReadError
     # themselves — it propagates out to main()'s handler, which prints the

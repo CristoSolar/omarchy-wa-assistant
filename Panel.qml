@@ -82,6 +82,24 @@ Panel {
   // never race the list/draft Process or the send Process.
   property var quickReplies: []
 
+  // account id -> label, via `wa-reply accounts`. The queue entry carries
+  // only the account ID, never a label: a label lives exclusively in
+  // accounts.json, so a rename there can never leave a stale copy
+  // disagreeing with it somewhere in the queue. This is asked for fresh
+  // on every refresh() rather than cached from the entry, through its
+  // own Process for the same reason quick replies get one — it must
+  // never race list/draft/send.
+  property var accountLabels: ({})
+
+  // The label for one account id, or the id itself when accounts.json
+  // has nothing for it (a stale entry from a removed account, or the
+  // labels haven't loaded yet) — never a blank badge.
+  function accountLabel(accountId) {
+    if (!accountId)
+      return ""
+    return root.accountLabels[accountId] || accountId
+  }
+
   // Guarded so the panel renders before the bar injects itself.
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property color contentUrgent: bar ? bar.urgent : Color.urgent
@@ -146,11 +164,49 @@ Panel {
     }
   }
 
-  function loadQuickReplies() {
+  // Quick replies are per-account (Task 5), and `quick` now takes the
+  // shown entry's id rather than nothing, so it can resolve which
+  // account's list to return. Called with "" (nothing selected) just
+  // clears the list instead of shelling out — the list view never shows
+  // quick-reply buttons, so there is nothing to fetch for it.
+  function loadQuickReplies(entryId) {
     if (quickProc.running)
       return
-    quickProc.command = [root.pluginDir + "bin/wa-reply", "quick"]
+    if (!entryId) {
+      root.quickReplies = []
+      return
+    }
+    quickProc.command = [root.pluginDir + "bin/wa-reply", "quick", entryId]
     quickProc.running = true
+  }
+
+  // Its own Process too, loaded once and re-read on every refresh() —
+  // labels can be renamed in accounts.json between refreshes, and this
+  // is exactly how the panel is meant to find out: by asking, not by
+  // trusting a copy the entry might carry.
+  Process {
+    id: accountsProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var parsed = null
+        try { parsed = JSON.parse(text) } catch (e) { parsed = null }
+        var map = {}
+        if (Array.isArray(parsed)) {
+          for (var i = 0; i < parsed.length; i++) {
+            var a = parsed[i]
+            if (a && a.id) map[a.id] = a.label || a.id
+          }
+        }
+        root.accountLabels = map
+      }
+    }
+  }
+
+  function loadAccountLabels() {
+    if (accountsProc.running)
+      return
+    accountsProc.command = [root.pluginDir + "bin/wa-reply", "accounts"]
+    accountsProc.running = true
   }
 
   // Long quick-reply texts are truncated for the button label only — the
@@ -245,6 +301,9 @@ Panel {
     root.statusWarn = false
     root.acknowledged = false
     root.sendBlocked = false
+    // Quick replies are this entry's account's own list — reload for
+    // whatever is now selected (or clear, for "back to the list").
+    root.loadQuickReplies(root.currentId)
     if (entry) Qt.callLater(function() { composer.forceActiveFocus() })
   }
 
@@ -306,7 +365,12 @@ Panel {
   }
 
   function refresh() {
-    root.loadQuickReplies()
+    root.loadAccountLabels()
+    // Re-fetch for whatever is currently open — refresh() runs on every
+    // panel open and on a timer-free basis after every send/draft, and a
+    // rename or an account swap on the open entry must not leave a stale
+    // list showing.
+    root.loadQuickReplies(root.currentId)
     run(["list"], function (out) {
       var list = []
       var parsed = null
@@ -431,6 +495,26 @@ Panel {
                   font.family: root.contentFontFamily
                   font.pixelSize: Style.font.subtitle
                 }
+                // The account badge: which number this conversation
+                // belongs to. Same information the detail view states in
+                // full ("sale desde …"), shown at a glance in the list so
+                // the two numbers are never mixed up before opening a
+                // chat.
+                Rectangle {
+                  radius: Style.cornerRadius
+                  color: Style.normalFillFor(root.contentForeground, Color.accent)
+                  implicitWidth: badgeText.implicitWidth + Style.spacing.md
+                  implicitHeight: badgeText.implicitHeight + Style.spacing.xxs
+                  Text {
+                    id: badgeText
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: root.accountLabel(row.modelData.account)
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+                }
                 Text {
                   textFormat: Text.PlainText
                   visible: row.ambiguous
@@ -469,6 +553,22 @@ Panel {
           visible: root.current !== null
           Layout.fillWidth: true; Layout.fillHeight: true
           spacing: Style.spacing.lg
+
+          // States plainly which number the reply will leave by. Not a
+          // choice — a reply always leaves by the number that received
+          // it, there is no selector anywhere in this panel, and this
+          // line exists so that fact is never left implicit.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.current !== null
+            text: "La respuesta va a salir desde: "
+                  + root.accountLabel(root.current ? root.current.account : "")
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+            wrapMode: Text.Wrap; Layout.fillWidth: true
+          }
 
           Text {
             textFormat: Text.PlainText

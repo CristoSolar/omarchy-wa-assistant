@@ -334,6 +334,30 @@ def cmd_list(args):
     print(json.dumps(store.load_queue(store.data_dir()), ensure_ascii=False))
 
 
+def cmd_accounts(args):
+    """The configured accounts' `id` and `label` — nothing else.
+
+    Exists so Panel.qml can label a queue entry's `account` field (a
+    badge in the list, and the "sale desde" line in the detail view)
+    without the queue ever carrying a denormalised copy of the label
+    itself. A copy on the entry could disagree with a later rename in
+    accounts.json; asking here every refresh cannot. Deliberately leaves
+    out `wuzapi_user`, `agent` and `quick_replies` — none of that is the
+    panel's business, and `quick_replies` already has its own accessor
+    (`quick <id>`) scoped to one entry's account.
+
+    Like `list`, a StoreReadError (corrupt accounts.json) propagates to
+    main()'s handler rather than being swallowed here, so a broken
+    install prints the same `{"ok": false, "error": ...}` shape as every
+    other subcommand instead of a silent empty array.
+    """
+    accts = accounts.load(store.data_dir())
+    print(json.dumps(
+        [{"id": a.get("id"), "label": a.get("label") or a.get("id")}
+         for a in accts],
+        ensure_ascii=False))
+
+
 def cmd_quick(args):
     """The quick replies of the account the given entry belongs to.
 
@@ -475,6 +499,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list").set_defaults(fn=cmd_list)
+    sub.add_parser("accounts").set_defaults(fn=cmd_accounts)
     p = sub.add_parser("quick"); p.add_argument("id")
     p.set_defaults(fn=cmd_quick)
     p = sub.add_parser("token-var"); p.add_argument("account_id")
