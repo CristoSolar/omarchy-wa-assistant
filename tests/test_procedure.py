@@ -12,6 +12,7 @@ happens to say.
 """
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -300,7 +301,9 @@ def test_wa_pair_json_vocabulary_matches_the_spec_exactly():
     """Only these seven event names may appear as an `event=` literal —
     the spec's whole point is that the GUI parses a fixed vocabulary, not
     prose that gets reworded later."""
-    emitted = set(re.findall(r'emit_(?:json|terminal) (\w+)', WA_PAIR))
+    code_lines = "\n".join(ln for ln in WA_PAIR.splitlines()
+                            if not ln.strip().startswith("#"))
+    emitted = set(re.findall(r'emit_(?:json|terminal) (\w+)', code_lines))
     assert emitted == {
         "validating", "code", "linked", "history_waiting",
         "history_purged", "done", "error",
@@ -427,6 +430,110 @@ def test_emit_json_body_produces_one_valid_json_line_per_event():
                 assert obj[k] == int(v)
             else:
                 assert obj[k] == v
+
+
+# --- Task 1, fix round 1: the latch must not lie about a failed emission ---
+#
+# `bin/wa-pair` is never run for these either. The JSON-emission machinery
+# (JSON_TERMINAL_EMITTED, emit_json, emit_terminal, on_exit, the trap
+# registration) is self-contained bash with no network/docker/file-system
+# side effects, so it is extracted verbatim from the source and run inside
+# a small harness script under a real `bash` subprocess — the only way to
+# observe trap/latch interaction honestly. What varies between harnesses is
+# PATH: hiding `python3` behind an empty PATH is how a failing emission is
+# simulated (python3 missing is one of the review's named real-world
+# causes, and it fails exactly like OOM or a dead reader would: emit_json's
+# python3 invocation returns non-zero without writing to stdout).
+_BASH = shutil.which("bash") or "/usr/bin/bash"
+assert Path(_BASH).exists(), "bash not found; cannot exercise the extracted JSON machinery"
+
+
+def _extract_json_machinery():
+    start = WA_PAIR.index("JSON_TERMINAL_EMITTED=0")
+    end = WA_PAIR.index("trap on_exit EXIT") + len("trap on_exit EXIT")
+    return WA_PAIR[start:end]
+
+
+def _run_harness(trailer, no_python3):
+    """Assemble JSON_MODE=1 + the extracted machinery + `trailer`, run it
+    under bash, and return the finished process. `no_python3` hides python3
+    from PATH so emit_json's underlying command fails the way it would if
+    python3 were missing, out of memory, or writing to a closed pipe."""
+    machinery = _extract_json_machinery()
+    script = "set -euo pipefail\nJSON_MODE=1\n" + machinery + "\n" + trailer + "\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
+        f.write(script)
+        path = f.name
+    env = {"PATH": "/nonexistent-omarchy-wa-test-path"} if no_python3 else {"PATH": "/usr/bin:/bin"}
+    return subprocess.run([_BASH, path], capture_output=True, text=True, env=env)
+
+
+def test_latch_is_not_set_when_the_emission_fails():
+    """python3 unavailable -> emit_json fails -> emit_terminal must NOT
+    latch JSON_TERMINAL_EMITTED. Fails against the pre-fix emit_terminal,
+    which set the latch unconditionally before attempting the emission."""
+    proc = _run_harness(
+        'emit_terminal error reason=boom fatal=true || true\n'
+        'echo "LATCH=$JSON_TERMINAL_EMITTED"',
+        no_python3=True)
+    assert "LATCH=0" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_latch_is_set_when_the_emission_succeeds():
+    """The positive control: with python3 available, the same call DOES
+    latch — proving the fix didn't just stop latching altogether."""
+    proc = _run_harness(
+        'emit_terminal error reason=boom fatal=true || true\n'
+        'echo "LATCH=$JSON_TERMINAL_EMITTED"',
+        no_python3=False)
+    assert "LATCH=1" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_trap_fallback_still_emits_when_python3_is_unavailable():
+    """The whole point of the backstop: even when the thing emit_json
+    depends on (python3) is exactly what's broken, the EXIT trap still
+    puts a terminal event on stdout, using a plain `printf` of a fixed
+    string rather than the same machinery that just failed."""
+    proc = _run_harness(
+        'emit_terminal error reason=boom fatal=true || true\n'
+        'exit 1',
+        no_python3=True)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected exactly one stdout line: {proc.stdout!r}"
+    obj = json.loads(lines[0])  # must not raise: a real, complete JSON line
+    assert obj == {
+        "event": "error",
+        "reason": "wa-pair exited unexpectedly (exit code 1)",
+        "fatal": True,
+    }
+
+
+def test_a_failing_emission_never_leaks_a_line_and_is_not_mistaken_for_success():
+    """Nothing from the failed `emit_terminal error reason=boom ...` call
+    may reach stdout — not a partial line, not the word "boom" anywhere —
+    only the trap's own fixed fallback line."""
+    proc = _run_harness(
+        'emit_terminal error reason=boom fatal=true || true\n'
+        'exit 1',
+        no_python3=True)
+    assert "boom" not in proc.stdout
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1
+    json.loads(lines[0])  # the one line present is complete, valid JSON
+
+
+def test_trap_fallback_is_skipped_once_a_real_terminal_event_went_out():
+    """Normal path, unaffected by the fix: when emit_terminal succeeds
+    before the script exits, the trap must NOT also emit its fallback —
+    exactly one terminal event reaches stdout, not two."""
+    proc = _run_harness(
+        'emit_terminal error reason=boom fatal=true || true\n'
+        'exit 1',
+        no_python3=False)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    assert len(lines) == 1, f"expected exactly one terminal event, got: {proc.stdout!r}"
+    obj = json.loads(lines[0])
+    assert obj == {"event": "error", "reason": "boom", "fatal": True}
 
 
 if __name__ == "__main__":

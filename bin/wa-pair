@@ -32,11 +32,20 @@ set -- "${ARGS[@]}"
 #
 # Each known exit point further down emits its OWN specific terminal event
 # (with a real reason) via emit_terminal() before exiting; emit_terminal()
-# latches JSON_TERMINAL_EMITTED so the trap knows one already went out. The
-# trap is the backstop for everything NOT anticipated explicitly — chiefly
-# what "set -euo pipefail" itself takes: an unchecked curl or python
-# failure anywhere below aborts the script immediately, and without the
-# trap that abort would be silent on stdout in --json mode.
+# latches JSON_TERMINAL_EMITTED, but ONLY once the emission actually
+# succeeded, so the trap knows one really went out (see emit_terminal()
+# below for why this order matters). The trap is the backstop for
+# everything NOT anticipated explicitly — chiefly what "set -euo pipefail"
+# itself takes: an unchecked curl or python failure anywhere below aborts
+# the script immediately, and without the trap that abort would be silent
+# on stdout in --json mode.
+#
+# The real guarantee this gives: every exit bash itself can observe —
+# a normal `exit`, or the ones set -e/set -u take on their own — ends the
+# stream with a terminal event. A hard kill (SIGKILL) cannot run an EXIT
+# trap; no userspace code can change that. A GUI reading this stream must
+# still treat "the process ended with no terminal event" as a real, if
+# rare, outcome — not something this script can promise away.
 JSON_TERMINAL_EMITTED=0
 
 emit_json() {
@@ -45,7 +54,10 @@ emit_json() {
   # JSON number, anything else is a JSON string. Each call is its own
   # python3 process that prints one line and exits, so the line is already
   # flushed by the time this function returns — nothing here buffers
-  # across events. A no-op in human mode.
+  # across events. A no-op in human mode. Returns non-zero if python3
+  # could not run or the write failed (e.g. python3 missing, OOM, disk
+  # full, or the reader's end of the pipe is already gone) — callers that
+  # need to know whether the line actually reached stdout must check this.
   (( JSON_MODE )) || return 0
   python3 -c '
 import json, sys
@@ -64,17 +76,34 @@ print(json.dumps(obj), flush=True)
 }
 
 emit_terminal() {
-  JSON_TERMINAL_EMITTED=1
-  emit_json "$@"
+  # The latch must only ever claim a terminal event that actually reached
+  # stdout. Setting it unconditionally BEFORE calling emit_json (as an
+  # earlier version of this function did) would let a failed emission —
+  # python3 missing or broken, OOM, disk full, a reader that already hung
+  # up — set the latch anyway; under `set -e` that failure then aborts the
+  # script, the EXIT trap fires, sees the latch already set, and skips its
+  # own fallback believing an event went out that never did. That is
+  # exactly the silent-stream failure this whole mechanism exists to rule
+  # out, so the latch is set ONLY after emit_json reports success.
+  if emit_json "$@"; then
+    JSON_TERMINAL_EMITTED=1
+  fi
 }
 
 on_exit() {
   local code=$?
   if (( JSON_MODE )) && (( ! JSON_TERMINAL_EMITTED )); then
+    # Deliberately NOT emit_json/emit_terminal here: if python3 itself is
+    # what is broken (missing, OOM, whatever aborted the script in the
+    # first place), a fallback that also shells out to python3 would fail
+    # the exact same way and leave stdout just as silent. This fallback
+    # carries no user-controlled data — it is one of two fixed strings —
+    # so a plain `printf` of a literal JSON line has no escaping to get
+    # wrong and no dependency on the thing that may have just died.
     if (( code == 0 )); then
-      emit_terminal done
+      printf '%s\n' '{"event":"done"}'
     else
-      emit_terminal error reason="wa-pair exited unexpectedly (exit code $code)" fatal=true
+      printf '{"event":"error","reason":"wa-pair exited unexpectedly (exit code %d)","fatal":true}\n' "$code"
     fi
   fi
   exit "$code"
