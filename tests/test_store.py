@@ -1,8 +1,37 @@
-import json, sys
+import json, os, sys
+from contextlib import contextmanager
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
 from sink import store
+
+
+@contextmanager
+def _no_data_dir_or_secrets_override():
+    """Pop WA_DATA_DIR/WA_SECRETS_FILE for the duration of the block.
+
+    tests/runner.py sets both, process-wide, to a single throwaway
+    location so no test can ever reach the user's real state. That is
+    exactly what migrate_single_account must now consult (I1: it resolves
+    data_dir/secrets_file the same way store.data_dir()/secrets_path() do,
+    env override first), so a migration test working against its own
+    per-test tmpdir has to clear those two overrides first — same pattern
+    as test_the_sink_data_dir_is_a_subdirectory_of_the_state_root below.
+    """
+    previous_dir = os.environ.pop("WA_DATA_DIR", None)
+    previous_secrets = os.environ.pop("WA_SECRETS_FILE", None)
+    try:
+        yield
+    finally:
+        if previous_dir is not None:
+            os.environ["WA_DATA_DIR"] = previous_dir
+        if previous_secrets is not None:
+            os.environ["WA_SECRETS_FILE"] = previous_secrets
+
+
+def _migrate(state_root):
+    with _no_data_dir_or_secrets_override():
+        return store.migrate_single_account(state_root)
 
 
 def _entry(jid="56911111111@s.whatsapp.net", text="hola", name="Ana"):
@@ -71,7 +100,7 @@ def test_context_ring_stops_at_ten():
     with tmpdir() as d:
         jid = "56911111111@s.whatsapp.net"
         for i in range(25):
-            ring = store.append_context(d, jid, {"text": f"m{i}"})
+            ring = store.append_context(d, jid, {"text": f"m{i}"}, "personal")
         assert len(ring) == 10
         assert ring[-1]["text"] == "m24", "newest message must be last"
         assert ring[0]["text"] == "m15", "oldest must be dropped"
@@ -272,7 +301,7 @@ def _pre_migration_layout(d):
 def test_migration_produces_the_expected_layout():
     with tmpdir() as d:
         state_root, original_queue = _pre_migration_layout(d)
-        changed = store.migrate_single_account(state_root)
+        changed = _migrate(state_root)
         assert changed is True
 
         data_dir = state_root / "state"
@@ -311,11 +340,11 @@ def test_migration_produces_the_expected_layout():
 def test_migration_is_idempotent_running_twice_matches_running_once():
     with tmpdir() as d1, tmpdir() as d2:
         state_root_1, _ = _pre_migration_layout(d1)
-        store.migrate_single_account(state_root_1)
+        _migrate(state_root_1)
 
         state_root_2, _ = _pre_migration_layout(d2)
-        store.migrate_single_account(state_root_2)
-        second_run_changed = store.migrate_single_account(state_root_2)
+        _migrate(state_root_2)
+        second_run_changed = _migrate(state_root_2)
 
         assert second_run_changed is False
 
@@ -334,7 +363,7 @@ def test_migration_is_idempotent_running_twice_matches_running_once():
 def test_migration_on_an_already_migrated_layout_is_a_complete_noop():
     with tmpdir() as d:
         state_root, _ = _pre_migration_layout(d)
-        store.migrate_single_account(state_root)
+        _migrate(state_root)
 
         data_dir = state_root / "state"
         before = {
@@ -344,7 +373,7 @@ def test_migration_on_an_already_migrated_layout_is_a_complete_noop():
             "secrets": (state_root / "secrets.env").read_text(),
             "ctx": sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json")),
         }
-        changed = store.migrate_single_account(state_root)
+        changed = _migrate(state_root)
         assert changed is False
         after = {
             "accounts": (data_dir / "accounts.json").read_text(),
@@ -354,6 +383,100 @@ def test_migration_on_an_already_migrated_layout_is_a_complete_noop():
             "ctx": sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json")),
         }
         assert before == after
+
+
+def test_migration_retry_after_an_earlier_ctx_move_merges_instead_of_dropping():
+    # C1: a crash between step 4 (move ctx) and the final accounts.json
+    # write, followed by the still-legacy sink writing fresh messages to a
+    # new flat ctx file for the same jid, must not lose either side when
+    # the retry runs. Simulate exactly that partial state by hand.
+    with tmpdir() as d:
+        state_root, _ = _pre_migration_layout(d)
+        data_dir = state_root / "state"
+        ctx_dir = data_dir / "ctx"
+        jid = "1@s.whatsapp.net"
+        safe = jid.replace("/", "_")
+
+        # First run's step 4 already moved this jid's ring...
+        account_ctx_dir = ctx_dir / "personal"
+        account_ctx_dir.mkdir(parents=True)
+        (account_ctx_dir / f"{safe}.json").write_text(
+            json.dumps([{"from": "x", "text": "hi", "ts": "2026-09-22T09:00:00"}]))
+        # ...but never reached accounts.json, so a legacy write landed a
+        # NEW flat file at the old path in the meantime.
+        (ctx_dir / f"{safe}.json").write_text(
+            json.dumps([{"from": "x", "text": "durante el corte",
+                         "ts": "2026-09-22T09:45:00"}]))
+
+        changed = _migrate(state_root)
+        assert changed is True
+
+        merged = json.loads((account_ctx_dir / f"{safe}.json").read_text())
+        texts = [m["text"] for m in merged]
+        assert "hi" in texts, "the already-migrated message must survive"
+        assert "durante el corte" in texts, \
+            "the message written during the interruption must survive"
+        assert not (ctx_dir / f"{safe}.json").exists(), \
+            "the flat file must not be left behind once merged"
+
+
+def test_migration_retry_after_an_earlier_queue_rewrite_does_not_double_prefix():
+    # I3: simulate a crash right after step 3 (queue rewrite + save) but
+    # before ctx/secrets/accounts.json. The retry must not re-rewrite
+    # already-migrated entries into "personal:personal:<jid>".
+    with tmpdir() as d:
+        state_root, original_queue = _pre_migration_layout(d)
+        data_dir = state_root / "state"
+        already_rewritten = []
+        for e in original_queue:
+            e = dict(e)
+            e["account"] = "personal"
+            e["id"] = store.entry_id("personal", e["id"])
+            already_rewritten.append(e)
+        (data_dir / "queue.json").write_text(
+            json.dumps(already_rewritten, ensure_ascii=False))
+
+        changed = _migrate(state_root)
+        assert changed is True
+
+        migrated_queue = json.loads((data_dir / "queue.json").read_text())
+        assert len(migrated_queue) == len(original_queue), "no entry may be lost"
+        by_jid = {e["jid"]: e for e in migrated_queue}
+        for original in original_queue:
+            m = by_jid[original["jid"]]
+            assert m["id"] == "personal:" + original["jid"], \
+                "an already-migrated id must not be prefixed a second time"
+            assert m["text"] == original["text"]
+            assert m["status"] == original["status"]
+
+
+def test_migration_retry_before_the_config_cleanup_loses_nothing():
+    # I3: simulate a crash after accounts.json was written (the commit
+    # marker) but before the config.json quick_replies cleanup ran. The
+    # gate means a retry is now a declared no-op — the point of this test
+    # is that the leftover duplicate is harmless, not that it gets cleaned
+    # up retroactively, and that nothing else regresses.
+    with tmpdir() as d:
+        state_root, original_queue = _pre_migration_layout(d)
+        data_dir = state_root / "state"
+        _migrate(state_root)
+
+        # Put the quick_replies key back into config.json, as if the
+        # cleanup step never ran.
+        config = json.loads((data_dir / "config.json").read_text())
+        config["quick_replies"] = ["Uno", "Dos"]
+        (data_dir / "config.json").write_text(json.dumps(config, ensure_ascii=False))
+
+        changed = _migrate(state_root)
+        assert changed is False, "accounts.json existing must still gate everything off"
+
+        accts = json.loads((data_dir / "accounts.json").read_text())
+        assert accts[0]["quick_replies"] == ["Uno", "Dos"], \
+            "the account's own copy must be untouched by the leftover duplicate"
+        migrated_queue = json.loads((data_dir / "queue.json").read_text())
+        assert len(migrated_queue) == len(original_queue), "no entry may be lost"
+        config_after = json.loads((data_dir / "config.json").read_text())
+        assert config_after["groups_enabled"] == ["1@g.us"]
 
 
 if __name__ == "__main__":

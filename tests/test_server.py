@@ -31,7 +31,8 @@ def test_form_encoded_payload_is_queued():
 def test_queued_message_also_lands_in_the_context_ring():
     with tmpdir() as d:
         handle_payload(json.dumps(EV).encode(), "application/json", d)
-        ring = store.load_context(d, "56911111111@s.whatsapp.net")
+        ring = store.load_context(d, "56911111111@s.whatsapp.net",
+                                  server._SINGLE_ACCOUNT_ID)
         assert len(ring) == 1 and ring[0]["text"] == "hola"
 
 

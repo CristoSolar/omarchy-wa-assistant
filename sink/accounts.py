@@ -17,11 +17,16 @@ def load(data_dir) -> list:
 
     A missing file reads as an empty list — a fresh, unmigrated or
     not-yet-configured install has no accounts yet. A file that exists but
-    cannot be parsed still raises store.StoreReadError, same as every other
-    state file: never mistake a broken accounts.json for "no accounts".
+    cannot be parsed, or parses to something other than a JSON list, still
+    raises store.StoreReadError, same as every other state file: never
+    mistake a broken accounts.json for "no accounts".
     """
-    accounts = store.read_json(Path(data_dir) / "accounts.json", [])
-    return accounts if isinstance(accounts, list) else []
+    path = Path(data_dir) / "accounts.json"
+    accounts = store.read_json(path, [])
+    if not isinstance(accounts, list):
+        raise store.StoreReadError(
+            path, f"expected a JSON list, got {type(accounts).__name__}")
+    return accounts
 
 
 def by_instance(accounts, instance_name):

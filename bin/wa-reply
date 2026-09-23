@@ -22,6 +22,14 @@ from sink import store  # noqa: E402
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 AGENT = Path(__file__).resolve().parents[1] / "agents" / "respuesta.md"
+
+# TEMPORARY bridge until Task 3 resolves the sending account from the
+# queue entry's own "account" field. Until then wa-reply only ever serves
+# the single migrated account, and context must be read from the same
+# per-account location migration moved it to (ctx/personal/<jid>.json) —
+# store.load_context now requires an explicit account precisely so this
+# can never silently fall back to the pre-migration flat layout.
+_SINGLE_ACCOUNT_ID = "personal"
 # Not anchored: a real `claude -p` reply often wraps the fenced block in a
 # preamble ("Claro, aca va:\n```\nHola\n```"), and the backticks must never
 # reach the recipient.
@@ -179,7 +187,8 @@ def cmd_draft(args):
                          ensure_ascii=False))
         return
     agent_text = AGENT.read_text() if AGENT.exists() else ""
-    prompt = build_prompt(agent_text, store.load_context(d, entry["jid"]),
+    prompt = build_prompt(agent_text,
+                          store.load_context(d, entry["jid"], _SINGLE_ACCOUNT_ID),
                           args.idea, entry["push_name"])
     try:
         out = subprocess.run(["claude", "-p", prompt], capture_output=True,

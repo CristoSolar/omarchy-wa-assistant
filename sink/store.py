@@ -6,6 +6,7 @@ half-written JSON file behind.
 """
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -170,17 +171,20 @@ def remove_queue(d, entry_id) -> list:
     return _save_queue(d, queue)
 
 
-def _ctx_path(d, jid, account=None) -> Path:
+def _ctx_path(d, jid, account) -> Path:
+    """ctx/<account>/<jid>.json.
+
+    `account` is required, not defaulted: a call site that forgets it must
+    fail loudly (TypeError) rather than silently reading/writing the
+    pre-migration flat ctx/<jid>.json — a post-migration install has no
+    reader for that path any more, so a quiet fallback there would look
+    like an empty context ring and start a second, invisible one.
+    """
     safe = jid.replace("/", "_")
-    if account is None:
-        # Legacy, pre-multi-account layout: ctx/<jid>.json. Kept so callers
-        # that have not yet been taught about accounts (server.py, wa-reply,
-        # until Tasks 2 and 3 land) keep working unchanged.
-        return Path(d) / "ctx" / f"{safe}.json"
     return Path(d) / "ctx" / account / f"{safe}.json"
 
 
-def append_context(d, jid, entry, account=None, limit=CONTEXT_LIMIT) -> list:
+def append_context(d, jid, entry, account, limit=CONTEXT_LIMIT) -> list:
     p = _ctx_path(d, jid, account)
     ring = read_json(p, [])
     if not isinstance(ring, list):
@@ -191,7 +195,7 @@ def append_context(d, jid, entry, account=None, limit=CONTEXT_LIMIT) -> list:
     return ring
 
 
-def load_context(d, jid, account=None) -> list:
+def load_context(d, jid, account) -> list:
     ring = read_json(_ctx_path(d, jid, account), [])
     return ring if isinstance(ring, list) else []
 
@@ -243,9 +247,17 @@ def migrate_single_account(state_root) -> bool:
     accounts.json is written but before the final config.json cleanup, the
     only residue is a harmless duplicate `quick_replies` key left behind in
     config.json — never data loss.
+
+    The sink-visible directory and the secrets file are resolved the same
+    way data_dir()/secrets_path() resolve them — an explicit WA_DATA_DIR or
+    WA_SECRETS_FILE override wins over a location derived from
+    `state_root` — so an install that has moved either independently of
+    its state root is migrated in the exact place its own processes read
+    from, never a state_root-derived path nothing else looks at.
     """
     state_root = Path(state_root)
-    data_dir = state_root / "state"
+    data_dir = Path(os.environ.get("WA_DATA_DIR", state_root / "state"))
+    data_dir.mkdir(parents=True, exist_ok=True)
     accounts_path = data_dir / "accounts.json"
     if accounts_path.exists():
         return False
@@ -274,7 +286,13 @@ def migrate_single_account(state_root) -> bool:
 
     # Step 4: move the context ring rather than abandon it. Only files
     # still sitting flat under ctx/ need moving; a partial prior run may
-    # have already moved some.
+    # have already moved some. If a retry finds BOTH a flat file and an
+    # already-moved one for the same jid — e.g. the first run moved it,
+    # then crashed before writing accounts.json, and the still-legacy
+    # server.py wrote fresh messages to a new flat file in the meantime —
+    # the flat one is never dropped: the two rings are merged (oldest
+    # first, newest last, capped at CONTEXT_LIMIT) so nothing that arrived
+    # during the interruption is lost.
     ctx_dir = data_dir / "ctx"
     ctx_dir.mkdir(parents=True, exist_ok=True)
     account_ctx_dir = ctx_dir / account_id
@@ -283,12 +301,24 @@ def migrate_single_account(state_root) -> bool:
         target = account_ctx_dir / p.name
         if not target.exists():
             os.replace(p, target)
-        else:
-            p.unlink()
+            continue
+        source_ring = read_json(p, [])
+        if not isinstance(source_ring, list):
+            source_ring = []
+        target_ring = read_json(target, [])
+        if not isinstance(target_ring, list):
+            target_ring = []
+        merged = (target_ring + source_ring)[-CONTEXT_LIMIT:]
+        atomic_write(target, json.dumps(merged, ensure_ascii=False))
+        p.unlink()
+        print(f"migrate_single_account: merged context found at both "
+              f"{p} and {target} into the latter (retry after an "
+              f"interrupted run) — no messages were dropped",
+              file=sys.stderr, flush=True)
 
     # Step 2: copy WA_TOKEN to WA_TOKEN_PERSONAL in secrets.env, keeping
     # the original so an in-progress session is never broken by this.
-    secrets_file = state_root / "secrets.env"
+    secrets_file = Path(os.environ.get("WA_SECRETS_FILE", state_root / "secrets.env"))
     try:
         lines = secrets_file.read_text().splitlines()
     except FileNotFoundError:

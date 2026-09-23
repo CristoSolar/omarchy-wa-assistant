@@ -64,31 +64,15 @@ if [[ -d "$STATE/ctx" && "$STATE/ctx" != "$DATA/ctx" ]]; then
   rmdir "$STATE/ctx" 2>/dev/null || true
 fi
 
-# Seed quick_replies on first run, or on an existing config.json that
-# predates this key. Never overwrites or reorders an existing list, and
-# never touches groups_enabled or any other key already there. A
-# config.json that exists but cannot be read/parsed is left alone here —
-# that is a broken install for wa-reply/wa-status to surface loudly, not
-# something wa-up should silently paper over by rewriting it.
-PYTHONPATH="$ROOT" python3 - "$DATA" <<'PYEOF'
-import json
-import sys
-from pathlib import Path
-from sink import store
-
-d = Path(sys.argv[1])
-try:
-    cfg = store.load_config(d)
-except store.StoreReadError:
-    sys.exit(0)
-if "quick_replies" not in cfg:
-    cfg["quick_replies"] = [
-        "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede "
-        "responder pero responderá en breve."
-    ]
-    store.atomic_write(d / "config.json", json.dumps(cfg, ensure_ascii=False))
-    print("seeded quick_replies default in config.json")
-PYEOF
+# quick_replies is no longer seeded here: it lives per account since the
+# multi-account migration (state/accounts.json), and seeding a canned
+# default into config.json's now-vestigial top-level key would collide
+# with that move — on a real install, migrate_single_account() moves the
+# user's own quick_replies onto the "personal" account, and this block
+# would immediately overwrite config.json with the factory default again,
+# which bin/wa-reply's `quick` command (still reading config.json until
+# Task 3) would then show instead of what the user configured. Seeding now
+# belongs to wa-pair, per account.
 
 if [[ ! -f "$SECRETS" ]]; then
   mkdir -p "$(dirname "$SECRETS")"

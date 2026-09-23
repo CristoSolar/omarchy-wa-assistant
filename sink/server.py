@@ -15,6 +15,15 @@ from sink.purge import purge_history
 
 PORT = 8099
 
+# TEMPORARY bridge until Task 2 resolves the real account from the event's
+# instanceName via sink.accounts.by_instance (built in Task 1). Until then
+# this sink only ever serves the single migrated account, and context must
+# land in the same per-account location migration moved it to
+# (ctx/personal/<jid>.json) — store.append_context/load_context now
+# require an explicit account precisely so a call site can never silently
+# fall back to the pre-migration flat layout that nothing reads any more.
+_SINGLE_ACCOUNT_ID = "personal"
+
 # JIDs of not-yet-enabled groups already logged, so a busy group chat
 # doesn't flood the log with the same JID on every message. Process-lifetime
 # only — it does not need to survive a restart.
@@ -51,7 +60,7 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
         return False
     store.append_context(data_dir, entry["jid"],
                          {"from": entry["push_name"], "text": entry["text"],
-                          "ts": entry["ts"]})
+                          "ts": entry["ts"]}, _SINGLE_ACCOUNT_ID)
     store.upsert_queue(data_dir, {
         "id": entry["jid"], "jid": entry["jid"],
         "push_name": entry["push_name"], "text": entry["text"],
