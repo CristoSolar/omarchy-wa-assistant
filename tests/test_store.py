@@ -191,5 +191,170 @@ def test_a_new_message_does_not_clear_an_interrupted_send():
         assert q[0]["status"] == "sending"
 
 
+def test_same_jid_under_two_accounts_does_not_collide():
+    with tmpdir() as d:
+        jid = "56911111111@s.whatsapp.net"
+        store.upsert_queue(d, {**_entry(jid=jid), "id": store.entry_id("personal", jid),
+                               "account": "personal"})
+        q = store.upsert_queue(d, {**_entry(jid=jid), "id": store.entry_id("trabajo", jid),
+                                   "account": "trabajo"})
+        assert len(q) == 2, "the same contact on two accounts must be two entries"
+        ids = {e["id"] for e in q}
+        assert ids == {"personal:" + jid, "trabajo:" + jid}
+
+
+def test_entry_id_and_split_entry_id_round_trip():
+    jid = "56911111111@s.whatsapp.net"
+    eid = store.entry_id("personal", jid)
+    assert eid == "personal:" + jid
+    assert store.split_entry_id(eid) == ("personal", jid)
+
+
+def test_entry_id_round_trip_with_a_colon_in_the_jid():
+    # Real JIDs on LID accounts look like "237786636488820:23@lid". A naive
+    # rsplit or split-all would cut this in the wrong place and resolve the
+    # entry to the wrong chat.
+    jid = "237786636488820:23@lid"
+    eid = store.entry_id("personal", jid)
+    assert eid == "personal:237786636488820:23@lid"
+    account_id, recovered_jid = store.split_entry_id(eid)
+    assert account_id == "personal"
+    assert recovered_jid == jid
+
+
+def test_context_for_one_account_is_invisible_to_another():
+    with tmpdir() as d:
+        jid = "56911111111@s.whatsapp.net"
+        store.append_context(d, jid, {"text": "hola personal"}, account="personal")
+        store.append_context(d, jid, {"text": "hola trabajo"}, account="trabajo")
+        personal_ring = store.load_context(d, jid, account="personal")
+        trabajo_ring = store.load_context(d, jid, account="trabajo")
+        assert [c["text"] for c in personal_ring] == ["hola personal"]
+        assert [c["text"] for c in trabajo_ring] == ["hola trabajo"]
+
+
+def _pre_migration_layout(d):
+    """A realistic single-account, pre-migration state root."""
+    state_root = d
+    data_dir = state_root / "state"
+    (data_dir / "ctx").mkdir(parents=True)
+    (state_root).mkdir(exist_ok=True)
+    secrets = state_root / "secrets.env"
+    secrets.write_text(
+        "WUZAPI_ADMIN_TOKEN=abc123\n"
+        "WUZAPI_GLOBAL_ENCRYPTION_KEY=def456\n"
+        "WA_TOKEN=tok-personal-789\n"
+    )
+    queue = [
+        {"id": "1@s.whatsapp.net", "jid": "1@s.whatsapp.net", "push_name": "Ana",
+         "text": "hola", "count": 1, "ts": "2026-09-22T10:00:00", "status": "pending"},
+        {"id": "2@s.whatsapp.net", "jid": "2@s.whatsapp.net", "push_name": "Beto",
+         "text": "que tal", "count": 2, "ts": "2026-09-22T11:00:00", "status": "sending"},
+        {"id": "237786636488820:23@lid", "jid": "237786636488820:23@lid",
+         "push_name": "Cami", "text": "che", "count": 1,
+         "ts": "2026-09-22T12:00:00", "status": "unknown"},
+    ]
+    (data_dir / "queue.json").write_text(json.dumps(queue, ensure_ascii=False))
+    (data_dir / "config.json").write_text(json.dumps(
+        {"groups_enabled": ["1@g.us"], "quick_replies": ["Uno", "Dos"]}))
+    for jid in ("1@s.whatsapp.net", "2@s.whatsapp.net"):
+        safe = jid.replace("/", "_")
+        (data_dir / "ctx" / f"{safe}.json").write_text(
+            json.dumps([{"from": "x", "text": "hi", "ts": "2026-09-22T09:00:00"}]))
+    # The colon-bearing jid needs its ctx filename derived the same way
+    # store does, so migration must find it too.
+    lid_jid = "237786636488820:23@lid"
+    (data_dir / "ctx" / f"{lid_jid.replace('/', '_')}.json").write_text(
+        json.dumps([{"from": "y", "text": "hey", "ts": "2026-09-22T09:30:00"}]))
+    return state_root, queue
+
+
+def test_migration_produces_the_expected_layout():
+    with tmpdir() as d:
+        state_root, original_queue = _pre_migration_layout(d)
+        changed = store.migrate_single_account(state_root)
+        assert changed is True
+
+        data_dir = state_root / "state"
+        accts = json.loads((data_dir / "accounts.json").read_text())
+        assert accts == [{
+            "id": "personal", "label": "Personal", "wuzapi_user": "omarchy",
+            "agent": "respuesta.md", "quick_replies": ["Uno", "Dos"],
+        }]
+
+        migrated_queue = json.loads((data_dir / "queue.json").read_text())
+        assert len(migrated_queue) == len(original_queue), "no entry may be lost"
+        by_old_jid = {e["jid"]: e for e in migrated_queue}
+        for original in original_queue:
+            m = by_old_jid[original["jid"]]
+            assert m["account"] == "personal"
+            assert m["id"] == "personal:" + original["jid"]
+            assert m["text"] == original["text"]
+            assert m["status"] == original["status"]
+
+        config = json.loads((data_dir / "config.json").read_text())
+        assert config["groups_enabled"] == ["1@g.us"], "groups_enabled must stay put"
+        assert "quick_replies" not in config, "quick_replies must move to the account"
+
+        assert not list((data_dir / "ctx").glob("*.json")), "ctx must not be left flat"
+        moved = sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json"))
+        assert moved == sorted([
+            "1@s.whatsapp.net.json", "2@s.whatsapp.net.json",
+            "237786636488820:23@lid.json",
+        ])
+
+        secrets_text = (state_root / "secrets.env").read_text()
+        assert "WA_TOKEN=tok-personal-789" in secrets_text, "original token must survive"
+        assert "WA_TOKEN_PERSONAL=tok-personal-789" in secrets_text
+
+
+def test_migration_is_idempotent_running_twice_matches_running_once():
+    with tmpdir() as d1, tmpdir() as d2:
+        state_root_1, _ = _pre_migration_layout(d1)
+        store.migrate_single_account(state_root_1)
+
+        state_root_2, _ = _pre_migration_layout(d2)
+        store.migrate_single_account(state_root_2)
+        second_run_changed = store.migrate_single_account(state_root_2)
+
+        assert second_run_changed is False
+
+        def _snapshot(root):
+            data_dir = root / "state"
+            return (
+                json.loads((data_dir / "accounts.json").read_text()),
+                json.loads((data_dir / "queue.json").read_text()),
+                json.loads((data_dir / "config.json").read_text()),
+                sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json")),
+                (root / "secrets.env").read_text(),
+            )
+        assert _snapshot(state_root_1) == _snapshot(state_root_2)
+
+
+def test_migration_on_an_already_migrated_layout_is_a_complete_noop():
+    with tmpdir() as d:
+        state_root, _ = _pre_migration_layout(d)
+        store.migrate_single_account(state_root)
+
+        data_dir = state_root / "state"
+        before = {
+            "accounts": (data_dir / "accounts.json").read_text(),
+            "queue": (data_dir / "queue.json").read_text(),
+            "config": (data_dir / "config.json").read_text(),
+            "secrets": (state_root / "secrets.env").read_text(),
+            "ctx": sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json")),
+        }
+        changed = store.migrate_single_account(state_root)
+        assert changed is False
+        after = {
+            "accounts": (data_dir / "accounts.json").read_text(),
+            "queue": (data_dir / "queue.json").read_text(),
+            "config": (data_dir / "config.json").read_text(),
+            "secrets": (state_root / "secrets.env").read_text(),
+            "ctx": sorted(p.name for p in (data_dir / "ctx" / "personal").glob("*.json")),
+        }
+        assert before == after
+
+
 if __name__ == "__main__":
     run(dict(globals()))

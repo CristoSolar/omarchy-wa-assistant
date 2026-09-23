@@ -170,13 +170,18 @@ def remove_queue(d, entry_id) -> list:
     return _save_queue(d, queue)
 
 
-def _ctx_path(d, jid) -> Path:
+def _ctx_path(d, jid, account=None) -> Path:
     safe = jid.replace("/", "_")
-    return Path(d) / "ctx" / f"{safe}.json"
+    if account is None:
+        # Legacy, pre-multi-account layout: ctx/<jid>.json. Kept so callers
+        # that have not yet been taught about accounts (server.py, wa-reply,
+        # until Tasks 2 and 3 land) keep working unchanged.
+        return Path(d) / "ctx" / f"{safe}.json"
+    return Path(d) / "ctx" / account / f"{safe}.json"
 
 
-def append_context(d, jid, entry, limit=CONTEXT_LIMIT) -> list:
-    p = _ctx_path(d, jid)
+def append_context(d, jid, entry, account=None, limit=CONTEXT_LIMIT) -> list:
+    p = _ctx_path(d, jid, account)
     ring = read_json(p, [])
     if not isinstance(ring, list):
         ring = []
@@ -186,6 +191,143 @@ def append_context(d, jid, entry, limit=CONTEXT_LIMIT) -> list:
     return ring
 
 
-def load_context(d, jid) -> list:
-    ring = read_json(_ctx_path(d, jid), [])
+def load_context(d, jid, account=None) -> list:
+    ring = read_json(_ctx_path(d, jid, account), [])
     return ring if isinstance(ring, list) else []
+
+
+# --- Multi-account: composite queue ids -------------------------------
+
+
+def entry_id(account_id: str, jid: str) -> str:
+    """The queue entry id for a (account, jid) pair: `<account_id>:<jid>`.
+
+    Composite on purpose: with the id equal to the bare jid, the same
+    contact writing to two accounts would produce two events with the same
+    id and one entry would overwrite the other in the queue.
+    """
+    return f"{account_id}:{jid}"
+
+
+def split_entry_id(eid: str):
+    """The inverse of entry_id: `<account_id>:<jid>` -> (account_id, jid).
+
+    Splits on the FIRST colon only. An account id is a slug and cannot
+    contain one; a JID can and real ones do (e.g.
+    "237786636488820:23@lid"). Splitting on the first colon is the only
+    split that can never cut a JID in the wrong place — rsplit or a
+    split-all would corrupt such a JID and resolve the entry to the wrong
+    chat.
+    """
+    account_id, sep, jid = eid.partition(":")
+    if not sep:
+        raise ValueError(f"not a composite entry id (no ':'): {eid!r}")
+    return account_id, jid
+
+
+# --- Migration: single account -> accounts.json ------------------------
+
+
+def migrate_single_account(state_root) -> bool:
+    """Migrate a pre-multi-account install to the accounts.json layout.
+
+    Follows the spec's five steps. Idempotent: a second run is a no-op,
+    and a run against an already-migrated install (accounts.json already
+    exists) changes nothing and returns False immediately — that check is
+    the ONLY gate, so every step below must tolerate being re-applied to
+    state a previous, interrupted run already partly migrated.
+    accounts.json is written last, once every other step has succeeded,
+    so it doubles as the commit marker: if the process dies before it is
+    written, the next run has no accounts.json, redoes the (idempotent)
+    steps, and reaches the same end state either way. If it dies after
+    accounts.json is written but before the final config.json cleanup, the
+    only residue is a harmless duplicate `quick_replies` key left behind in
+    config.json — never data loss.
+    """
+    state_root = Path(state_root)
+    data_dir = state_root / "state"
+    accounts_path = data_dir / "accounts.json"
+    if accounts_path.exists():
+        return False
+
+    account_id = "personal"
+
+    # Step 1 (data collection only; the write happens last): read the
+    # existing config so we know what quick_replies to carry over.
+    config = load_config(data_dir)
+    quick_replies = config.get("quick_replies", [])
+    if not isinstance(quick_replies, list):
+        quick_replies = []
+
+    # Step 3: rewrite each queue entry, idempotently. Only entries that do
+    # not already carry an "account" field are pre-migration; a partial
+    # prior run may have already rewritten some.
+    queue = load_queue(data_dir)
+    changed_queue = False
+    for e in queue:
+        if "account" not in e:
+            e["account"] = account_id
+            e["id"] = entry_id(account_id, e["id"])
+            changed_queue = True
+    if changed_queue:
+        _save_queue(data_dir, queue)
+
+    # Step 4: move the context ring rather than abandon it. Only files
+    # still sitting flat under ctx/ need moving; a partial prior run may
+    # have already moved some.
+    ctx_dir = data_dir / "ctx"
+    ctx_dir.mkdir(parents=True, exist_ok=True)
+    account_ctx_dir = ctx_dir / account_id
+    account_ctx_dir.mkdir(exist_ok=True)
+    for p in ctx_dir.glob("*.json"):
+        target = account_ctx_dir / p.name
+        if not target.exists():
+            os.replace(p, target)
+        else:
+            p.unlink()
+
+    # Step 2: copy WA_TOKEN to WA_TOKEN_PERSONAL in secrets.env, keeping
+    # the original so an in-progress session is never broken by this.
+    secrets_file = state_root / "secrets.env"
+    try:
+        lines = secrets_file.read_text().splitlines()
+    except FileNotFoundError:
+        lines = []
+    token_value = None
+    has_personal = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("WA_TOKEN=") and "=" in stripped:
+            token_value = stripped.split("=", 1)[1]
+        if stripped.startswith("WA_TOKEN_PERSONAL="):
+            has_personal = True
+    if token_value is not None and not has_personal:
+        new_text = "\n".join(lines)
+        if new_text and not new_text.endswith("\n"):
+            new_text += "\n"
+        new_text += f"WA_TOKEN_PERSONAL={token_value}\n"
+        atomic_write(secrets_file, new_text)
+        os.chmod(secrets_file, 0o600)
+
+    # Steps 1 + 5, combined into the single atomic write that commits the
+    # migration: create accounts.json with the personal account, carrying
+    # over quick_replies.
+    account = {
+        "id": account_id,
+        "label": "Personal",
+        "wuzapi_user": "omarchy",
+        "agent": "respuesta.md",
+        "quick_replies": quick_replies,
+    }
+    atomic_write(accounts_path, json.dumps([account], ensure_ascii=False))
+
+    # Cleanup: drop quick_replies from config.json now that it lives on
+    # the account, leaving groups_enabled where it is. Best-effort — if
+    # this never runs (crash right after the write above), the only
+    # residue is a harmless duplicate, not a loss.
+    if "quick_replies" in config:
+        config = dict(config)
+        del config["quick_replies"]
+        atomic_write(data_dir / "config.json", json.dumps(config, ensure_ascii=False))
+
+    return True
