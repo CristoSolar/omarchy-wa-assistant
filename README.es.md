@@ -82,6 +82,10 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
   Cada chat en la cola muestra una etiqueta con la cuenta a la que
   pertenece, y al abrirlo la vista de detalle dice explícitamente desde qué
   número va a salir la respuesta.
+- **El engranaje (⚙)** abre una pantalla de configuración incrustada en el
+  mismo panel: la lista de cuentas configuradas, emparejar una nueva,
+  desvincular una y editar el tono y las respuestas rápidas de cada cuenta
+  — ver "Pantalla de configuración" más abajo.
 
 ## Requisitos
 
@@ -243,6 +247,12 @@ en sí, no algo que haga este plugin.
 
 ## Emparejar
 
+Esto se puede hacer desde la terminal, tal cual abajo, o desde la pantalla
+de configuración del panel (el engranaje, ⚙ — "+ Vincular cuenta nueva"),
+que corre este mismo script por detrás. Ver "Pantalla de configuración" más
+abajo para cómo se ve el camino desde la UI; el comportamiento de fondo no
+cambia entre uno y otro.
+
 ```sh
 ./bin/wa-pair <account-id> <número, formato internacional, sin +>
 ```
@@ -374,10 +384,15 @@ Cada entrada tiene:
   agregar, cambiar o borrar una; no hace falta reiniciar nada, el panel lo
   relee (vía `wa-reply quick`) cada vez que abrís un chat.
 
-Para cambiarle el nombre a una cuenta o sus respuestas rápidas, editá su
-entrada en `accounts.json` directamente y guardá — hoy no hay un comando
-para esto. Para cambiar su tono, editá el archivo que indica su campo
-`agent`.
+Para cambiarle el nombre a una cuenta, editá su entrada en `accounts.json`
+directamente y guardá — hoy no hay un comando para esto. Su tono y sus
+respuestas rápidas también se pueden editar a mano de la misma forma (el
+archivo que indica su campo `agent`, y su array `quick_replies`
+respectivamente), o desde la pantalla de configuración del panel (el
+engranaje, ⚙ — ver "Pantalla de configuración" más abajo), que lee y
+escribe exactamente los mismos archivos vía `wa-reply tone-get`/`tone-set`
+y `quick-get`/`quick-set`. Ninguna de las dos vías es una capa de
+almacenamiento distinta; la pantalla es otra puerta a los mismos archivos.
 
 **`groups_enabled` no es por cuenta.** Se queda exactamente donde siempre
 estuvo, en `~/.local/share/omarchy-wa/state/config.json`, compartido por
@@ -441,6 +456,133 @@ Es seguro correrla más de una vez y seguro interrumpirla: es un no-op una
 vez que existe `accounts.json`, y si se interrumpe a la mitad (un cuelgue a
 mitad de `wa-up`), el próximo `wa-up` retoma desde donde quedó en vez de
 rehacer pasos ya terminados o perder algo.
+
+## Pantalla de configuración
+
+El engranaje (⚙) en la esquina superior derecha del panel abre una pantalla
+de configuración incrustada en el mismo panel; el mismo botón, ahora
+rotulado "Volver", la cierra y vuelve a la cola de mensajes exactamente
+donde la dejaste. Lista todas las cuentas configuradas, y desde ahí podés
+emparejar una nueva, editar el tono o las respuestas rápidas de una cuenta
+existente, o desvincularla. Nunca envía un mensaje — no hay ningún camino
+de envío en la pantalla de configuración, solo los subcomandos de lectura y
+escritura de tono y respuestas rápidas de `wa-pair`/`wa-unlink`/`wa-reply`
+— y sigue corriendo un emparejamiento o una desvinculación en segundo plano
+aunque cierres la pantalla de configuración o todo el panel mientras uno
+está en curso.
+
+### Emparejar desde la UI
+
+"+ Vincular cuenta nueva" pide lo mismo que el comando de terminal — un id
+de cuenta y un número de teléfono — y después corre `wa-pair` en modo
+`--json` y muestra su progreso etapa por etapa:
+
+1. **Validando** el id de cuenta.
+2. **El código** — el mismo código de 8 dígitos que `wa-pair` imprime en la
+   terminal, mostrado grande, con las mismas instrucciones: WhatsApp >
+   Dispositivos vinculados > Vincular un dispositivo > Vincular con número
+   de teléfono.
+3. **Vinculado. Confirmando el webhook…**
+4. **Esperando que WhatsApp termine de mandar el historial** — la espera
+   del volcado de historial descrita en "Emparejar" más arriba. Puede
+   tardar varios minutos; la pantalla lo dice y se queda abierta. No pasa
+   nada raro si tarda un rato acá.
+5. Uno de los mismos tres resultados de historial que `wa-pair` siempre
+   reporta (ver "Emparejar" más arriba), mostrado como texto simple en vez
+   de algo que tengas que interpretar de una terminal:
+   - **purgado y verificado** — se vio historial y se confirmó que quedó
+     vacío;
+   - **quedan filas** — el historial puede no haberse borrado del todo,
+     mostrado como advertencia, con la misma indicación de "reiniciá el
+     sink y volvé a chequear";
+   - **nunca se vio una fila** — también mostrado como advertencia, nunca
+     como éxito. Es incertidumbre honesta, no un resultado vacío
+     confirmado: puede significar que esta cuenta no tiene historial, o que
+     WhatsApp todavía no había empezado a mandarlo, y la pantalla dice
+     exactamente eso en vez de elegir una de las dos.
+
+Si `wa-pair` se corta a la mitad (un reinicio de la barra, un crash) antes
+de reportar alguno de los tres resultados, la pantalla lo dice claramente
+en vez de adivinar — no sabe si la cuenta terminó vinculada, y te pide que
+lo chequees a mano (la lista de cuentas, o `docker logs omarchy-wa-sink`)
+antes de reintentar.
+
+**El camino de terminal sigue funcionando, sin cambios, y no está
+deprecado:**
+
+```sh
+./bin/wa-pair <account-id> <número, formato internacional, sin +>
+```
+
+Su modo `--json` (`./bin/wa-pair <account-id> <número> --json`, un objeto
+JSON por línea) es exactamente lo que la pantalla de configuración corre y
+consume — no hay un camino de emparejamiento separado, exclusivo de la UI.
+
+Una pantalla de configuración que hace más fácil emparejar no hace más
+segura la operación de emparejar. Si acaso, baja la fricción de una acción
+que carga el riesgo de baneo descrito al principio de este README — leé esa
+advertencia antes de usar cualquiera de los dos caminos, terminal o UI.
+
+### Desvincular
+
+"Desvincular" junto a una cuenta pide una confirmación escrita: tenés que
+tipear el id de la cuenta exactamente antes de que se habilite el botón.
+Antes de pedirla, calcula — en ese momento, nunca desde una copia guardada
+de cuando se abrió la pantalla — cuántas conversaciones pendientes de esa
+cuenta está por descartar, y lo dice en el texto de confirmación. Se niega
+a seguir si ese número no se pudo calcular, así que nunca te pide confirmar
+contra un número desconocido.
+
+Esas conversaciones pendientes se descartan, no se conservan, porque
+`bin/wa-reply` se niega para siempre a contestar una entrada de la cola
+cuya cuenta ya no existe (ver "Qué hace, en resumen" más arriba) —
+dejarlas en la cola después de que la cuenta desaparece las dejaría
+varadas ahí, visibles y sin poder responderse nunca. Descartarlas al
+desvincular es el resultado honesto, no una limitación a esquivar.
+
+**Desvincular no borra el archivo de tono** en `agents/<account-id>.md`.
+Eso es deliberado: no tiene ninguna credencial, es prosa que escribiste y
+editaste a mano, y volver a emparejar el mismo id de cuenta más adelante te
+lo devuelve en vez de hacerte escribirlo de nuevo.
+
+El comando equivalente en terminal:
+
+```sh
+./bin/wa-unlink <account-id>
+```
+
+con `--json` (el mismo vocabulario de eventos que `wa-pair --json`, y el
+transporte que usa la propia pantalla de configuración) y `--count-only`
+(imprime solo la cantidad de conversaciones a descartar para esa cuenta y
+no cambia nada — lo primero que calcula el diálogo de confirmación de
+arriba). Ver "Desvincular" más abajo para qué hace y qué no hace del lado
+de la lista de dispositivos de WhatsApp, y para tirar abajo toda la
+instalación en vez de una sola cuenta.
+
+### Editar tono y respuestas rápidas
+
+"Tono" y "Respuestas rápidas" abren un editor para el archivo de tono de
+esa cuenta (`agents/<account-id>.md`) y su lista `quick_replies` en
+`accounts.json`, respectivamente. Los dos siguen siendo archivos comunes,
+editables a mano — ver "Múltiples cuentas" más arriba — la pantalla de
+configuración es otra puerta a los mismos archivos, no un reemplazo de
+editarlos directamente.
+
+**Conflictos al guardar.** Los dos editores leen el contenido del archivo y
+un hash de ese contenido al abrirse, y mandan ese hash de vuelta al
+guardar. Si el archivo cambió en disco desde que se leyó, el guardado se
+rechaza directamente y no se escribe nada — nunca se combina, nunca se
+sobrescribe en silencio. Usá "Recargar" para traer el contenido actual y
+volver a aplicar tu cambio.
+
+La protección de respuestas rápidas es más burda que la del tono: calcula
+el hash de *todo* el archivo `accounts.json`, no solo de la entrada
+`quick_replies` de esa cuenta, así que un cambio a mano (u otro guardado
+desde la pantalla de configuración) a una cuenta *distinta*, entre que se
+abrió esta pantalla y se guarda, también puede bloquear este guardado,
+aunque nada de la cuenta que estás editando haya cambiado en realidad. Esto
+nunca pierde datos — solo te obliga a recargar y reintentar — pero es más
+burdo de lo que hace falta, y el propio texto de la pantalla lo dice.
 
 ## Habilitar un grupo
 
@@ -707,8 +849,26 @@ rm -rf ~/.local/share/omarchy-wa
 
 ## Desvincular
 
-Los `docker rm -f`/`rm -rf` de abajo tiran abajo toda la instalación —
-todas las cuentas emparejadas de una, no solo una. Hacé esto en orden:
+Para sacar **una sola** cuenta y dejar el resto de la instalación
+funcionando, usá:
+
+```sh
+./bin/wa-unlink <account-id>
+```
+
+o el botón "Desvincular" de la pantalla de configuración (ver "Pantalla de
+configuración" más arriba para el flujo de confirmación, qué descarta, y
+por qué). Esto cierra la sesión de esa cuenta en wuzapi, la saca de
+`accounts.json`, borra su token de `secrets.env`, borra su anillo de
+contexto, y descarta sus entradas pendientes en la cola — pero deja a
+propósito `agents/<account-id>.md` (su archivo de tono) intacto. No saca
+por sí solo el dispositivo de la lista de "Dispositivos vinculados" de
+WhatsApp; hacelo también en el teléfono si querés que WhatsApp considere
+desvinculado el número, no solo esta instalación.
+
+Para tirar abajo **toda** la instalación — todas las cuentas emparejadas
+de una, no solo una — los `docker rm -f`/`rm -rf` de abajo siguen siendo
+el camino:
 
 1. En **cada número de teléfono** que emparejaste: **WhatsApp >
    Dispositivos vinculados**, y sacá este dispositivo de la lista. Hacé
@@ -718,9 +878,6 @@ todas las cuentas emparejadas de una, no solo una. Hacé esto en orden:
    acá que te recuerde a qué teléfonos les falta.
 2. `docker rm -f omarchy-wuzapi omarchy-wa-sink`
 3. `rm -rf ~/.local/share/omarchy-wa`
-
-Hoy no hay un comando para desvincular una sola cuenta dejando las demás
-funcionando — esto tira abajo toda la instalación.
 
 Saltearse el paso 1 deja el dispositivo listado como vinculado del lado de
 WhatsApp aunque ya hayas tirado abajo los contenedores acá.

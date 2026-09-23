@@ -76,6 +76,10 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
   then does **Enviar** turn on. Each queued chat shows a badge naming which
   account it belongs to, and once you open one the detail view states
   plainly which number the reply will go out from.
+- **The gear (⚙)** opens a settings screen embedded in the same panel: the
+  list of configured accounts, linking a new one, unlinking one, and
+  editing each account's tone and quick replies — see "Settings screen"
+  below.
 
 ## Requirements
 
@@ -227,6 +231,12 @@ something this plugin does.
 
 ## Pairing
 
+This can be done from the terminal, exactly as below, or from the panel's
+settings screen (the gear, ⚙ — "+ Vincular cuenta nueva"), which drives
+this same script under the hood. See "Settings screen" below for what the
+UI path looks like; nothing about the underlying behaviour differs between
+the two.
+
 ```sh
 ./bin/wa-pair <account-id> <number, international format, no +>
 ```
@@ -349,9 +359,14 @@ has:
   needed, the panel re-reads it (via `wa-reply quick`) every time you open a
   chat.
 
-To rename an account's label or change its quick replies, edit its entry in
-`accounts.json` directly and save — there's no command for this today. To
-change its tone, edit the file named in its `agent` field.
+To rename an account's label, edit its entry in `accounts.json` directly and
+save — there's no command for this today. Its tone and quick replies can
+also be hand-edited the same way (the file named in its `agent` field, and
+its `quick_replies` array respectively), or edited through the panel's
+settings screen (the gear, ⚙ — see "Settings screen" below), which reads and
+writes the exact same files via `wa-reply tone-get`/`tone-set` and
+`quick-get`/`quick-set`. Neither is a separate storage layer; the screen is
+another door onto the same files.
 
 **`groups_enabled` is not per account.** It stays exactly where it always
 was, in `~/.local/share/omarchy-wa/state/config.json`, shared by every
@@ -411,6 +426,123 @@ This is safe to run more than once and safe to interrupt: it is a no-op
 once `accounts.json` exists, and if it's ever interrupted partway (a crash
 mid-`wa-up`), the next `wa-up` picks up wherever it left off rather than
 redoing finished steps or losing anything.
+
+## Settings screen
+
+The gear (⚙) in the panel's top-right corner opens a settings screen
+embedded in the same panel; the same button, now labelled "Volver", closes
+it and returns to the message queue exactly where you left it. It lists
+every configured account, and from there you can link a new one, edit an
+existing account's tone or quick replies, or unlink it. It never sends a
+message — there is no send path in the settings screen at all, only
+`wa-pair`/`wa-unlink`/`wa-reply`'s read and write subcommands for tone and
+quick replies — and it keeps running a link or an unlink in the background
+even if you close the settings screen or the whole panel while one is
+mid-flight.
+
+### Linking from the UI
+
+"+ Vincular cuenta nueva" asks for the same two things the terminal command
+does — an account id and a phone number — then runs `wa-pair` in `--json`
+mode and shows its progress one stage at a time:
+
+1. **Validating** the account id.
+2. **The code** — the same 8-digit linking code `wa-pair` prints on the
+   terminal, shown large, with the same instructions: WhatsApp > Linked
+   devices > Link device > Link with phone number.
+3. **Linked. Confirming the webhook…**
+4. **Waiting for WhatsApp to finish sending the history** — the
+   history-dump wait described under "Pairing" above. This can take
+   several minutes; the screen says so and stays open. Nothing is wrong if
+   it sits here a while.
+5. One of the same three history outcomes `wa-pair` always reports (see
+   "Pairing" above), shown as plain text rather than something you have to
+   parse from a terminal:
+   - **purged and verified** — history was seen and confirmed cleared;
+   - **rows remaining** — history may not be fully cleared, shown as a
+     warning, with the same "restart the sink and check again" guidance;
+   - **never saw a row** — also shown as a warning, never as success. This
+     is honest uncertainty, not a confirmed empty result: it can mean this
+     account has no history, or that WhatsApp simply hadn't started
+     sending it yet, and the screen says exactly that rather than picking
+     one.
+
+If `wa-pair` is killed mid-run (a bar restart, a crash) before it reports
+any of the three, the screen says so plainly instead of guessing — it does
+not know whether the account ended up linked, and tells you to check by
+hand (the account list, or `docker logs omarchy-wa-sink`) before retrying.
+
+**The terminal path still works, unchanged, and is not deprecated:**
+
+```sh
+./bin/wa-pair <account-id> <number, international format, no +>
+```
+
+Its `--json` mode (`./bin/wa-pair <account-id> <number> --json`, one JSON
+object per line) is exactly what the settings screen runs and consumes —
+there is no separate, UI-only pairing path.
+
+A settings screen that makes linking easier does not make linking safer.
+If anything it lowers the friction on an action that carries the ban risk
+described at the top of this README — read that warning before you use
+either path, terminal or UI.
+
+### Unlinking
+
+"Desvincular" next to an account asks for a typed confirmation: you must
+type the account id exactly before the button enables. Before asking, it
+fetches — fresh at that moment, never cached from when the screen was
+opened — how many pending conversations for that account it is about to
+discard, and states the count in the confirmation text. It refuses to
+proceed if that count could not be fetched, so you are never asked to
+confirm against an unknown number.
+
+Those pending conversations are discarded, not preserved, because
+`bin/wa-reply` refuses forever to answer a queue entry whose account no
+longer exists (see "What it does, in short" above) — leaving them in the
+queue after the account is gone would strand them there, visible and
+permanently unanswerable. Discarding them at unlink time is the honest
+outcome, not a limitation to route around.
+
+**Unlinking does not remove the tone file** under `agents/<account-id>.md`.
+That is deliberate: it holds no credential, it is prose you wrote and
+edited by hand, and re-linking the same account id later gets it back
+instead of making you write it again.
+
+The equivalent terminal command:
+
+```sh
+./bin/wa-unlink <account-id>
+```
+
+with `--json` (the same event vocabulary as `wa-pair --json`, and the
+settings screen's own transport) and `--count-only` (prints just the
+pending-discard count for that account and changes nothing — what the
+confirmation dialog above fetches first). See "Unlinking" further below for
+what unlinking does and does not do to the WhatsApp-side device list, and
+for tearing down the whole install instead of one account.
+
+### Editing tone and quick replies
+
+"Tono" and "Respuestas rápidas" open an editor for that account's tone file
+(`agents/<account-id>.md`) and its `quick_replies` list in `accounts.json`,
+respectively. Both remain ordinary hand-editable files — see "Multiple
+accounts" above — the settings screen is another door onto the same files,
+not a replacement for editing them directly.
+
+**Save conflicts.** Both editors read the file's content and a hash of it
+when opened, and send that hash back with the save. If the file changed on
+disk since it was read, the save is refused outright and nothing is
+written — never merged, never silently overwritten. Use "Recargar" to pick
+up the current content, then reapply your edit.
+
+The quick-replies guard is coarser than the tone guard: it hashes the
+*whole* `accounts.json` file, not just the one account's `quick_replies`
+entry, so a hand edit (or another settings-screen save) to a *different*
+account between opening this screen and saving can also block this save,
+even though nothing about the account you're editing actually conflicted.
+This never loses data — it only makes you reload and retry — but it is
+coarser than it strictly needs to be, and the screen's own text says so.
 
 ## Enabling a group
 
@@ -661,8 +793,23 @@ rm -rf ~/.local/share/omarchy-wa
 
 ## Unlinking
 
-`docker rm -f`/`rm -rf` below tear down the whole install — every paired
-account at once, not just one. Do this in order:
+To remove **one** account and leave the rest of the install running, use:
+
+```sh
+./bin/wa-unlink <account-id>
+```
+
+or the settings screen's "Desvincular" button (see "Settings screen"
+above for the confirmation flow, what it discards, and why). This logs the
+account out of wuzapi, removes it from `accounts.json`, removes its token
+from `secrets.env`, removes its context ring, and discards its pending
+queue entries — but deliberately leaves `agents/<account-id>.md` (its tone
+file) in place. It does **not** by itself remove the device from
+WhatsApp's own "Linked devices" list; do that on the phone too if you want
+WhatsApp to consider the number unlinked, not just this install.
+
+To tear down the **whole** install — every paired account at once, not
+just one — `docker rm -f`/`rm -rf` below is still the way:
 
 1. On **each phone number** you paired: **WhatsApp > Linked devices**, and
    remove this device from the list. Do this first, for every account —
@@ -672,9 +819,6 @@ account at once, not just one. Do this in order:
    need it done.
 2. `docker rm -f omarchy-wuzapi omarchy-wa-sink`
 3. `rm -rf ~/.local/share/omarchy-wa`
-
-There's no command to unlink a single account while leaving the others
-running today — this tears down the whole install.
 
 Skipping step 1 leaves the device listed as linked on WhatsApp's side even
 after you've torn down the containers here.
