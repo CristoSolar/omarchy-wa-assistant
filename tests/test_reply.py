@@ -967,5 +967,92 @@ def test_draft_refuses_an_entry_whose_account_is_unknown():
             wa.subprocess.run = original_run
 
 
+def test_two_ids_differing_only_by_case_never_share_a_token():
+    # The Critical: by_id matches exactly, so `trabajo` and `Trabajo` are
+    # two DIFFERENT accounts, and an unvalidated upper-casing would give
+    # them both WA_TOKEN_TRABAJO — a message out under the wrong identity
+    # with no refusal. The charset makes the collision unrepresentable:
+    # such a file does not load at all.
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO,
+                     {"id": "Trabajo", "label": "Otra", "wuzapi_user": "otra"}))
+        entry = _queue_entry(account="Trabajo")
+        _enqueue(d, entry)
+
+        posted = []
+        original_post, wa._post = wa._post, (lambda *a, **k: posted.append(a))
+        sent = []
+        original_send, wa.send = wa.send, (
+            lambda jid, text, token: sent.append(token))
+        try:
+            _run_cmd_send(d, entry["id"])
+            raise AssertionError("a case-variant account id must never send")
+        except store.StoreReadError as exc:
+            assert "Trabajo" in str(exc)
+        finally:
+            wa._post = original_post
+            wa.send = original_send
+        assert sent == [] and posted == []
+        assert store.load_queue(d)[0]["status"] == "pending"
+
+
+def test_token_env_var_refuses_an_id_outside_the_charset():
+    for bad in ("Trabajo", "mi-trabajo", "a b; echo PWNED", "", None):
+        try:
+            wa.token_env_var(bad)
+            raise AssertionError(f"{bad!r} must not yield a token variable name")
+        except ValueError:
+            pass
+
+
+def test_token_var_refuses_a_shell_unsafe_id_and_prints_nothing():
+    # wa-pair substitutes this output into bash. It must be a legal shell
+    # identifier or nothing at all.
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            wa.cmd_token_var(SimpleNamespace(account_id="a b; echo PWNED"))
+        raise AssertionError("a shell-unsafe id must be refused")
+    except SystemExit as exc:
+        assert exc.code == 1
+    assert buf.getvalue() == "", "nothing may reach stdout for a refused id"
+
+
+def test_a_duplicate_account_id_is_refused_rather_than_first_wins():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, {**PERSONAL, "quick_replies": ["Otra cosa"]}))
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        try:
+            _run_cmd_quick(d, entry["id"])
+            raise AssertionError("a duplicate id must be a loud error")
+        except store.StoreReadError as exc:
+            assert "duplicate" in str(exc)
+
+
+def test_quick_on_a_vanished_entry_still_prints_an_array():
+    # The panel binds this output to its quick-reply list; one shape in
+    # every outcome. The non-zero exit carries the failure.
+    with tmpdir() as d:
+        _prepare(d)
+        buf = io.StringIO()
+        with _reply_env(d):
+            try:
+                with redirect_stdout(buf):
+                    wa.cmd_quick(SimpleNamespace(id="personal:nope@s.whatsapp.net"))
+                raise AssertionError("a vanished entry must exit non-zero")
+            except SystemExit as exc:
+                assert exc.code == 1
+        assert json.loads(buf.getvalue()) == []
+
+
+def test_an_entry_with_no_account_says_something_actionable():
+    entry_id = "1@s.whatsapp.net"
+    payload = wa.AccountNotStated(entry_id).payload
+    assert payload["error"].count("None") == 0
+    assert entry_id in payload["error"] and "wa-up" in payload["error"]
+    assert isinstance(wa.AccountNotStated(None), wa.UnknownAccount)
+
+
 if __name__ == "__main__":
     run(dict(globals()))

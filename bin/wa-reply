@@ -120,6 +120,27 @@ class MissingToken(ReplyRefused):
         })
 
 
+class AccountNotStated(UnknownAccount):
+    """The entry does not say which account it arrived on.
+
+    A pre-migration entry that somehow survived, or a hand-edited queue.
+    Same family as UnknownAccount — there is no account to answer from and
+    guessing one is the forbidden move — but the message has to name a
+    fixable cause instead of reading "cuenta None".
+    """
+
+    def __init__(self, entry_id=None):
+        which = f" ({entry_id})" if entry_id else ""
+        ReplyRefused.__init__(self, {
+            "ok": False,
+            "unknown_account": None,
+            "error": (f"la entrada{which} no dice de qué cuenta es, así que no "
+                      f"hay número desde el cual contestar; no se envía nada. "
+                      f"Es una entrada anterior a la migración: corré wa-up "
+                      f"(que migra) o descartála."),
+        })
+
+
 def token_env_var(account_id: str) -> str:
     """The name of the environment variable holding an account's token.
 
@@ -130,13 +151,17 @@ def token_env_var(account_id: str) -> str:
     agree in every test and disagree exactly once: at send time, on a real
     message to a real person.
 
-    The id is a slug that never changes (the spec forbids renaming it), so
-    a plain upper-casing is total and reversible; no character is dropped
-    or folded, which keeps two distinct account ids from ever collapsing
-    onto one variable name.
+    Upper-casing is only injective over a restricted charset, so the id is
+    validated first (accounts.validate_id, `^[a-z0-9_]+$`) and an id that
+    fails raises instead of yielding a name. Without that check `trabajo`
+    and `Trabajo` — two DIFFERENT accounts as far as accounts.by_id is
+    concerned — would both resolve to WA_TOKEN_TRABAJO and one of them
+    would send under the other's identity, with no refusal anywhere. The
+    charset is enforced here AND on every read of accounts.json, so
+    neither a caller nor the file can get around it; it also keeps the
+    derived name a legal shell identifier for secrets.env.
     """
-    if not account_id:
-        raise ValueError("an account id is required to name its token variable")
+    accounts.validate_id(account_id)
     return f"WA_TOKEN_{account_id.upper()}"
 
 
@@ -152,7 +177,7 @@ def resolve_account(d, entry) -> dict:
     """
     account_id = (entry or {}).get("account")
     if not account_id:
-        raise UnknownAccount(account_id)
+        raise AccountNotStated((entry or {}).get("id"))
     account = accounts.by_id(accounts.load(d), account_id)
     if account is None:
         raise UnknownAccount(account_id)
@@ -301,8 +326,22 @@ def cmd_token_var(args):
     the token into secrets.env derives its name from token_env_var() here
     instead of building the same string a second time in bash. It prints a
     variable NAME, never a value.
+
+    token_env_var validates the charset, so this can only ever print a
+    legal shell identifier: the output is substituted unquoted into bash
+    in wa-pair, and an id like `a b; echo x` or `mi-trabajo` must fail
+    here rather than become part of a command line. It deliberately does
+    NOT require the account to exist yet — wa-pair names an account before
+    creating it.
     """
-    print(token_env_var(args.account_id))
+    try:
+        print(token_env_var(args.account_id))
+    except ValueError as exc:
+        # Refused on stderr and with a non-zero exit, and nothing on
+        # stdout: a bash caller doing VAR=$(wa-reply token-var "$1") must
+        # get an empty capture and a failing status, never a fragment.
+        print(f"wa-reply: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 def cmd_list(args):
@@ -323,9 +362,15 @@ def cmd_quick(args):
     d = store.data_dir()
     entry = _entry(d, args.id)
     if entry is None:
-        print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
-                         ensure_ascii=False))
-        return
+        # Always an ARRAY on stdout, in every outcome: the panel binds this
+        # output straight to its quick-reply list, and a JSON object here
+        # (the shape the other subcommands use for an error) would be a
+        # second shape it has to know about. The exit code carries the
+        # failure instead — the empty list is "no buttons", not "this
+        # account has no quick replies".
+        print("[]")
+        print(f"wa-reply: no queue entry with id {args.id}", file=sys.stderr)
+        sys.exit(1)
     account = resolve_account(d, entry)
     quick = account.get("quick_replies", [])
     print(json.dumps(quick if isinstance(quick, list) else [], ensure_ascii=False))
