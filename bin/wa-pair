@@ -86,6 +86,13 @@ for _ in $(seq 1 40); do
      | grep -q '"loggedIn":true'; then
     echo "linked."
 
+    # Marks this install as having reached loggedIn:true at least once, so
+    # `wa-up` can tell "never paired" (nothing to wait for or heal) apart
+    # from "paired, mid-reconnect after a restart" (worth a bounded wait)
+    # the next time it recreates the containers. Idempotent; safe to
+    # re-touch on every successful pairing.
+    touch "$STATE/.paired" 2>/dev/null || true
+
     # AUTHORITATIVE webhook set. wuzapi's session login rebuilds its
     # in-memory client record, wiping any webhook set before login even
     # though the DB row (and GET /webhook) still shows it. A webhook set

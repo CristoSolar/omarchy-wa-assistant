@@ -167,8 +167,28 @@ echo "Pair with:  wa-pair <number>"
 # this one. Here we just wait for wuzapi to answer first, so the very first
 # run after `wa-up` gives an immediate, useful answer instead of the "not
 # reachable yet" a bare timer tick would print moments after a fresh start.
+#
+# Answering is not enough, though: a previously-paired device's credentials
+# survive the container recreate above, but wuzapi still has to reconnect
+# to WhatsApp's servers from scratch, and /session/status answers
+# immediately while reporting loggedIn:false until that reconnect finishes
+# — a race, not a hang. wa-heal (correctly, since it must stay fast and
+# idempotent for the timer) treats loggedIn:false as "nothing to heal", so
+# calling it the instant wuzapi answers can skip the one re-assert that
+# matters and leave the stack silently deaf — containers up, wa-status
+# healthy — until the next timer tick, dropping every message in between.
+# wa-up caused this restart, so wa-up is the one that waits for the
+# reconnect, not wa-heal.
+#
+# $STATE/.paired (written by wa-pair once a session has ever logged in)
+# tells the two honest-but-opposite cases apart: no marker means this
+# install has never been paired, so loggedIn:false is simply the truth,
+# not a race — nothing to wait for or heal, and the wait below is skipped
+# entirely so a fresh install isn't held up for no reason. A marker means
+# reconnect is expected, so it's worth a bounded wait.
 API=http://127.0.0.1:8080
 WA_TOKEN="${WA_TOKEN:-}"
+PAIRED_MARKER="$STATE/.paired"
 if [[ -n "$WA_TOKEN" ]]; then
   READY=""
   for _ in $(seq 1 20); do
@@ -178,9 +198,38 @@ if [[ -n "$WA_TOKEN" ]]; then
     fi
     sleep 1
   done
-  if [[ -n "$READY" ]]; then
-    WA_STATE_ROOT="$STATE" WA_SECRETS_FILE="$SECRETS" WA_API="$API" "$ROOT/bin/wa-heal" || true
-  else
+  if [[ -z "$READY" ]]; then
     echo "warning: wuzapi did not respond in time; skipped webhook self-heal check." >&2
+  elif [[ ! -f "$PAIRED_MARKER" ]]; then
+    echo "no session paired yet — nothing to heal. Run: wa-pair <number>"
+  else
+    # Bound chosen from what reconnecting a paired session actually takes
+    # (a few seconds, per wa-pair's own observed handshake) with generous
+    # headroom for a slow network — 30s, well short of the 5-minute timer
+    # interval, so a genuinely stuck reconnect is reported promptly instead
+    # of wa-up hanging.
+    LOGGED_IN=""
+    for _ in $(seq 1 30); do
+      STATUS=$(curl -s --max-time 2 "$API/session/status" -H "token: $WA_TOKEN" 2>/dev/null || true)
+      if echo "$STATUS" | python3 -c "
+import json, sys
+try:
+    sys.exit(0 if json.load(sys.stdin)['data']['loggedIn'] else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+        LOGGED_IN=1
+        break
+      fi
+      sleep 1
+    done
+    if [[ -n "$LOGGED_IN" ]]; then
+      WA_STATE_ROOT="$STATE" WA_SECRETS_FILE="$SECRETS" WA_API="$API" "$ROOT/bin/wa-heal" || true
+    else
+      echo "warning: session did not log back in within 30s — the webhook" >&2
+      echo "  could NOT be re-asserted. Incoming messages will be DROPPED" >&2
+      echo "  until it is. The wa-heal timer will retry within 5 minutes," >&2
+      echo "  or run it now: bin/wa-heal" >&2
+    fi
   fi
 fi
