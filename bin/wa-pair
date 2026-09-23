@@ -5,6 +5,82 @@
 # days_to_sync_history cannot prevent it, so we purge right afterwards.
 set -euo pipefail
 
+# --json is an additive, optional flag: it may appear anywhere in argv and
+# is stripped before the two positional args are parsed below, so the
+# existing usage error stays byte-identical when the flag is absent. See
+# docs/superpowers/specs/2026-09-23-settings-ui-design.md for the exact
+# event vocabulary this emits.
+JSON_MODE=0
+ARGS=()
+for _arg in "$@"; do
+  if [[ "$_arg" == "--json" ]]; then
+    JSON_MODE=1
+  else
+    ARGS+=("$_arg")
+  fi
+done
+set -- "${ARGS[@]}"
+
+# --- --json event emission --------------------------------------------------
+#
+# Every path that can end this script must emit a terminal ("done" or
+# "error") event in --json mode — a run that stops without one leaves a GUI
+# showing a spinner forever. Registered BEFORE the positional args are even
+# parsed, so a missing-argument usage error (an `exit` bash takes on its
+# own from `${1:?...}` under `set -u`) is still caught by the EXIT trap
+# below, not just the exit paths this script explicitly annotates.
+#
+# Each known exit point further down emits its OWN specific terminal event
+# (with a real reason) via emit_terminal() before exiting; emit_terminal()
+# latches JSON_TERMINAL_EMITTED so the trap knows one already went out. The
+# trap is the backstop for everything NOT anticipated explicitly — chiefly
+# what "set -euo pipefail" itself takes: an unchecked curl or python
+# failure anywhere below aborts the script immediately, and without the
+# trap that abort would be silent on stdout in --json mode.
+JSON_TERMINAL_EMITTED=0
+
+emit_json() {
+  # $1 = event name; remaining args are "key=value" pairs. A value of
+  # "true"/"false" becomes a JSON bool, an integer-looking value becomes a
+  # JSON number, anything else is a JSON string. Each call is its own
+  # python3 process that prints one line and exits, so the line is already
+  # flushed by the time this function returns — nothing here buffers
+  # across events. A no-op in human mode.
+  (( JSON_MODE )) || return 0
+  python3 -c '
+import json, sys
+obj = {"event": sys.argv[1]}
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    if v in ("true", "false"):
+        obj[k] = (v == "true")
+    else:
+        try:
+            obj[k] = int(v)
+        except ValueError:
+            obj[k] = v
+print(json.dumps(obj), flush=True)
+' "$@"
+}
+
+emit_terminal() {
+  JSON_TERMINAL_EMITTED=1
+  emit_json "$@"
+}
+
+on_exit() {
+  local code=$?
+  if (( JSON_MODE )) && (( ! JSON_TERMINAL_EMITTED )); then
+    if (( code == 0 )); then
+      emit_terminal done
+    else
+      emit_terminal error reason="wa-pair exited unexpectedly (exit code $code)" fatal=true
+    fi
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+
 ACCOUNT_ID="${1:?usage: wa-pair <account-id> <number, international, no +>}"
 NUMBER="${2:?usage: wa-pair <account-id> <number, international, no +>}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -13,6 +89,7 @@ SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
 DATA="${WA_DATA_DIR:-$STATE/state}"
 API=http://127.0.0.1:8080
 DB="$STATE/wuzdata/users.db"
+emit_json validating account="$ACCOUNT_ID"
 
 # The account id is validated in exactly one place — accounts.validate_id,
 # reached here through `wa-reply token-var` — never re-derived in bash.
@@ -23,10 +100,17 @@ DB="$STATE/wuzdata/users.db"
 # nothing on stdout and exits non-zero for an invalid id, and it has
 # already printed a clear reason on stderr, so there is nothing to add
 # here beyond stopping.
-TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || exit 1
+if (( JSON_MODE )); then
+  TOKEN_VAR_ERR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID" 2>&1 >/dev/null) || true
+fi
+TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || {
+  emit_terminal error reason="${TOKEN_VAR_ERR:-invalid account id: $ACCOUNT_ID}" fatal=true
+  exit 1
+}
 
 if [[ ! -f "$SECRETS" ]]; then
   echo "error: $SECRETS does not exist yet. Run wa-up first." >&2
+  emit_terminal error reason="$SECRETS does not exist yet. Run wa-up first." fatal=true
   exit 1
 fi
 # shellcheck disable=SC1090
@@ -131,9 +215,10 @@ read -r ACCOUNTS_STATUS WUZAPI_USER <<<"$RESOLVE_OUT"
 if [[ -z "$WUZAPI_USER" ]]; then
   echo "error: could not resolve or create accounts.json entry for $ACCOUNT_ID:" >&2
   echo "  $RESOLVE_OUT" >&2
+  emit_terminal error reason="could not resolve or create accounts.json entry for $ACCOUNT_ID: $RESOLVE_OUT" fatal=true
   exit 1
 fi
-echo "accounts.json: $ACCOUNT_ID ($ACCOUNTS_STATUS), wuzapi user: $WUZAPI_USER"
+(( JSON_MODE )) || echo "accounts.json: $ACCOUNT_ID ($ACCOUNTS_STATUS), wuzapi user: $WUZAPI_USER"
 
 if [[ "$ACCOUNTS_STATUS" == "added" ]]; then
   # Seed this account's tone file — only for a genuinely new account. An
@@ -148,7 +233,7 @@ if [[ "$ACCOUNTS_STATUS" == "added" ]]; then
     else
       touch "$AGENT_FILE"
     fi
-    echo "seeded tone file: $AGENT_FILE (edit this to change how $ACCOUNT_ID replies)"
+    (( JSON_MODE )) || echo "seeded tone file: $AGENT_FILE (edit this to change how $ACCOUNT_ID replies)"
   fi
 fi
 
@@ -166,6 +251,7 @@ HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" && ! "$BODY" =~ "already" ]]; then
   echo "error: failed to create wuzapi user (HTTP $HTTP_CODE): $BODY" >&2
+  emit_terminal error reason="failed to create wuzapi user (HTTP $HTTP_CODE): $BODY" fatal=true
   exit 1
 fi
 
@@ -202,13 +288,15 @@ CODE=$(curl -s -X POST "$API/session/pairphone" -H "token: $TOKEN_VALUE" \
   -H "Content-Type: application/json" -d "{\"Phone\":\"$NUMBER\"}" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['LinkingCode'])")
 
-echo "Linking code: $CODE"
-echo "WhatsApp > Linked devices > Link device > Link with phone number"
+emit_json code code="$CODE"
+(( JSON_MODE )) || echo "Linking code: $CODE"
+(( JSON_MODE )) || echo "WhatsApp > Linked devices > Link device > Link with phone number"
 
 for _ in $(seq 1 40); do
   if curl -s "$API/session/status" -H "token: $TOKEN_VALUE" \
      | grep -q '"loggedIn":true'; then
-    echo "linked."
+    (( JSON_MODE )) || echo "linked."
+    emit_json linked
 
     # wa-up used to need a $STATE/.paired marker touched here so it could
     # tell "never paired" apart from "paired, mid-reconnect after a
@@ -235,11 +323,13 @@ for _ in $(seq 1 40); do
       echo "      -H 'Content-Type: application/json' \\" >&2
       echo "      -d '{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}'" >&2
       echo "  then confirm with: curl -s $API/webhook -H 'token: \$$TOKEN_VAR'" >&2
+      emit_terminal error reason="webhook did not stick after login (GET /webhook shows: ${GOT:-<unreadable>}, expected: $WEBHOOK_URL)" fatal=true
       exit 1
     fi
-    echo "webhook confirmed: $WEBHOOK_URL"
+    (( JSON_MODE )) || echo "webhook confirmed: $WEBHOOK_URL"
 
-    echo "waiting for WhatsApp to finish sending history..."
+    (( JSON_MODE )) || echo "waiting for WhatsApp to finish sending history..."
+    emit_json history_waiting
 
     # loggedIn flips at the END of the pairing handshake, before whatsmeow
     # starts streaming history-sync blobs. Wait for rows to appear and then
@@ -253,11 +343,13 @@ for _ in $(seq 1 40); do
       echo "  history dump. NOTHING was purged and nothing was verified." >&2
       echo "  Check 'docker logs omarchy-wa-sink' and the database at:" >&2
       echo "    $DB" >&2
+      emit_terminal error reason="could not read wuzapi's history table while waiting for the history dump; nothing was purged and nothing was verified" fatal=true
       exit 1
     fi
     read -r PRE_PURGE SETTLED SAW_ROWS <<<"$WAIT_OUT"
     if [[ -z "${SAW_ROWS:-}" ]]; then
       echo "error: unexpected output from the history wait: ${WAIT_OUT@Q}" >&2
+      emit_terminal error reason="unexpected output from the history wait: ${WAIT_OUT@Q}" fatal=true
       exit 1
     fi
 
@@ -274,6 +366,7 @@ for _ in $(seq 1 40); do
     # warning that protects their history. Poll instead, with a bound.
     if ! POST_PURGE=$(count_history); then
       echo "error: could not re-count wuzapi's history table after the purge." >&2
+      emit_terminal error reason="could not re-count wuzapi's history table after the purge" fatal=true
       exit 1
     fi
     for _ in $(seq 1 45); do
@@ -283,6 +376,7 @@ for _ in $(seq 1 40); do
     done
     if [[ -z "$POST_PURGE" ]]; then
       echo "error: could not re-count wuzapi's history table after the purge." >&2
+      emit_terminal error reason="could not re-count wuzapi's history table after the purge (post-restart poll)" fatal=true
       exit 1
     fi
 
@@ -290,19 +384,26 @@ for _ in $(seq 1 40); do
       # Honest uncertainty. We cannot tell "this account has no history"
       # from "the dump has not started" by looking at the database, so we
       # do not claim either. This is NOT a success message.
-      echo "history: no rows for $ACCOUNT_ID were ever observed in wuzapi's"
-      echo "  message_history table. That may mean this account has no"
-      echo "  history to sync, or it may mean WhatsApp had not started"
-      echo "  sending it yet. This run cannot tell which. Nothing was"
-      echo "  confirmed purged for this account, because nothing was ever seen."
-      echo "  If you want certainty, wait a few minutes and then run:"
-      echo "    docker restart omarchy-wa-sink"
-      echo "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line"
+      if (( JSON_MODE )); then
+        emit_json history_purged rows="$PRE_PURGE" verified=false seen=false
+      else
+        echo "history: no rows for $ACCOUNT_ID were ever observed in wuzapi's"
+        echo "  message_history table. That may mean this account has no"
+        echo "  history to sync, or it may mean WhatsApp had not started"
+        echo "  sending it yet. This run cannot tell which. Nothing was"
+        echo "  confirmed purged for this account, because nothing was ever seen."
+        echo "  If you want certainty, wait a few minutes and then run:"
+        echo "    docker restart omarchy-wa-sink"
+        echo "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line"
+      fi
+      emit_terminal done
       exit 0
     fi
 
     if [[ "$SETTLED" == "True" && "$POST_PURGE" == "0" ]]; then
-      echo "history purged: $PRE_PURGE row(s) seen for $ACCOUNT_ID, table now empty."
+      (( JSON_MODE )) || echo "history purged: $PRE_PURGE row(s) seen for $ACCOUNT_ID, table now empty."
+      emit_json history_purged rows="$PRE_PURGE" verified=true seen=true
+      emit_terminal done
       exit 0
     fi
 
@@ -310,9 +411,12 @@ for _ in $(seq 1 40); do
     echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
     echo "  Rows seen for $ACCOUNT_ID before restart: $PRE_PURGE, rows remaining (all accounts): $POST_PURGE" >&2
     echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
+    emit_json history_purged rows="$PRE_PURGE" verified=false seen=true remaining="$POST_PURGE"
+    emit_terminal error reason="history may not have been fully cleared: settled=$SETTLED, rows seen for $ACCOUNT_ID before restart=$PRE_PURGE, rows remaining (all accounts)=$POST_PURGE" fatal=true
     exit 1
   fi
   sleep 5
 done
 echo "timed out waiting for the link" >&2
+emit_terminal error reason="timed out waiting for the link" fatal=true
 exit 1
