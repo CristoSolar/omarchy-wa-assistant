@@ -90,18 +90,34 @@ def test_dry_run_is_the_default_when_the_env_var_is_entirely_absent():
     # WA_DRY_RUN key at all, not even "1". An implementation that read
     # os.environ.get("WA_DRY_RUN", "0") would pass every other test here
     # and then send for real on first real use.
+    #
+    # This must prove the CODE's default, not whatever WA_DRY_RUN happens to
+    # be set to in the machine's real secrets.env. send() calls
+    # _load_secrets(), which reads store.secrets_path() and would otherwise
+    # repopulate WA_DRY_RUN from the user's live file the instant it is
+    # popped. The runner already points WA_SECRETS_FILE at a throwaway
+    # location for every test; this test additionally points it at a
+    # tmpdir of its own with no secrets.env at all, so it proves the
+    # default even if run outside this runner.
     called = []
     original, wa._post = wa._post, lambda *a, **k: called.append(a)
-    previous = os.environ.pop("WA_DRY_RUN", None)
-    try:
-        assert "WA_DRY_RUN" not in os.environ
-        out = wa.send("56911111111@s.whatsapp.net", "hola")
-        assert out["dry_run"] is True
-        assert called == [], "a bare environment must still default to dry-run"
-    finally:
-        wa._post = original
-        if previous is not None:
-            os.environ["WA_DRY_RUN"] = previous
+    previous_dry_run = os.environ.pop("WA_DRY_RUN", None)
+    previous_secrets_file = os.environ.get("WA_SECRETS_FILE")
+    with tmpdir() as d:
+        os.environ["WA_SECRETS_FILE"] = str(d / "no-such-secrets.env")
+        try:
+            assert "WA_DRY_RUN" not in os.environ
+            out = wa.send("56911111111@s.whatsapp.net", "hola")
+            assert out["dry_run"] is True
+            assert called == [], "a bare environment must still default to dry-run"
+        finally:
+            wa._post = original
+            if previous_dry_run is not None:
+                os.environ["WA_DRY_RUN"] = previous_dry_run
+            if previous_secrets_file is None:
+                os.environ.pop("WA_SECRETS_FILE", None)
+            else:
+                os.environ["WA_SECRETS_FILE"] = previous_secrets_file
 
 
 def test_api_must_stay_on_loopback():

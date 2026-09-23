@@ -107,21 +107,62 @@ brings them back on their own, and Docker's restart handling and the
 container comes back first — `omarchy-wuzapi` and `omarchy-wa-sink` don't
 need to start in any particular order to find each other by name.
 
-That covers the containers coming back up. It does **not** cover a
-`docker`-level restart of `omarchy-wuzapi` staying able to *deliver*
+That covers the containers coming back up. On its own it does **not** cover
+a `docker`-level restart of `omarchy-wuzapi` staying able to *deliver*
 messages: wuzapi keeps its webhook registration in memory, and a restart
 (crash, OOM, reboot) drops it even though `GET /webhook` still shows it
-set in the database. The only thing that re-asserts it is `wa-up`'s own
-self-heal step, which runs when you (or something) executes `wa-up` — not
-automatically when Docker restarts the container on its own. If wuzapi
-gets restarted outside of `wa-up` (a crash, a reboot with Docker enabled
-at boot — see below), run `./bin/wa-up` again once to reassert the
-webhook and confirm delivery is really working, rather than assuming
-`unless-stopped` alone put you back in a working state.
+set in the database.
+
+### Automatic healing: `wa-heal`
+
+`install.sh` installs and enables a systemd **user** timer,
+`wa-heal.timer`, that runs `./bin/wa-heal` every 5 minutes and once at
+login. `wa-heal` re-asserts the webhook when a session is logged in, then
+reads it back with `GET /webhook` to confirm it actually stuck, instead of
+trusting the `POST`'s 200. It is a no-op if nothing is paired yet or no
+session is logged in, and safe to run as often as the timer likes.
+
+This is what makes `--restart unless-stopped` on `omarchy-wuzapi` safe:
+without it, a container that comes back from a crash or a reboot looks
+fully healthy — containers up, `wa-status` reporting
+`ok: true, logged_in: true`, the bar pill green — while silently receiving
+nothing, because nothing had re-registered the webhook. `wa-heal` closes
+that gap on its own, on a timer, without anyone needing to notice the
+stack looked fine but wasn't and run `wa-up` by hand. `wa-up` itself
+still calls the same `wa-heal` script (not a second copy of the logic)
+right after bringing the containers up, so a fresh `wa-up` still gives you
+an immediate answer.
+
+**Check it's working:**
+
+```sh
+systemctl --user status wa-heal.timer      # is the timer scheduled?
+journalctl --user -u wa-heal.service -n 20 # what did the last few runs report?
+```
+
+A healthy run logs `wa-heal: webhook healthy (...)` or a "nothing to
+heal" no-op. A failed re-assert logs a loud `wa-heal: FAILED to
+re-assert the webhook` to the unit's stderr (captured by journald) and
+the service exits non-zero, which `systemctl --user status` will show as
+a failed last run.
+
+**Turn it off:**
+
+```sh
+systemctl --user disable --now wa-heal.timer
+```
+
+You can still run `./bin/wa-heal` by hand at any time, or fall back to
+running `./bin/wa-up` after a restart, as before.
 
 `--restart unless-stopped` (not `always`) is deliberate: this stack holds
 a live link to your personal WhatsApp session, so a `docker stop` you did
 on purpose must stay stopped, not resurrect itself on the next boot.
+Re-examined now that `wa-heal` exists: `unless-stopped` is still the
+right call, and arguably more so — the container actually coming back up
+is a precondition for `wa-heal` being able to heal anything at all; a
+policy that left it down would mean the timer has nothing to re-assert
+against.
 
 **`--restart unless-stopped` alone will not bring the stack back after a
 reboot** unless the Docker daemon itself is set to start at boot. That is

@@ -159,11 +159,15 @@ echo "Pair with:  wa-pair <number>"
 # that gets rebuilt (and the webhook lost) whenever a session logs in. If a
 # session is already paired from a prior run, that in-memory record is gone
 # on every container restart even though GET /webhook (DB-backed) still
-# shows it set. Re-assert it now so an existing install doesn't have to be
-# re-paired to keep receiving messages. Do nothing if no session is logged
-# in yet (there's nothing to heal, and pairing will set it after login).
+# shows it set. The actual re-assert-and-verify logic lives in bin/wa-heal,
+# a single implementation that this script and the systemd --user timer
+# installed by install.sh both call — so the periodic timer (and a run at
+# login) keep healing this automatically after a crash, a `docker restart`,
+# or a reboot, without a second copy of the logic that could drift from
+# this one. Here we just wait for wuzapi to answer first, so the very first
+# run after `wa-up` gives an immediate, useful answer instead of the "not
+# reachable yet" a bare timer tick would print moments after a fresh start.
 API=http://127.0.0.1:8080
-WEBHOOK_URL="http://omarchy-wa-sink:8099"
 WA_TOKEN="${WA_TOKEN:-}"
 if [[ -n "$WA_TOKEN" ]]; then
   READY=""
@@ -175,28 +179,7 @@ if [[ -n "$WA_TOKEN" ]]; then
     sleep 1
   done
   if [[ -n "$READY" ]]; then
-    STATUS=$(curl -s --max-time 3 "$API/session/status" -H "token: $WA_TOKEN" 2>/dev/null || true)
-    LOGGED_IN=$(echo "$STATUS" | python3 -c "
-import json,sys
-try: print('true' if json.load(sys.stdin)['data']['loggedIn'] else 'false')
-except Exception: print('false')
-" 2>/dev/null || echo false)
-    if [[ "$LOGGED_IN" == "true" ]]; then
-      curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
-      GOT=$(curl -s "$API/webhook" -H "token: $WA_TOKEN" \
-        | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['webhook'])" 2>/dev/null || echo "")
-      if [[ "$GOT" == "$WEBHOOK_URL" ]]; then
-        echo "webhook re-asserted for already-logged-in session: $WEBHOOK_URL"
-      else
-        echo "warning: could not confirm webhook after re-asserting it on startup." >&2
-        echo "  GET /webhook shows: ${GOT:-<unreadable>}" >&2
-        echo "  expected: $WEBHOOK_URL" >&2
-        echo "  Messages may NOT be delivered. Check with:" >&2
-        echo "    curl -s $API/webhook -H 'token: \$WA_TOKEN'" >&2
-      fi
-    fi
+    WA_STATE_ROOT="$STATE" WA_SECRETS_FILE="$SECRETS" WA_API="$API" "$ROOT/bin/wa-heal" || true
   else
     echo "warning: wuzapi did not respond in time; skipped webhook self-heal check." >&2
   fi

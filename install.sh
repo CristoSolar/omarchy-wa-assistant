@@ -27,6 +27,19 @@ if command -v omarchy-bar >/dev/null; then
   omarchy-bar put io.github.cristosolar.waassistant || true
 fi
 
+# Install the wa-heal timer: it re-asserts wuzapi's webhook (lost in memory
+# on every restart) every few minutes and once at login, so a crash, a
+# `docker restart`, or a reboot converges without needing wa-up run by
+# hand. See systemd/wa-heal.service and the "Surviving restarts" section of
+# the README for what this does and how to disable it.
+UNIT_DIR="$HOME/.config/systemd/user"
+mkdir -p "$UNIT_DIR"
+cp "$ROOT/systemd/wa-heal.service" "$ROOT/systemd/wa-heal.timer" "$UNIT_DIR/"
+if command -v systemctl >/dev/null; then
+  systemctl --user daemon-reload
+  systemctl --user enable --now wa-heal.timer
+fi
+
 echo "Installed. Next:"
 echo "  ./bin/wa-up"
 echo "  ./bin/wa-pair <your number>"

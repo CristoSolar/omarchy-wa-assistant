@@ -113,23 +113,66 @@ importar cuál contenedor arranque primero — `omarchy-wuzapi` y
 `omarchy-wa-sink` no necesitan arrancar en un orden particular para
 encontrarse por nombre.
 
-Eso cubre que los contenedores vuelvan a estar arriba. **No** cubre que un
-reinicio de `omarchy-wuzapi` a nivel Docker siga pudiendo *entregar*
-mensajes: wuzapi guarda su registro de webhook en memoria, y un reinicio
-(cuelgue, OOM, reboot) lo pierde aunque `GET /webhook` siga mostrándolo
-seteado en la base de datos. Lo único que lo reafirma es el paso de
-autosanación (self-heal) de `wa-up`, que corre cuando vos (o algo)
-ejecuta `wa-up` — no automáticamente cuando Docker reinicia el contenedor
-por su cuenta. Si `omarchy-wuzapi` se reinicia fuera de `wa-up` (un
-cuelgue, un reboot con Docker habilitado al arranque — ver abajo), corré
-`./bin/wa-up` de nuevo una vez para reafirmar el webhook y confirmar que
-la entrega realmente funciona, en lugar de asumir que `unless-stopped`
-solo ya te dejó en un estado funcional.
+Eso cubre que los contenedores vuelvan a estar arriba. Por sí solo **no**
+cubre que un reinicio de `omarchy-wuzapi` a nivel Docker siga pudiendo
+*entregar* mensajes: wuzapi guarda su registro de webhook en memoria, y un
+reinicio (cuelgue, OOM, reboot) lo pierde aunque `GET /webhook` siga
+mostrándolo seteado en la base de datos.
+
+### Autosanación automática: `wa-heal`
+
+`install.sh` instala y habilita un timer de systemd de **usuario**,
+`wa-heal.timer`, que corre `./bin/wa-heal` cada 5 minutos y una vez al
+iniciar sesión. `wa-heal` reafirma el webhook cuando hay una sesión
+logueada, y después lo relee con `GET /webhook` para confirmar que
+realmente quedó puesto, en vez de confiar en el 200 del `POST`. No hace
+nada si todavía no emparejaste nada o no hay sesión logueada, y es seguro
+correrlo tan seguido como quiera el timer.
+
+Esto es lo que hace seguro usar `--restart unless-stopped` en
+`omarchy-wuzapi`: sin esto, un contenedor que vuelve de un cuelgue o un
+reboot se ve completamente sano — contenedores arriba, `wa-status`
+reportando `ok: true, logged_in: true`, la pastilla de la barra en verde —
+mientras no recibe nada en silencio, porque nadie volvió a registrar el
+webhook. `wa-heal` cierra ese hueco solo, con un timer, sin que nadie
+tenga que notar que el stack se veía bien pero no lo estaba y correr
+`wa-up` a mano. `wa-up` mismo sigue llamando al mismo script `wa-heal`
+(no una segunda copia de la lógica) justo después de levantar los
+contenedores, así que un `wa-up` recién corrido te sigue dando una
+respuesta inmediata.
+
+**Verificar que está funcionando:**
+
+```sh
+systemctl --user status wa-heal.timer      # ¿está agendado el timer?
+journalctl --user -u wa-heal.service -n 20 # ¿qué reportaron las últimas corridas?
+```
+
+Una corrida sana loguea `wa-heal: webhook healthy (...)` o un no-op de
+"nada que sanar". Un reintento fallido loguea un
+`wa-heal: FAILED to re-assert the webhook` bien visible en el stderr de la
+unidad (capturado por journald), y el servicio termina con código
+distinto de cero, lo que `systemctl --user status` va a mostrar como una
+última corrida fallida.
+
+**Desactivarlo:**
+
+```sh
+systemctl --user disable --now wa-heal.timer
+```
+
+Igual podés correr `./bin/wa-heal` a mano cuando quieras, o volver a
+correr `./bin/wa-up` después de un reinicio, como antes.
 
 `--restart unless-stopped` (no `always`) es deliberado: este stack tiene
 un vínculo vivo con tu sesión personal de WhatsApp, así que un
 `docker stop` hecho a propósito debe quedarse detenido, no resucitar
-solo en el próximo arranque.
+solo en el próximo arranque. Reexaminado ahora que existe `wa-heal`:
+`unless-stopped` sigue siendo la decisión correcta, y con más razón
+todavía — que el contenedor vuelva a estar arriba es una condición
+necesaria para que `wa-heal` pueda sanar algo; una política que lo
+dejara caído significaría que el timer no tiene nada contra qué
+reafirmar.
 
 **`--restart unless-stopped` por sí solo no hace que el stack vuelva
 después de un reboot** a menos que el propio demonio de Docker esté

@@ -123,6 +123,12 @@ def test_the_sink_data_dir_is_a_subdirectory_of_the_state_root():
     import os
     previous_root = os.environ.get("WA_STATE_ROOT")
     previous_dir = os.environ.pop("WA_DATA_DIR", None)
+    # The test harness (tests/runner.py) sets WA_SECRETS_FILE on every test
+    # process so no test can ever fall back to the real secrets.env; that
+    # override takes precedence over WA_STATE_ROOT by design (see
+    # store.secrets_path()), so it must come off here too to observe the
+    # plain state-root-derived default this test is actually about.
+    previous_secrets_file = os.environ.pop("WA_SECRETS_FILE", None)
     with tmpdir() as d:
         os.environ["WA_STATE_ROOT"] = str(d)
         try:
@@ -137,6 +143,8 @@ def test_the_sink_data_dir_is_a_subdirectory_of_the_state_root():
                 os.environ.pop("WA_STATE_ROOT", None)
             else:
                 os.environ["WA_STATE_ROOT"] = previous_root
+            if previous_secrets_file is not None:
+                os.environ["WA_SECRETS_FILE"] = previous_secrets_file
 
 
 def test_the_secrets_path_has_its_own_override():

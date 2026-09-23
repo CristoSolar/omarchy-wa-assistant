@@ -1,0 +1,12 @@
+[Unit]
+Description=Re-assert the omarchy-wa webhook if a WhatsApp session is logged in
+Documentation=https://github.com/CristoSolar/omarchy-wa-assistant
+# No After=/Requires= on Docker: a user unit cannot usefully order itself
+# against a system unit like docker.service, and it doesn't need to — if
+# wuzapi isn't up yet (right after login or boot), wa-heal itself detects
+# that and exits with a quiet, non-fatal failure (see bin/wa-heal); the
+# timer's next tick tries again a few minutes later.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.config/omarchy/plugins/io.github.cristosolar.waassistant/bin/wa-heal
