@@ -274,6 +274,12 @@ def test_unreachable_wuzapi_does_not_block_local_cleanup():
         assert result.returncode == 0, result.stderr
         assert accounts.load(d) == []
         assert store.load_queue(d) == []
+        # curl's -w '%{http_code}' already prints "000" on a connection
+        # failure; a naive `|| echo "000"` fallback duplicates it into
+        # "000000" in the message a person reads right when something is
+        # already going wrong.
+        assert "HTTP 000)" in result.stderr, result.stderr
+        assert "000000" not in result.stderr
 
 
 # --- Unlinking the last account leaves a valid empty state -----------------

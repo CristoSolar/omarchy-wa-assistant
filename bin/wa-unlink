@@ -13,6 +13,11 @@
 # --count-only below) and ask for a typed confirmation before running this
 # for real.
 #
+# agents/<id>.md — the tone file — is deliberately LEFT BEHIND. It holds
+# no credential, it is prose the person wrote and edited by hand, and
+# re-linking the same id later should hand them their customisation back
+# rather than make them write it again.
+#
 # --json is additive, exactly like bin/wa-pair's --json: one JSON object
 # per line, human mode unchanged and still the default. See
 # docs/superpowers/specs/2026-09-23-settings-ui-design.md.
@@ -238,8 +243,16 @@ if (( FOUND )); then
     # Best-effort: see the ordering comment above for why an unreachable
     # wuzapi must not block the rest of this script. The outcome is
     # reported, never assumed — a caller that cares can check `ok`.
+    # curl's -w '%{http_code}' already prints "000" on its own when the
+    # request never got a response (connection refused, timeout, etc) —
+    # that output reaches this command substitution regardless of curl's
+    # own exit status, so a trailing `|| echo "000"` here would run
+    # alongside curl's own already-printed "000" and concatenate a second
+    # one onto it (LOGOUT_HTTP="000000"). Only fall back when curl printed
+    # nothing at all.
     LOGOUT_HTTP=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-      -X POST "$API/session/logout" -H "token: $TOKEN_VALUE" 2>/dev/null || echo "000")
+      -X POST "$API/session/logout" -H "token: $TOKEN_VALUE" 2>/dev/null)
+    [[ -z "$LOGOUT_HTTP" ]] && LOGOUT_HTTP="000"
     if [[ "$LOGOUT_HTTP" == "200" || "$LOGOUT_HTTP" == "201" ]]; then
       (( JSON_MODE )) || echo "wuzapi session logged out for $ACCOUNT_ID"
       emit_json logged_out ok=true
