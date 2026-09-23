@@ -21,7 +21,13 @@ fi
 
 docker build -t omarchy-wa-sink -f "$ROOT/docker/sink.Dockerfile" "$ROOT"
 
+# `omarchy bar put` is idempotent: it leaves the widget where it is if it's
+# already on the bar, so re-running install.sh is safe and won't duplicate it.
+if command -v omarchy-bar >/dev/null; then
+  omarchy-bar put io.github.cristosolar.waassistant || true
+fi
+
 echo "Installed. Next:"
 echo "  ./bin/wa-up"
 echo "  ./bin/wa-pair <your number>"
-echo "  omarchy-restart-bar"
+echo "  omarchy-restart-shell"

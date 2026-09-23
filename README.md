@@ -80,11 +80,13 @@ from the internet on a routine `wa-up` would be a slow, surprising side
 effect to have on a command you run often; building it once, during
 install, is not.
 
-After `install.sh` finishes:
+`install.sh` also puts the plugin's widget on the bar (via `omarchy-bar put`,
+which is safe to run again — it leaves the widget where it is if it's
+already there). After `install.sh` finishes:
 
 ```sh
 ./bin/wa-up
-omarchy-restart-bar
+omarchy-restart-shell
 ```
 
 `wa-up` creates `~/.local/share/omarchy-wa/`, generates a random admin

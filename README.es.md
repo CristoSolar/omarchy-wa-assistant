@@ -86,11 +86,13 @@ imagen de terceros bajada de internet en un `wa-up` de rutina sería un
 efecto secundario lento y sorpresivo para un comando que corrés seguido;
 construirla una sola vez, durante la instalación, no lo es.
 
-Después de que `install.sh` termine:
+`install.sh` también pone el widget del plugin en la barra (con
+`omarchy-bar put`, que es seguro correr de nuevo — deja el widget donde
+está si ya se encuentra ahí). Después de que `install.sh` termine:
 
 ```sh
 ./bin/wa-up
-omarchy-restart-bar
+omarchy-restart-shell
 ```
 
 `wa-up` crea `~/.local/share/omarchy-wa/`, genera un token de admin, una
