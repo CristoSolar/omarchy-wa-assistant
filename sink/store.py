@@ -113,6 +113,19 @@ def load_config(d) -> dict:
     return read_json(Path(d) / "config.json", {"groups_enabled": []})
 
 
+def load_quick_replies(d) -> list:
+    """The one-click quick-reply texts, in configured order.
+
+    A missing key or a missing config.json both read as an empty list —
+    the panel then simply shows no quick-reply buttons — but a
+    config.json that exists and cannot be read/parsed still raises
+    StoreReadError via load_config(), same as every other read here:
+    never mistake a broken install for "no quick replies configured".
+    """
+    ql = load_config(d).get("quick_replies", [])
+    return ql if isinstance(ql, list) else []
+
+
 def load_queue(d) -> list:
     q = read_json(Path(d) / "queue.json", [])
     return q if isinstance(q, list) else []

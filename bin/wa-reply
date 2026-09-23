@@ -164,6 +164,10 @@ def cmd_list(args):
     print(json.dumps(store.load_queue(store.data_dir()), ensure_ascii=False))
 
 
+def cmd_quick(args):
+    print(json.dumps(store.load_quick_replies(store.data_dir()), ensure_ascii=False))
+
+
 def cmd_draft(args):
     d = store.data_dir()
     entry = _entry(d, args.id)
@@ -267,6 +271,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list").set_defaults(fn=cmd_list)
+    sub.add_parser("quick").set_defaults(fn=cmd_quick)
     p = sub.add_parser("draft"); p.add_argument("id"); p.add_argument("--idea", required=True)
     p.set_defaults(fn=cmd_draft)
     p = sub.add_parser("send"); p.add_argument("id"); p.add_argument("--text", required=True)

@@ -77,6 +77,11 @@ Panel {
   // but a rapid double-click on Enviar still has to be refused.
   property bool inFlight: false
 
+  // One-click quick replies (config.json's quick_replies, via
+  // `wa-reply quick`). Loaded through its own Process so fetching it can
+  // never race the list/draft Process or the send Process.
+  property var quickReplies: []
+
   // Guarded so the panel renders before the bar injects itself.
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property color contentUrgent: bar ? bar.urgent : Color.urgent
@@ -126,6 +131,108 @@ Panel {
     stdout: StdioCollector {
       onStreamFinished: if (sendProc.done) sendProc.done(text)
     }
+  }
+
+  // Its own Process too, for the same reason: fetching the quick-reply
+  // list must never be blocked by, or block, list/draft or send.
+  Process {
+    id: quickProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var parsed = null
+        try { parsed = JSON.parse(text) } catch (e) { parsed = null }
+        root.quickReplies = Array.isArray(parsed) ? parsed : []
+      }
+    }
+  }
+
+  function loadQuickReplies() {
+    if (quickProc.running)
+      return
+    quickProc.command = [root.pluginDir + "bin/wa-reply", "quick"]
+    quickProc.running = true
+  }
+
+  // Long quick-reply texts are truncated for the button label only — the
+  // full text is still what gets sent (doSend() reads from quickReplies,
+  // never from the label).
+  function elideLabel(text, max) {
+    max = max || 42
+    return text.length > max ? text.slice(0, max - 1) + "…" : text
+  }
+
+  // Shared by "Enviar" and every quick-reply button: exactly one code path
+  // reaches `wa-reply send`, so the timestamp check, the "unknown"
+  // handling, the status bookkeeping and the queue removal all behave
+  // identically no matter which button triggered it. A quick reply is not
+  // a second send path — it is a different source of `text` for this one.
+  function doSend(text) {
+    if (root.inFlight || sendProc.running)
+      return
+    root.status = "enviando…"
+    root.statusWarn = false
+    root.inFlight = true
+    var args = ["send", root.currentId, "--text", text]
+    if (root.needsAck && root.acknowledged)
+      args.push("--acknowledged")
+    sendProc.command = [root.pluginDir + "bin/wa-reply"].concat(args)
+    sendProc.done = function (out) {
+      // Cleared first, before anything that can throw, so a malformed
+      // response never leaves the buttons permanently disabled.
+      root.inFlight = false
+      try {
+        const r = JSON.parse(out)
+        if (r.ok && r.dry_run) {
+          // Nothing was sent, so nothing changes: the entry stays in
+          // the queue and stays open. Say so plainly.
+          root.status = "DRY RUN — no se envió nada. "
+                       + "La entrada sigue pendiente en la cola."
+          root.statusWarn = false
+          root.refresh()
+        } else if (r.ok && r.superseded) {
+          root.status = "enviado. Llegó un mensaje nuevo en "
+                       + "este chat mientras redactabas, así que "
+                       + "la entrada sigue en la cola."
+          root.statusWarn = true
+          root.refresh()
+        } else if (r.ok) {
+          root.status = "enviado"
+          root.statusWarn = false
+          root.select(null)
+          root.refresh()
+        } else if (r.needs_ack) {
+          root.status = r.error
+          root.statusWarn = true
+          root.acknowledged = false
+          root.refresh()
+        } else if (r.unknown) {
+          // The request timed out: the message may or may not have
+          // gone out. wa-reply has recorded "unknown" on disk, so the
+          // refresh below is what re-arms the block — it survives a
+          // restart.
+          root.status = "sin confirmación: puede que el mensaje ya se haya enviado — revisá WhatsApp antes de reintentar"
+          root.statusWarn = true
+          root.acknowledged = false
+          root.refresh()
+        } else {
+          root.status = "falló: " + r.error
+          root.statusWarn = true
+          root.refresh()
+        }
+      } catch (e) {
+        // A send whose response could not be parsed (wa-reply crashed
+        // or was truncated mid-write) is exactly as ambiguous as an
+        // `unknown` outcome — it may already have reached WhatsApp —
+        // and unlike `unknown` we cannot rely on anything having been
+        // written to disk, so it also gets the volatile block. Scoped
+        // to the send path only.
+        root.status = "sin confirmación: puede que el mensaje ya se haya enviado — revisá WhatsApp antes de reintentar"
+        root.statusWarn = true
+        root.sendBlocked = true
+        root.refresh()
+      }
+    }
+    sendProc.running = true
   }
 
   function select(entry) {
@@ -199,6 +306,7 @@ Panel {
   }
 
   function refresh() {
+    root.loadQuickReplies()
     run(["list"], function (out) {
       var list = []
       var parsed = null
@@ -421,6 +529,53 @@ Panel {
             }
           }
 
+          // One-click quick replies. Visually separated from the composer
+          // (its own heading, its own divider) because clicking one of
+          // these does NOT fill the box below — it sends the text
+          // immediately, with no further confirmation. The heading says
+          // that plainly so nobody expecting "fill the composer" gets
+          // "message delivered" instead. Disabled while a send or a
+          // draft is running (inFlight/drafting) so a double click can't
+          // race the composer's own send, and while needsAck applies and
+          // is not yet acknowledged — the same guard the "Enviar" button
+          // enforces, and one wa-reply send re-enforces server-side
+          // regardless of this button's enabled state.
+          ColumnLayout {
+            visible: root.quickReplies.length > 0
+            Layout.fillWidth: true
+            spacing: Style.spacing.xs
+            Text {
+              textFormat: Text.PlainText
+              text: "Respuestas rápidas — envían al toque, sin confirmar"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            Flow {
+              Layout.fillWidth: true
+              spacing: Style.spacing.sm
+              Repeater {
+                model: root.quickReplies
+                delegate: Button {
+                  required property string modelData
+                  text: root.elideLabel(modelData)
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  bordered: true
+                  enabled: !root.inFlight && !root.drafting
+                           && (!root.needsAck || root.acknowledged)
+                  onClicked: root.doSend(modelData)
+                }
+              }
+            }
+            Rectangle {
+              Layout.fillWidth: true
+              Layout.preferredHeight: Style.spacing.hairline
+              color: Color.muted
+            }
+          }
+
           // Once a draft exists, the composer below no longer holds the
           // user's raw idea — it holds the message that Enviar will
           // actually send. This heading plus the muted recap line are the
@@ -540,79 +695,7 @@ Panel {
                        && !root.drafting
                        && !root.inFlight
                        && (!root.needsAck || root.acknowledged)
-              onClicked: {
-                if (root.inFlight || sendProc.running)
-                  return
-                root.status = "enviando…"
-                root.statusWarn = false
-                root.inFlight = true
-                var args = ["send", root.currentId, "--text", composer.text]
-                if (root.needsAck && root.acknowledged)
-                  args.push("--acknowledged")
-                sendProc.command = [root.pluginDir + "bin/wa-reply"].concat(args)
-                sendProc.done = function (out) {
-                  // Cleared first, before anything that can throw,
-                  // so a malformed response never leaves the
-                  // button permanently disabled.
-                  root.inFlight = false
-                  try {
-                    const r = JSON.parse(out)
-                    if (r.ok && r.dry_run) {
-                      // Nothing was sent, so nothing changes:
-                      // the entry stays in the queue and stays
-                      // open. Say so plainly.
-                      root.status = "DRY RUN — no se envió nada. "
-                                   + "La entrada sigue pendiente en la cola."
-                      root.statusWarn = false
-                      root.refresh()
-                    } else if (r.ok && r.superseded) {
-                      root.status = "enviado. Llegó un mensaje nuevo en "
-                                   + "este chat mientras redactabas, así que "
-                                   + "la entrada sigue en la cola."
-                      root.statusWarn = true
-                      root.refresh()
-                    } else if (r.ok) {
-                      root.status = "enviado"
-                      root.statusWarn = false
-                      root.select(null)
-                      root.refresh()
-                    } else if (r.needs_ack) {
-                      root.status = r.error
-                      root.statusWarn = true
-                      root.acknowledged = false
-                      root.refresh()
-                    } else if (r.unknown) {
-                      // The request timed out: the message may
-                      // or may not have gone out. wa-reply has
-                      // recorded "unknown" on disk, so the
-                      // refresh below is what re-arms the
-                      // block — it survives a restart.
-                      root.status = "sin confirmación: puede que el mensaje ya se haya enviado — revisá WhatsApp antes de reintentar"
-                      root.statusWarn = true
-                      root.acknowledged = false
-                      root.refresh()
-                    } else {
-                      root.status = "falló: " + r.error
-                      root.statusWarn = true
-                      root.refresh()
-                    }
-                  } catch (e) {
-                    // A send whose response could not be parsed
-                    // (wa-reply crashed or was truncated
-                    // mid-write) is exactly as ambiguous as an
-                    // `unknown` outcome — it may already have
-                    // reached WhatsApp — and unlike `unknown` we
-                    // cannot rely on anything having been written
-                    // to disk, so it also gets the volatile
-                    // block. Scoped to the send path only.
-                    root.status = "sin confirmación: puede que el mensaje ya se haya enviado — revisá WhatsApp antes de reintentar"
-                    root.statusWarn = true
-                    root.sendBlocked = true
-                    root.refresh()
-                  }
-                }
-                sendProc.running = true
-              }
+              onClicked: root.doSend(composer.text)
             }
             Button {
               text: "Volver"

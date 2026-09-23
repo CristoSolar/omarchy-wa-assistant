@@ -64,6 +64,32 @@ if [[ -d "$STATE/ctx" && "$STATE/ctx" != "$DATA/ctx" ]]; then
   rmdir "$STATE/ctx" 2>/dev/null || true
 fi
 
+# Seed quick_replies on first run, or on an existing config.json that
+# predates this key. Never overwrites or reorders an existing list, and
+# never touches groups_enabled or any other key already there. A
+# config.json that exists but cannot be read/parsed is left alone here —
+# that is a broken install for wa-reply/wa-status to surface loudly, not
+# something wa-up should silently paper over by rewriting it.
+PYTHONPATH="$ROOT" python3 - "$DATA" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+from sink import store
+
+d = Path(sys.argv[1])
+try:
+    cfg = store.load_config(d)
+except store.StoreReadError:
+    sys.exit(0)
+if "quick_replies" not in cfg:
+    cfg["quick_replies"] = [
+        "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede "
+        "responder pero responderá en breve."
+    ]
+    store.atomic_write(d / "config.json", json.dumps(cfg, ensure_ascii=False))
+    print("seeded quick_replies default in config.json")
+PYEOF
+
 if [[ ! -f "$SECRETS" ]]; then
   mkdir -p "$(dirname "$SECRETS")"
   {

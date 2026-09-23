@@ -200,6 +200,37 @@ It logs each JID only once per process, not once per message, so a busy
 group won't flood the log — if you don't see the line, send another
 message. Copy the JID into the array above.
 
+## Quick replies
+
+The panel's chat detail view shows a row of quick-reply buttons above the
+composer. **Clicking one sends that exact text immediately — there is no
+confirmation step, no undo, and no draft to review first.** It is not a
+shortcut for filling the composer; the message goes out on that click.
+They're disabled while a draft or a send is already in progress, and an
+entry whose last send is unconfirmed (`unknown`/`sending`) still requires
+you to acknowledge that before a quick reply — same as `Enviar` — because
+the guard exists on the `wa-reply send` side, not in the button.
+
+Quick replies live in `quick_replies` in the same
+`~/.local/share/omarchy-wa/state/config.json` as `groups_enabled`, as a
+plain list of strings:
+
+```json
+{"groups_enabled": [], "quick_replies": [
+  "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
+  "Gracias, te respondo apenas pueda."
+]}
+```
+
+`wa-up` seeds this key with one default entry the first time it finds the
+file missing or lacking `quick_replies` at all; it never overwrites or
+reorders a list that's already there, and never touches `groups_enabled`.
+
+To add, edit or remove a quick reply: edit the `quick_replies` array by
+hand (add a string, change one, or delete one) and save. There's no
+restart needed — the panel re-reads it from `wa-reply quick` every time
+you reopen a chat in the panel.
+
 ## Container logs and message content
 
 `bin/wa-up` starts wuzapi with `LOG_LEVEL=warn`. Left unset, wuzapi defaults
@@ -325,8 +356,8 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
 - `state/queue.json` — pending messages shown in the panel.
 - `state/ctx/` — one small JSON file per chat, the last 10 messages of
   context used when drafting.
-- `state/config.json` — `groups_enabled` and any other hand-edited
-  settings.
+- `state/config.json` — `groups_enabled`, `quick_replies`, and any other
+  hand-edited settings.
 - `wuzdata/` — wuzapi's own SQLite database and session data, bind-mounted
   into both containers. This is where the history dump lands before
   `wa-pair`/the sink purge it.

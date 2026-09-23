@@ -208,6 +208,38 @@ Registra cada JID una sola vez por proceso, no por mensaje, así que un
 grupo con mucho tráfico no inunda el log — si no ves la línea, esperá otro
 mensaje. Copiá el JID al arreglo de arriba.
 
+## Respuestas rápidas
+
+La vista de detalle del panel muestra una fila de botones de respuesta
+rápida arriba del cuadro de redacción. **Tocar uno manda ese texto tal
+cual, al instante — no hay confirmación, no hay deshacer, no hay borrador
+para revisar antes.** No es un atajo para llenar el cuadro; el mensaje
+sale con ese clic. Quedan deshabilitados mientras hay un borrador o un
+envío en curso, y una entrada cuyo último envío quedó sin confirmar
+(`unknown`/`sending`) también exige el mismo reconocimiento que pide
+`Enviar` antes de dejar pasar una respuesta rápida — porque esa guarda
+vive del lado de `wa-reply send`, no en el botón.
+
+Las respuestas rápidas viven en `quick_replies`, en el mismo
+`~/.local/share/omarchy-wa/state/config.json` que `groups_enabled`, como
+una lista simple de strings:
+
+```json
+{"groups_enabled": [], "quick_replies": [
+  "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
+  "Gracias, te respondo apenas pueda."
+]}
+```
+
+`wa-up` siembra esta clave con una entrada por defecto la primera vez que
+encuentra el archivo faltante o sin `quick_replies`; nunca sobrescribe ni
+reordena una lista que ya está ahí, y nunca toca `groups_enabled`.
+
+Para agregar, editar o borrar una respuesta rápida: editá el arreglo
+`quick_replies` a mano (agregá un string, cambiá uno, o borrá uno) y
+guardá. No hace falta reiniciar nada — el panel lo relee con
+`wa-reply quick` cada vez que abrís un chat en el panel.
+
 ## Logs de los contenedores y contenido de los mensajes
 
 `bin/wa-up` levanta wuzapi con `LOG_LEVEL=warn`. Sin esa variable, wuzapi
@@ -340,8 +372,8 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
 - `state/queue.json` — los mensajes pendientes que se ven en el panel.
 - `state/ctx/` — un archivo JSON chico por chat, los últimos 10 mensajes
   de contexto usados al redactar.
-- `state/config.json` — `groups_enabled` y cualquier otro ajuste editado a
-  mano.
+- `state/config.json` — `groups_enabled`, `quick_replies`, y cualquier
+  otro ajuste editado a mano.
 - `wuzdata/` — la base SQLite y los datos de sesión propios de wuzapi,
   montados en los dos contenedores. Ahí es donde cae el volcado de
   historial antes de que `wa-pair`/el sink lo purguen.

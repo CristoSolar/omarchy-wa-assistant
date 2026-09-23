@@ -536,5 +536,57 @@ def test_an_entry_stranded_at_sending_sends_once_acknowledged():
         assert store.load_queue(d) == []
 
 
+def _run_cmd_quick(d):
+    """Run cmd_quick with WA_DATA_DIR pointed at d; return its one JSON line."""
+    previous_dir = os.environ.get("WA_DATA_DIR")
+    os.environ["WA_DATA_DIR"] = str(d)
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            wa.cmd_quick(SimpleNamespace())
+    finally:
+        if previous_dir is None:
+            os.environ.pop("WA_DATA_DIR", None)
+        else:
+            os.environ["WA_DATA_DIR"] = previous_dir
+    return json.loads(buf.getvalue())
+
+
+def test_quick_prints_the_configured_list():
+    with tmpdir() as d:
+        (d / "config.json").write_text(
+            json.dumps({"quick_replies": ["Uno", "Dos"]}))
+        assert _run_cmd_quick(d) == ["Uno", "Dos"]
+
+
+def test_quick_prints_an_empty_list_when_the_key_is_absent():
+    with tmpdir() as d:
+        (d / "config.json").write_text(json.dumps({"groups_enabled": []}))
+        assert _run_cmd_quick(d) == []
+
+
+def test_quick_reports_a_store_read_error_the_same_way_other_subcommands_do():
+    # cmd_list, cmd_draft and cmd_send never catch store.StoreReadError
+    # themselves — it propagates out to main()'s handler, which prints the
+    # `{"ok": False, "error": ...}` line and exits non-zero rather than
+    # ever printing a bare `[]`. cmd_quick must behave identically: raise,
+    # not swallow.
+    with tmpdir() as d:
+        (d / "config.json").write_text("{not json")
+        previous_dir = os.environ.get("WA_DATA_DIR")
+        os.environ["WA_DATA_DIR"] = str(d)
+        try:
+            try:
+                wa.cmd_quick(SimpleNamespace())
+                raise AssertionError("expected StoreReadError for invalid JSON")
+            except store.StoreReadError as exc:
+                assert "config.json" in str(exc)
+        finally:
+            if previous_dir is None:
+                os.environ.pop("WA_DATA_DIR", None)
+            else:
+                os.environ["WA_DATA_DIR"] = previous_dir
+
+
 if __name__ == "__main__":
     run(dict(globals()))
