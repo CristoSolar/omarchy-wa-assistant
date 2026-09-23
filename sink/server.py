@@ -104,19 +104,44 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     return True
 
 
+def response_status(raw: bytes, content_type: str, data_dir) -> int:
+    """Process one event and return the HTTP status to answer wuzapi with.
+
+    wuzapi treats 200 as "delivered" and drops the event; anything else is
+    retried (five attempts, thirty seconds apart per the design spec). So
+    the two failure shapes must get different answers:
+
+    - A deliberate decision not to queue — the user's own message, a group
+      not in groups_enabled, an unrecognised instanceName, or a body that
+      doesn't parse as an event at all — is correct and final. Retrying it
+      would change nothing, so it answers 200 whether handle_payload
+      returned True or False.
+    - A processing failure — StoreReadError from a broken accounts.json or
+      queue file, a disk write that fails, or any other unexpected
+      exception — means the event was never actually handled. It answers
+      500 so wuzapi's retry window is what actually recovers it, instead
+      of the event silently vanishing behind a log line nobody is
+      watching. It is still logged loudly here, and the exception is
+      still swallowed: a bad event must never kill the sink.
+    """
+    try:
+        handle_payload(raw, content_type, data_dir)
+    except Exception as exc:  # a bad event must never kill the sink
+        print(f"error handling event: {exc}", file=sys.stderr, flush=True)
+        return 500
+    return 200
+
+
 class Handler(BaseHTTPRequestHandler):
     data_dir = None
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n)
-        try:
-            handle_payload(raw, self.headers.get("Content-Type", ""), self.data_dir)
-        except Exception as exc:  # a bad event must never kill the sink
-            print(f"error handling event: {exc}", file=sys.stderr, flush=True)
-        self.send_response(200)
+        status = response_status(raw, self.headers.get("Content-Type", ""), self.data_dir)
+        self.send_response(status)
         self.end_headers()
-        self.wfile.write(b"ok")
+        self.wfile.write(b"ok" if status == 200 else b"error")
 
     def log_message(self, *args):
         pass

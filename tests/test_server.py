@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
 import sink.server as server
-from sink.server import handle_payload, purge_or_warn
+from sink.server import handle_payload, purge_or_warn, response_status
 from sink import store
 
 PERSONAL = {"id": "personal", "label": "Personal", "wuzapi_user": "omarchy"}
@@ -151,6 +151,81 @@ def test_broken_accounts_json_raises_instead_of_queuing_under_a_guess():
             pass
         assert store.load_queue(d) == [], \
             "an event arriving while accounts.json is broken must not be queued"
+
+
+# --- Fix round 1: 200 vs 500 --------------------------------------------
+
+
+def test_broken_accounts_json_answers_500_and_queues_nothing():
+    with tmpdir() as d:
+        (d / "accounts.json").write_text("{not json")
+        ev = _event(instance_name="omarchy")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            status = response_status(json.dumps(ev).encode(), "application/json", d)
+        assert status == 500
+        assert store.load_queue(d) == []
+
+
+def test_own_message_answers_200_and_queues_nothing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event(is_from_me=True)
+        assert response_status(json.dumps(ev).encode(), "application/json", d) == 200
+        assert store.load_queue(d) == []
+
+
+def test_unenabled_group_answers_200_and_queues_nothing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        server._logged_group_jids.clear()
+        ev = _event(is_group=True, chat="888@g.us")
+        assert response_status(json.dumps(ev).encode(), "application/json", d) == 200
+        assert store.load_queue(d) == []
+
+
+def test_unknown_instance_name_answers_200_and_queues_nothing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        server._logged_unknown_instances.clear()
+        ev = _event(instance_name="ghost2")
+        assert response_status(json.dumps(ev).encode(), "application/json", d) == 200
+        assert store.load_queue(d) == []
+
+
+def test_unparseable_body_answers_200_and_queues_nothing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        assert response_status(b"<<<not json>>>", "application/json", d) == 200
+        assert store.load_queue(d) == []
+
+
+def test_successful_queue_answers_200():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event(chat="56922222222@s.whatsapp.net")
+        assert response_status(json.dumps(ev).encode(), "application/json", d) == 200
+        assert len(store.load_queue(d)) == 1
+
+
+def test_unexpected_exception_in_the_queueing_path_answers_500_not_crash():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event()
+
+        def _boom(*a, **k):
+            raise RuntimeError("disk exploded")
+
+        original = store.upsert_queue
+        store.upsert_queue = _boom
+        try:
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                status = response_status(json.dumps(ev).encode(), "application/json", d)
+            assert status == 500
+            assert "disk exploded" in buf.getvalue()
+        finally:
+            store.upsert_queue = original
 
 
 if __name__ == "__main__":
