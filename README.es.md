@@ -205,6 +205,42 @@ Registra cada JID una sola vez por proceso, no por mensaje, así que un
 grupo con mucho tráfico no inunda el log — si no ves la línea, esperá otro
 mensaje. Copiá el JID al arreglo de arriba.
 
+## Logs de los contenedores y contenido de los mensajes
+
+`bin/wa-up` levanta wuzapi con `LOG_LEVEL=warn`. Sin esa variable, wuzapi
+usa por defecto su nivel más verboso y escribe el texto completo de cada
+mensaje —tuyo y de la otra persona— en `docker logs omarchy-wuzapi` en
+texto plano. Eso anula directamente la purga de historial de arriba: no
+tiene mucho sentido borrar 15.000 filas de SQLite si el mismo contenido
+queda guardado en el journal de Docker. `warn` mantiene visibles los
+problemas de conexión (logins fallidos, sesiones caídas, el warning "No
+webhook set for user") y a la vez descarta las líneas de debug por mensaje
+que contienen el contenido.
+
+El log del sink (`docker logs omarchy-wa-sink`) no se ve afectado por este
+ajuste y sigue como se describió arriba: solo registra JIDs y nombres
+visibles para las decisiones de descarte de grupos, nunca el cuerpo de los
+mensajes.
+
+Si querés mirar la actividad reciente de wuzapi sin revisar todo el
+historial, usá `--since`:
+
+```sh
+docker logs --since 10m omarchy-wuzapi
+```
+
+Si corridas anteriores a nivel DEBUG ya escribieron contenido de mensajes
+en el journal y querés que desaparezca, el log está atado al contenedor,
+no a un archivo aparte que se pueda editar selectivamente — eliminalo junto
+con el contenedor:
+
+```sh
+docker rm -f omarchy-wuzapi
+```
+
+`wa-up` lo vuelve a crear en la próxima corrida con el logging ya en
+`warn`.
+
 ## Desactivar el dry-run
 
 Todo envío pasa por `bin/wa-reply`, y por defecto no hace nada más que

@@ -50,9 +50,29 @@ curl -s -X POST "$API/session/connect" -H "token: $WA_TOKEN" \
   -d '{"Subscribe":["Message"],"Immediate":true}' >/dev/null
 sleep 3
 
-curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"webhookurl":"http://omarchy-wa-sink:8099","events":["Message"]}' >/dev/null
+WEBHOOK_URL="http://omarchy-wa-sink:8099"
+
+set_webhook() {
+  curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
+}
+
+verify_webhook() {
+  # wuzapi keeps a separate in-memory copy of the webhook that is rebuilt
+  # when a session logs in, discarding whatever was set before login. GET
+  # /webhook reads the durable (DB-backed) copy, which is necessary but not
+  # sufficient: only a webhook set AFTER login is guaranteed to also be in
+  # the in-memory record that actually delivers events. Never assume a POST
+  # stuck; always read it back.
+  GOT=$(curl -s "$API/webhook" -H "token: $WA_TOKEN" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['webhook'])" 2>/dev/null)
+  [[ "$GOT" == "$WEBHOOK_URL" ]]
+}
+
+# Best-effort pre-pairing attempt; harmless but NOT authoritative — see the
+# post-login set_webhook call below, which is the one that actually sticks.
+set_webhook
 
 CODE=$(curl -s -X POST "$API/session/pairphone" -H "token: $WA_TOKEN" \
   -H "Content-Type: application/json" -d "{\"Phone\":\"$NUMBER\"}" \
@@ -65,6 +85,26 @@ for _ in $(seq 1 40); do
   if curl -s "$API/session/status" -H "token: $WA_TOKEN" \
      | grep -q '"loggedIn":true'; then
     echo "linked."
+
+    # AUTHORITATIVE webhook set. wuzapi's session login rebuilds its
+    # in-memory client record, wiping any webhook set before login even
+    # though the DB row (and GET /webhook) still shows it. A webhook set
+    # only before login never delivers a single message — silently. Set it
+    # again now, then read it back; do not just assume the POST worked.
+    set_webhook
+    if ! verify_webhook; then
+      echo "error: webhook did not stick after login. GET /webhook shows:" >&2
+      echo "  ${GOT:-<unreadable>}" >&2
+      echo "  expected: $WEBHOOK_URL" >&2
+      echo "  Messages will NOT be delivered until this is fixed. Try:" >&2
+      echo "    curl -s -X POST $API/webhook -H 'token: \$WA_TOKEN' \\" >&2
+      echo "      -H 'Content-Type: application/json' \\" >&2
+      echo "      -d '{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}'" >&2
+      echo "  then confirm with: curl -s $API/webhook -H 'token: \$WA_TOKEN'" >&2
+      exit 1
+    fi
+    echo "webhook confirmed: $WEBHOOK_URL"
+
     echo "waiting for WhatsApp to finish sending history..."
 
     # loggedIn flips at the END of the pairing handshake, before whatsmeow
