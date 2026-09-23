@@ -420,6 +420,43 @@ def test_migration_retry_after_an_earlier_ctx_move_merges_instead_of_dropping():
             "the flat file must not be left behind once merged"
 
 
+def test_migration_retry_after_a_crash_inside_the_merge_does_not_duplicate():
+    # Fix round 2: the merge itself does atomic_write(target, merged) then
+    # p.unlink(source). A crash between those two leaves the target
+    # already holding the merge AND the flat file still present with its
+    # ORIGINAL (pre-merge) content — a retry must converge to the same
+    # ring as a single clean pass, not append the already-merged entries
+    # a second time.
+    with tmpdir() as d:
+        state_root, _ = _pre_migration_layout(d)
+        data_dir = state_root / "state"
+        ctx_dir = data_dir / "ctx"
+        jid = "1@s.whatsapp.net"
+        safe = jid.replace("/", "_")
+
+        original = {"from": "x", "text": "hi", "ts": "2026-09-22T09:00:00"}
+        during_outage = {"from": "x", "text": "durante el corte",
+                         "ts": "2026-09-22T09:45:00"}
+
+        # State as if the merge already ran and wrote its result to the
+        # target, but crashed before removing the flat source — the flat
+        # file still has only its own original content, never the merge.
+        account_ctx_dir = ctx_dir / "personal"
+        account_ctx_dir.mkdir(parents=True)
+        (account_ctx_dir / f"{safe}.json").write_text(
+            json.dumps([original, during_outage], ensure_ascii=False))
+        (ctx_dir / f"{safe}.json").write_text(
+            json.dumps([during_outage], ensure_ascii=False))
+
+        changed = _migrate(state_root)
+        assert changed is True
+
+        merged = json.loads((account_ctx_dir / f"{safe}.json").read_text())
+        assert merged == [original, during_outage], \
+            "a retry over an already-merged target must not duplicate entries"
+        assert not (ctx_dir / f"{safe}.json").exists()
+
+
 def test_migration_retry_after_an_earlier_queue_rewrite_does_not_double_prefix():
     # I3: simulate a crash right after step 3 (queue rewrite + save) but
     # before ctx/secrets/accounts.json. The retry must not re-rewrite

@@ -293,6 +293,23 @@ def migrate_single_account(state_root) -> bool:
     # the flat one is never dropped: the two rings are merged (oldest
     # first, newest last, capped at CONTEXT_LIMIT) so nothing that arrived
     # during the interruption is lost.
+    #
+    # "The flat file is always the newer write" only holds for that
+    # historical crash window: server.py and bin/wa-reply now always pass
+    # an account and never write the flat path at all, so a flat file can
+    # only exist here as leftover state from a run of an OLDER version of
+    # this function that crashed before finishing. It cannot reappear
+    # going forward.
+    #
+    # The merge itself must be idempotent: a crash between the
+    # atomic_write below and the p.unlink() that follows it leaves the
+    # target already holding the merge AND the flat file still present
+    # with its original (pre-merge) content. A retry must not re-append
+    # what is already merged in, or the ring would accumulate a duplicate
+    # of every entry on each retry. Two entries are the same record when
+    # their (from, text, ts) triple matches — the three fields
+    # append_context actually stores — rather than comparing whole dicts,
+    # which would be fragile against key ordering or an added field.
     ctx_dir = data_dir / "ctx"
     ctx_dir.mkdir(parents=True, exist_ok=True)
     account_ctx_dir = ctx_dir / account_id
@@ -308,7 +325,16 @@ def migrate_single_account(state_root) -> bool:
         target_ring = read_json(target, [])
         if not isinstance(target_ring, list):
             target_ring = []
-        merged = (target_ring + source_ring)[-CONTEXT_LIMIT:]
+        merged = []
+        seen = set()
+        for message in target_ring + source_ring:
+            key = ((message.get("from"), message.get("text"), message.get("ts"))
+                   if isinstance(message, dict) else message)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(message)
+        merged = merged[-CONTEXT_LIMIT:]
         atomic_write(target, json.dumps(merged, ensure_ascii=False))
         p.unlink()
         print(f"migrate_single_account: merged context found at both "
