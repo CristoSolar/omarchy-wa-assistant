@@ -97,3 +97,30 @@ def by_id(accounts, account_id):
         if account.get("id") == account_id:
             return account
     return None
+
+
+def token_env_var(account_id: str) -> str:
+    """The name of the environment variable holding an account's token.
+
+    THE single definition of this derivation. Every caller reaches it
+    here rather than building `f"WA_TOKEN_{...}"` itself — bin/wa-reply
+    (which writes and reads the variable, and exposes it to bash through
+    its `token-var` subcommand for bin/wa-pair) and bin/wa-status (which
+    polls every configured account's login state on every bar-widget
+    refresh, so it reads the variable directly rather than shelling out
+    to `wa-reply token-var` per account per poll). Two independent
+    derivations of a credential's name agree in every test and disagree
+    exactly once: at send time, on a real message to a real person.
+
+    Upper-casing is only injective over a restricted charset, so the id
+    is validated first (`validate_id`, `\\A[a-z0-9_]+\\Z`) and an id that
+    fails raises instead of yielding a name. Without that check `trabajo`
+    and `Trabajo` — two DIFFERENT accounts as far as `by_id` is concerned
+    — would both resolve to `WA_TOKEN_TRABAJO` and one of them would send
+    under the other's identity, with no refusal anywhere. The charset is
+    enforced here AND on every read of accounts.json, so neither a caller
+    nor the file can get around it; it also keeps the derived name a
+    legal shell identifier for secrets.env.
+    """
+    validate_id(account_id)
+    return f"WA_TOKEN_{account_id.upper()}"

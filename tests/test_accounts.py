@@ -1,4 +1,4 @@
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
@@ -142,6 +142,67 @@ def test_the_migrations_own_account_id_passes_the_charset():
                     os.environ[k] = v
         assert [a["id"] for a in loaded] == ["personal"]
         assert accounts.validate_id("personal") == "personal"
+
+
+# --- Multi-account: the token variable name has exactly one derivation --
+
+
+def test_token_env_var_derives_the_expected_name():
+    assert accounts.token_env_var("personal") == "WA_TOKEN_PERSONAL"
+    assert accounts.token_env_var("trabajo") == "WA_TOKEN_TRABAJO"
+
+
+def test_token_env_var_refuses_an_invalid_id():
+    try:
+        accounts.token_env_var("Trabajo")
+        assert False, "an id outside the charset must be refused, not upper-cased"
+    except ValueError:
+        pass
+
+
+def test_wa_reply_and_wa_status_both_reach_the_one_derivation():
+    """bin/wa-reply's token_env_var is a REFERENCE to accounts.token_env_var,
+    not a second copy of it — the two must be the same function object, so
+    a fix to one can never miss the other."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    root = Path(__file__).resolve().parents[1]
+    loader = SourceFileLoader("wa_reply_identity_check", str(root / "bin" / "wa-reply"))
+    wa = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("wa_reply_identity_check", loader))
+    loader.exec_module(wa)
+    assert wa.token_env_var is accounts.token_env_var
+
+
+def test_no_file_builds_the_token_variable_name_a_second_way():
+    """Guards the single-derivation rule at the text level: nothing outside
+    sink/accounts.py may construct a WA_TOKEN_<...> name itself (an
+    f-string, string concatenation, or a shelled-out upper-casing in bash)
+    instead of calling accounts.token_env_var / `wa-reply token-var`.
+    Reading a WA_TOKEN_<ID> value that was already resolved elsewhere
+    (e.g. `${!token_var}` in bash, `secrets.get(var)` in Python) is fine
+    and does not match these patterns; only a place that BUILDS the name
+    would.
+    """
+    root = Path(__file__).resolve().parents[1]
+    suspicious = re.compile(r"WA_TOKEN_\{|WA_TOKEN_\$\{|WA_TOKEN_\" *\+|'WA_TOKEN_' *\+")
+    offenders = []
+    for path in root.rglob("*"):
+        if path.resolve() == (root / "sink" / "accounts.py").resolve():
+            continue
+        if not path.is_file() or path.suffix not in ("", ".py"):
+            continue
+        if "/.git/" in str(path) or "/tests/" in str(path):
+            continue
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if suspicious.search(text):
+            offenders.append(str(path.relative_to(root)))
+    assert offenders == [], (
+        f"found a second derivation of the token variable name outside "
+        f"sink/accounts.py: {offenders}")
 
 
 if __name__ == "__main__":

@@ -141,28 +141,14 @@ class AccountNotStated(UnknownAccount):
         })
 
 
-def token_env_var(account_id: str) -> str:
-    """The name of the environment variable holding an account's token.
-
-    THE single definition of this derivation. bin/wa-pair (which writes
-    the variable) must reach this function rather than re-deriving the
-    name — a bash caller through `wa-reply token-var <id>`, a Python one
-    by importing it. Two independent derivations of a credential's name
-    agree in every test and disagree exactly once: at send time, on a real
-    message to a real person.
-
-    Upper-casing is only injective over a restricted charset, so the id is
-    validated first (accounts.validate_id, `^[a-z0-9_]+$`) and an id that
-    fails raises instead of yielding a name. Without that check `trabajo`
-    and `Trabajo` — two DIFFERENT accounts as far as accounts.by_id is
-    concerned — would both resolve to WA_TOKEN_TRABAJO and one of them
-    would send under the other's identity, with no refusal anywhere. The
-    charset is enforced here AND on every read of accounts.json, so
-    neither a caller nor the file can get around it; it also keeps the
-    derived name a legal shell identifier for secrets.env.
-    """
-    accounts.validate_id(account_id)
-    return f"WA_TOKEN_{account_id.upper()}"
+# The single definition of the token variable's name now lives in
+# sink/accounts.py (token_env_var): bin/wa-status needs it too, polled
+# every few seconds by the bar widget once per configured account, so it
+# cannot afford to shell out to `wa-reply token-var` per account per poll —
+# it imports sink.accounts directly instead. This name is a reference to
+# that one function, not a second copy of it, kept so every existing
+# `wa.token_env_var(...)` call (here and in tests) still works unchanged.
+token_env_var = accounts.token_env_var
 
 
 def resolve_account(d, entry) -> dict:

@@ -98,7 +98,17 @@ any_reachable = False
 all_logged_in = True
 for acct in accts:
     account_id = acct.get("id")
-    var = f"WA_TOKEN_{account_id.upper()}" if isinstance(account_id, str) else None
+    # The single definition of this derivation: accounts.load() above
+    # already validated every id, so this should never raise here, but
+    # the call still goes through accounts.token_env_var rather than a
+    # local f-string built from the account id — never a second,
+    # independent derivation of a credential's name. Polled every few
+    # seconds by the bar widget, so this reads the variable directly
+    # instead of shelling out to `wa-reply token-var` per account per poll.
+    try:
+        var = accounts_module.token_env_var(account_id)
+    except ValueError:
+        var = None
     token = secrets.get(var, "") if var else ""
     reachable, logged_in = session_status(token)
     any_reachable = any_reachable or reachable
