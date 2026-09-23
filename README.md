@@ -20,6 +20,17 @@ this README is not going to soften it: if you pair your main number, you are
 choosing to accept that WhatsApp may lock you out of it. Consider a spare
 number for anything but casual, low-volume use.
 
+This applies per number you link, not once per install. Pairing a second
+account (`wa-pair <account-id> <number>`, see "Pairing" below) links a
+second phone number the same way, through the same bridge, under the same
+risk — it does not make the first number any safer, and it doubles the
+number of accounts that can be banned. If that second number is a work
+number, the calculus is worse, not the same: losing a personal number is an
+inconvenience, losing the number your employer or your clients call you on
+is not. Decide account by account whether the convenience is worth it, with
+this in mind for each one you add — the tool will let you pair as many
+numbers as you want, but it will not tell you which ones are worth the risk.
+
 There's a second thing to know before you pair: linking a device makes
 WhatsApp dump the account's *entire* message history into wuzapi's local
 SQLite database, unencrypted. In an earlier test that was on the order of
@@ -46,14 +57,25 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
   context ring (last 10 messages). It never sends anything.
 - **`bin/wa-reply`** is the only component that can send a message. It
   refuses an empty draft, refuses any recipient that isn't a full JID, and
-  refuses to send at all unless `WA_DRY_RUN=0` is set.
+  refuses to send at all unless `WA_DRY_RUN=0` is set. **A reply always
+  leaves by the number it arrived on.** The account is read from the queue
+  entry itself (written by the sink from the webhook's `instanceName` when
+  the message came in) — there is no flag, environment variable or setting
+  anywhere that can send a reply from a different account than the one that
+  received it, and an entry naming an account no longer in `accounts.json`
+  is refused rather than sent under some other one. This is a deliberate
+  guarantee, not a limitation: answering a client from your personal number
+  because something defaulted wrong is exactly the failure this closes by
+  construction.
 - **The bar widget and panel** (`BarWidget.qml`, `Panel.qml`) show pending
   chats, let you type the idea, call `claude -p` to draft a reply against
-  the chat's own agent instructions (`agents/respuesta.md`), and send it.
-  There is one text box: type the idea and press **Redactar** (or Enter)
-  to draft it, then the same box switches to holding the drafted message
-  — editable, with the idea it came from shown above it — and only then
-  does **Enviar** turn on.
+  that chat's own account's tone file (see "Multiple accounts" below), and
+  send it. There is one text box: type the idea and press **Redactar** (or
+  Enter) to draft it, then the same box switches to holding the drafted
+  message — editable, with the idea it came from shown above it — and only
+  then does **Enviar** turn on. Each queued chat shows a badge naming which
+  account it belongs to, and once you open one the detail view states
+  plainly which number the reply will go out from.
 
 ## Requirements
 
@@ -143,7 +165,7 @@ for the session to actually log back in before handing off to `wa-heal`,
 and tells you which of two different things happened:
 
 - **Nothing was ever paired** — `wa-up` says so calmly and points you at
-  `wa-pair <number>`. Not a problem.
+  `wa-pair <account-id> <number>`. Not a problem.
 - **A paired session didn't log back in within 30s** — `wa-up` says the
   webhook could not be re-asserted, that incoming messages will be
   dropped until it is, and that the `wa-heal` timer will retry within five
@@ -196,8 +218,32 @@ something this plugin does.
 ## Pairing
 
 ```sh
-./bin/wa-pair <number, international format, no +>
+./bin/wa-pair <account-id> <number, international format, no +>
 ```
+
+`<account-id>` names the account you're pairing — this is what
+`accounts.json` will call this number for the rest of the system: it becomes
+the wuzapi user, the default tone-file name, and the label shown on the
+panel's badges (see "Multiple accounts" below). On a fresh install, pick
+whatever id you like for your first number, e.g.:
+
+```sh
+./bin/wa-pair personal 5491122334455
+```
+
+An account id may contain only lowercase ASCII letters, digits and
+underscores. That restriction exists for a concrete reason, not style: the
+id is upper-cased to build the name of the environment variable that holds
+its token (`WA_TOKEN_<ID>`, e.g. `trabajo` → `WA_TOKEN_TRABAJO`). If two ids
+differed only by case — `trabajo` and `Trabajo` — they would upper-case to
+the *same* variable name, and whichever one paired second would silently
+overwrite the first one's token in `secrets.env`; a reply meant for one
+number could then go out from the other with nothing refusing it. This was
+a real defect caught in review, not a hypothetical, and the charset rule is
+what makes it impossible rather than merely unlikely. `wa-pair` refuses a
+bad id (through `wa-reply token-var`, the one place this is checked) before
+it creates a wuzapi user, writes a token, or touches `accounts.json` — a
+rejected id never leaves a half-made account behind.
 
 This prints an 8-digit linking code and tells you where to enter it:
 **WhatsApp > Linked devices > Link device > Link with phone number**. Once
@@ -217,7 +263,7 @@ things.
 ```
 linked.
 waiting for WhatsApp to finish sending history...
-history purged: 14832 rows deleted, table now empty.
+history purged: 14832 row(s) seen for trabajo, table now empty.
 ```
 
 **2. It did not work.**
@@ -225,7 +271,7 @@ history purged: 14832 rows deleted, table now empty.
 ```
 WARNING: history may NOT have been fully cleared.
   History was still arriving when purge ran: settled=False
-  Rows before restart: 9021, rows remaining: 342
+  Rows seen for trabajo before restart: 9021, rows remaining (all accounts): 342
   Please run 'docker restart omarchy-wa-sink' in a minute and check again.
 ```
 
@@ -233,15 +279,18 @@ Do exactly that: wait a minute, run `docker restart omarchy-wa-sink`
 yourself, and re-check. The sink purges the history table every time it
 starts, so a second restart after the dump has actually finished should
 leave the table empty. Don't consider pairing done until you've confirmed
-that.
+that. Note that the row count remaining is across **every** account's
+history, not just the one you just paired — the purge itself always empties
+the whole shared table.
 
 **3. It cannot tell.**
 
 ```
-history: no rows were ever observed in wuzapi's message_history table.
-  That may mean this account has no history to sync, or it may mean
-  WhatsApp had not started sending it yet. This run cannot tell which.
-  Nothing was confirmed purged, because nothing was ever seen.
+history: no rows for trabajo were ever observed in wuzapi's
+  message_history table. That may mean this account has no
+  history to sync, or it may mean WhatsApp had not started
+  sending it yet. This run cannot tell which. Nothing was
+  confirmed purged for this account, because nothing was ever seen.
 ```
 
 This is **not** a success message, even though the command exits 0.
@@ -255,10 +304,98 @@ docker restart omarchy-wa-sink
 docker logs omarchy-wa-sink   # look for the "purged N history rows" line
 ```
 
+## Multiple accounts
+
+You can link more than one WhatsApp number to the same install — for
+example a personal number and a separate work number, each answered in its
+own voice. Pair a second one exactly like the first, with a new account id:
+
+```sh
+./bin/wa-pair trabajo 5491122223333
+```
+
+That's the whole procedure — `wa-pair` creates a new wuzapi user, seeds an
+entry for `trabajo` in `accounts.json`, and copies `agents/respuesta.md` to
+`agents/trabajo.md` as a starting tone file, all before it walks you through
+linking the phone the same way described above.
+
+**Where per-account settings live.** Every configured account is one entry
+in `~/.local/share/omarchy-wa/state/accounts.json`, a JSON list. Each entry
+has:
+
+- `id` — the account id you gave `wa-pair`.
+- `label` — shown on the panel's badges and in the "sale desde" line;
+  defaults to the id with underscores turned into spaces and title-cased
+  (`trabajo` → `Trabajo`), and you can edit it to anything you like.
+- `wuzapi_user` — the name of the wuzapi user this account maps to; this is
+  what arrives as the webhook's `instanceName` and is how the sink knows
+  which account a message belongs to. Normally the same as `id`.
+- `agent` — the filename, under `agents/`, of this account's tone file —
+  the instructions `claude -p` is given when drafting a reply for this
+  account. Edit `agents/<that file>` to change how this account replies.
+- `quick_replies` — this account's own one-click reply texts, a plain list
+  of strings shown as buttons in the panel when a chat from this account is
+  open. Edit this array by hand to add, change or remove one; no restart
+  needed, the panel re-reads it (via `wa-reply quick`) every time you open a
+  chat.
+
+To rename an account's label or change its quick replies, edit its entry in
+`accounts.json` directly and save — there's no command for this today. To
+change its tone, edit the file named in its `agent` field.
+
+**`groups_enabled` is not per account.** It stays exactly where it always
+was, in `~/.local/share/omarchy-wa/state/config.json`, shared by every
+account (see "Enabling a group" below). That's deliberate, not an
+oversight: a group JID is unique across all of WhatsApp, and a given group
+either has one of your accounts as a member or it doesn't — there is no
+scenario where the same JID needs different enablement per account, so
+splitting this setting per account would only add a place for the same
+JID to disagree with itself.
+
+**In the panel:** each queued chat in the list carries a small badge naming
+the account it arrived on, and once you open a chat, the detail view states
+plainly which number the reply will go out on ("La respuesta va a salir
+desde: …") — never a choice, since a reply always leaves by the number it
+arrived on (see "What it does" above).
+
+### Migrating from a single-account install
+
+If you're upgrading an install that predates multi-account, you don't need
+to do anything by hand: the next time you run `./bin/wa-up`, it migrates
+your existing setup to the `accounts.json` layout automatically, before
+starting any containers. You'll see one of these two lines:
+
+```
+migrated to accounts.json
+```
+or, on every run after the first:
+```
+accounts.json already present
+```
+
+The migration creates a single account called `personal` (`wuzapi_user:
+omarchy`, matching the wuzapi user your install already had), copies your
+existing `WA_TOKEN` to `WA_TOKEN_PERSONAL` in `secrets.env` (the original
+`WA_TOKEN` is left in place, untouched), moves whatever `quick_replies` you
+already had in `config.json` onto that account, and moves your existing
+per-chat context files into `state/ctx/personal/`. **Your pending
+conversations are preserved**: every queue entry already sitting in
+`queue.json` is rewritten to carry `"account": "personal"` rather than
+dropped or reset, and none of your quick replies or context history is
+lost in the process. `groups_enabled` in `config.json` is left exactly
+where it was.
+
+This is safe to run more than once and safe to interrupt: it is a no-op
+once `accounts.json` exists, and if it's ever interrupted partway (a crash
+mid-`wa-up`), the next `wa-up` picks up wherever it left off rather than
+redoing finished steps or losing anything.
+
 ## Enabling a group
 
-Group chats are ignored by default. To let one through, add its JID to
-`groups_enabled` in `~/.local/share/omarchy-wa/state/config.json`:
+Group chats are ignored by default. `groups_enabled` is shared by every
+configured account, not set per account — see "Multiple accounts" above for
+why. To let one through, add its JID to `groups_enabled` in
+`~/.local/share/omarchy-wa/state/config.json`:
 
 ```json
 {"groups_enabled": ["120363012345678901@g.us"]}
@@ -305,25 +442,30 @@ entry whose last send is unconfirmed (`unknown`/`sending`) still requires
 you to acknowledge that before a quick reply — same as `Enviar` — because
 the guard exists on the `wa-reply send` side, not in the button.
 
-Quick replies live in `quick_replies` in the same
-`~/.local/share/omarchy-wa/state/config.json` as `groups_enabled`, as a
-plain list of strings:
+Quick replies are per account: each account's own list lives in its
+`quick_replies` field in `~/.local/share/omarchy-wa/state/accounts.json`
+(see "Multiple accounts" above), as a plain list of strings, for example:
 
 ```json
-{"groups_enabled": [], "quick_replies": [
-  "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
-  "Gracias, te respondo apenas pueda."
-]}
+[{"id": "personal", "label": "Personal", "wuzapi_user": "omarchy",
+  "agent": "respuesta.md",
+  "quick_replies": [
+    "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
+    "Gracias, te respondo apenas pueda."
+  ]}]
 ```
 
-`wa-up` seeds this key with one default entry the first time it finds the
-file missing or lacking `quick_replies` at all; it never overwrites or
-reorders a list that's already there, and never touches `groups_enabled`.
+`wa-pair` seeds a new account's `quick_replies` with one default entry when
+it creates that account; it never touches an existing account's list. A
+migrated single-account install has its old `quick_replies` (formerly in
+`config.json`) carried onto the `personal` account instead — see
+"Migrating from a single-account install" above.
 
-To add, edit or remove a quick reply: edit the `quick_replies` array by
-hand (add a string, change one, or delete one) and save. There's no
-restart needed — the panel re-reads it from `wa-reply quick` every time
-you reopen a chat in the panel.
+To add, edit or remove a quick reply for a given account: edit that
+account's `quick_replies` array in `accounts.json` by hand (add a string,
+change one, or delete one) and save. There's no restart needed — the panel
+re-reads it from `wa-reply quick` every time you open a chat that belongs
+to that account.
 
 ## Container logs and message content
 
@@ -437,21 +579,29 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
 ├── secrets.env     mode 600 — mounted into NO container
 ├── state/          mounted into the sink at /state
 │   ├── queue.json
+│   ├── accounts.json
 │   ├── ctx/
+│   │   └── <account-id>/
 │   └── config.json
 └── wuzdata/        mounted into both containers
 ```
 
-- `secrets.env` — the admin token, encryption key, API token, and (if you
-  set it) `WA_DRY_RUN=0`. Mode 600. It sits **outside** `state/` on
-  purpose: the sink is the container that receives whatever arrives from
-  the internet, and it has no business holding the credential that can
-  send messages as you. It is not bind-mounted anywhere.
-- `state/queue.json` — pending messages shown in the panel.
-- `state/ctx/` — one small JSON file per chat, the last 10 messages of
-  context used when drafting.
-- `state/config.json` — `groups_enabled`, `quick_replies`, and any other
-  hand-edited settings.
+- `secrets.env` — the admin token, encryption key, and one API token per
+  paired account (`WA_TOKEN_<ID>`, e.g. `WA_TOKEN_PERSONAL`,
+  `WA_TOKEN_TRABAJO`), plus (if you set it) `WA_DRY_RUN=0`. Mode 600. It
+  sits **outside** `state/` on purpose: the sink is the container that
+  receives whatever arrives from the internet, and it has no business
+  holding a credential that can send messages as you. It is not
+  bind-mounted anywhere.
+- `state/queue.json` — pending messages shown in the panel, each carrying
+  which account it arrived on.
+- `state/accounts.json` — the configured accounts: one entry per number,
+  see "Multiple accounts" above.
+- `state/ctx/<account-id>/` — one small JSON file per chat, per account,
+  the last 10 messages of context used when drafting.
+- `state/config.json` — `groups_enabled` (shared by every account) and any
+  other hand-edited, install-wide settings. Quick replies are no longer
+  here — they live per account in `accounts.json`.
 - `wuzdata/` — wuzapi's own SQLite database and session data, bind-mounted
   into both containers. This is where the history dump lands before
   `wa-pair`/the sink purge it.
@@ -489,13 +639,20 @@ rm -rf ~/.local/share/omarchy-wa
 
 ## Unlinking
 
-Do this in order:
+`docker rm -f`/`rm -rf` below tear down the whole install — every paired
+account at once, not just one. Do this in order:
 
-1. On your phone: **WhatsApp > Linked devices**, and remove this device
-   from the list. Do this first — it's the step that actually tells
-   WhatsApp the link is over.
+1. On **each phone number** you paired: **WhatsApp > Linked devices**, and
+   remove this device from the list. Do this first, for every account —
+   it's the step that actually tells WhatsApp the link is over, and
+   step 2/3 delete the local record of which numbers you'd paired, so
+   there's nothing left here afterwards to remind you which phones still
+   need it done.
 2. `docker rm -f omarchy-wuzapi omarchy-wa-sink`
 3. `rm -rf ~/.local/share/omarchy-wa`
+
+There's no command to unlink a single account while leaving the others
+running today — this tears down the whole install.
 
 Skipping step 1 leaves the device listed as linked on WhatsApp's side even
 after you've torn down the containers here.

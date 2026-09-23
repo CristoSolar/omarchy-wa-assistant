@@ -21,6 +21,18 @@ principal, estás aceptando que WhatsApp puede bloqueártelo. Considerá usar
 un número de repuesto para cualquier uso que no sea casual y de bajo
 volumen.
 
+Esto aplica por cada número que vinculás, no una sola vez por instalación.
+Emparejar una segunda cuenta (`wa-pair <account-id> <número>`, ver
+"Emparejar" más abajo) vincula un segundo número de teléfono de la misma
+forma, por el mismo puente, bajo el mismo riesgo — no hace más seguro al
+primer número, y duplica la cantidad de cuentas que pueden terminar
+baneadas. Si ese segundo número es un número de trabajo, la cuenta no es
+la misma, es peor: perder un número personal es una molestia, perder el
+número por el que te llaman tu jefe o tus clientes no lo es. Decidí cuenta
+por cuenta si la comodidad vale el riesgo, teniendo esto en cuenta para
+cada una que agregues — la herramienta te va a dejar emparejar tantos
+números como quieras, pero no te va a decir cuáles valen la pena.
+
 Hay una segunda cosa que hay que saber antes de emparejar: vincular un
 dispositivo hace que WhatsApp vuelque *todo* el historial de mensajes de la
 cuenta en la base SQLite local de wuzapi, sin cifrar. En una prueba
@@ -50,14 +62,26 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 - **`bin/wa-reply`** es el único componente que puede enviar un mensaje.
   Rechaza un borrador vacío, rechaza cualquier destinatario que no sea un
   JID completo, y se niega a enviar directamente a menos que
-  `WA_DRY_RUN=0` esté seteado.
+  `WA_DRY_RUN=0` esté seteado. **Una respuesta siempre sale por el número
+  al que llegó.** La cuenta se lee de la propia entrada de la cola (que el
+  sink escribe a partir del `instanceName` del webhook cuando llegó el
+  mensaje) — no hay flag, variable de entorno ni ajuste en ningún lado que
+  pueda mandar una respuesta desde una cuenta distinta a la que la recibió,
+  y una entrada que nombra una cuenta que ya no está en `accounts.json` se
+  rechaza en vez de enviarse desde otra. Esto es una garantía deliberada,
+  no una limitación: contestarle a un cliente desde tu número personal
+  porque algo tomó un valor por defecto mal es exactamente la falla que
+  esto cierra por construcción.
 - **El widget de barra y el panel** (`BarWidget.qml`, `Panel.qml`) muestran
   los chats pendientes, te dejan escribir la idea, llaman a `claude -p`
-  para redactar una respuesta según las instrucciones del agente
-  (`agents/respuesta.md`) y la envían. Hay una sola caja de texto: escribís
-  la idea y apretás **Redactar** (o Enter) para redactarla; esa misma caja
-  pasa a tener el mensaje redactado — editable, con la idea de la que salió
-  mostrada arriba — y recién ahí se habilita **Enviar**.
+  para redactar una respuesta según el archivo de tono de la cuenta de ese
+  chat (ver "Múltiples cuentas" más abajo) y la envían. Hay una sola caja de
+  texto: escribís la idea y apretás **Redactar** (o Enter) para redactarla;
+  esa misma caja pasa a tener el mensaje redactado — editable, con la idea
+  de la que salió mostrada arriba — y recién ahí se habilita **Enviar**.
+  Cada chat en la cola muestra una etiqueta con la cuenta a la que
+  pertenece, y al abrirlo la vista de detalle dice explícitamente desde qué
+  número va a salir la respuesta.
 
 ## Requisitos
 
@@ -152,7 +176,7 @@ loguearse antes de pasarle la posta a `wa-heal`, y te dice cuál de dos
 cosas distintas pasó:
 
 - **Nunca se emparejó nada** — `wa-up` lo dice con calma y te apunta a
-  `wa-pair <número>`. No es un problema.
+  `wa-pair <account-id> <número>`. No es un problema.
 - **Una sesión emparejada no volvió a loguearse en 30s** — `wa-up` dice
   que el webhook no se pudo reafirmar, que los mensajes entrantes se van a
   perder hasta que se reafirme, y que el timer de `wa-heal` va a reintentar
@@ -208,8 +232,35 @@ en sí, no algo que haga este plugin.
 ## Emparejar
 
 ```sh
-./bin/wa-pair <número, formato internacional, sin +>
+./bin/wa-pair <account-id> <número, formato internacional, sin +>
 ```
+
+`<account-id>` nombra la cuenta que estás emparejando — es lo que
+`accounts.json` va a usar para llamar a este número en el resto del
+sistema: se convierte en el usuario de wuzapi, en el nombre por defecto del
+archivo de tono, y en la etiqueta que se muestra en las badges del panel
+(ver "Múltiples cuentas" más abajo). En una instalación nueva, elegí el id
+que quieras para tu primer número, por ejemplo:
+
+```sh
+./bin/wa-pair personal 5491122334455
+```
+
+Un account id solo puede contener letras ASCII minúsculas, dígitos y guion
+bajo. Esa restricción existe por una razón concreta, no por estilo: el id
+se pasa a mayúsculas para armar el nombre de la variable de entorno que
+guarda su token (`WA_TOKEN_<ID>`, por ejemplo `trabajo` → `WA_TOKEN_TRABAJO`).
+Si dos ids difirieran solo en mayúsculas/minúsculas — `trabajo` y `Trabajo`
+— los dos pasarían a mayúsculas al *mismo* nombre de variable, y el que se
+emparejara segundo pisaría en silencio el token del primero en
+`secrets.env`; una respuesta pensada para un número podría entonces salir
+por el otro sin que nada lo impida. Este fue un defecto real detectado en
+revisión, no un caso hipotético, y la regla del charset es lo que lo hace
+imposible en vez de simplemente improbable. `wa-pair` rechaza un id
+inválido (a través de `wa-reply token-var`, el único lugar donde se
+verifica esto) antes de crear un usuario de wuzapi, escribir un token o
+tocar `accounts.json` — un id rechazado nunca deja una cuenta a medio
+crear.
 
 Esto imprime un código de vinculación de 8 dígitos y te dice dónde
 ingresarlo: **WhatsApp > Dispositivos vinculados > Vincular un dispositivo
@@ -230,7 +281,7 @@ distintas.
 ```
 linked.
 waiting for WhatsApp to finish sending history...
-history purged: 14832 rows deleted, table now empty.
+history purged: 14832 row(s) seen for trabajo, table now empty.
 ```
 
 **2. No salió bien.**
@@ -238,7 +289,7 @@ history purged: 14832 rows deleted, table now empty.
 ```
 WARNING: history may NOT have been fully cleared.
   History was still arriving when purge ran: settled=False
-  Rows before restart: 9021, rows remaining: 342
+  Rows seen for trabajo before restart: 9021, rows remaining (all accounts): 342
   Please run 'docker restart omarchy-wa-sink' in a minute and check again.
 ```
 
@@ -246,15 +297,19 @@ Hacé exactamente eso: esperá un minuto, corré `docker restart
 omarchy-wa-sink` vos mismo, y volvé a revisar. El sink purga la tabla de
 historial cada vez que arranca, así que un segundo reinicio después de que
 el volcado haya terminado de verdad debería dejar la tabla vacía. No des
-por terminado el emparejamiento hasta confirmar eso.
+por terminado el emparejamiento hasta confirmar eso. Notá que la cantidad
+de filas restantes es la de **todas** las cuentas juntas, no solo la que
+acabás de emparejar — la purga siempre vacía la tabla entera, que es
+compartida.
 
 **3. No puede saberlo.**
 
 ```
-history: no rows were ever observed in wuzapi's message_history table.
-  That may mean this account has no history to sync, or it may mean
-  WhatsApp had not started sending it yet. This run cannot tell which.
-  Nothing was confirmed purged, because nothing was ever seen.
+history: no rows for trabajo were ever observed in wuzapi's
+  message_history table. That may mean this account has no
+  history to sync, or it may mean WhatsApp had not started
+  sending it yet. This run cannot tell which. Nothing was
+  confirmed purged for this account, because nothing was ever seen.
 ```
 
 Esto **no** es un mensaje de éxito, aunque el comando salga con código 0.
@@ -268,9 +323,103 @@ docker restart omarchy-wa-sink
 docker logs omarchy-wa-sink   # buscá la línea "purged N history rows"
 ```
 
+## Múltiples cuentas
+
+Podés vincular más de un número de WhatsApp a la misma instalación — por
+ejemplo un número personal y uno de trabajo aparte, cada uno respondido con
+su propia voz. Emparejá un segundo número exactamente igual que el
+primero, con un account id nuevo:
+
+```sh
+./bin/wa-pair trabajo 5491122223333
+```
+
+Eso es todo el procedimiento — `wa-pair` crea un usuario nuevo en wuzapi,
+siembra una entrada para `trabajo` en `accounts.json`, y copia
+`agents/respuesta.md` a `agents/trabajo.md` como archivo de tono inicial,
+todo esto antes de guiarte para vincular el teléfono de la misma forma
+descrita arriba.
+
+**Dónde viven los ajustes por cuenta.** Cada cuenta configurada es una
+entrada en `~/.local/share/omarchy-wa/state/accounts.json`, una lista JSON.
+Cada entrada tiene:
+
+- `id` — el account id que le diste a `wa-pair`.
+- `label` — se muestra en las badges del panel y en la línea "sale desde";
+  por defecto es el id con los guiones bajos convertidos en espacios y con
+  la primera letra de cada palabra en mayúscula (`trabajo` → `Trabajo`), y
+  podés cambiarla a lo que quieras.
+- `wuzapi_user` — el nombre del usuario de wuzapi al que corresponde esta
+  cuenta; esto es lo que llega como `instanceName` del webhook y es cómo el
+  sink sabe a qué cuenta pertenece un mensaje. Normalmente es igual a `id`.
+- `agent` — el nombre del archivo, bajo `agents/`, que es el tono de esta
+  cuenta — las instrucciones que recibe `claude -p` al redactar una
+  respuesta para esta cuenta. Editá `agents/<ese archivo>` para cambiar
+  cómo responde esta cuenta.
+- `quick_replies` — las respuestas rápidas propias de esta cuenta, una
+  lista simple de strings que se muestran como botones en el panel cuando
+  está abierto un chat de esta cuenta. Editá este arreglo a mano para
+  agregar, cambiar o borrar una; no hace falta reiniciar nada, el panel lo
+  relee (vía `wa-reply quick`) cada vez que abrís un chat.
+
+Para cambiarle el nombre a una cuenta o sus respuestas rápidas, editá su
+entrada en `accounts.json` directamente y guardá — hoy no hay un comando
+para esto. Para cambiar su tono, editá el archivo que indica su campo
+`agent`.
+
+**`groups_enabled` no es por cuenta.** Se queda exactamente donde siempre
+estuvo, en `~/.local/share/omarchy-wa/state/config.json`, compartido por
+todas las cuentas (ver "Habilitar un grupo" más abajo). Eso es deliberado,
+no un descuido: el JID de un grupo es único en todo WhatsApp, y un grupo
+dado o tiene a alguna de tus cuentas como miembro o no la tiene — no hay
+ningún escenario donde el mismo JID necesite habilitación distinta según
+la cuenta, así que separar este ajuste por cuenta solo agregaría un lugar
+donde el mismo JID podría contradecirse a sí mismo.
+
+**En el panel:** cada chat en la cola lleva una pequeña badge con el
+nombre de la cuenta a la que llegó, y una vez que abrís un chat, la vista
+de detalle dice explícitamente por qué número va a salir la respuesta
+("La respuesta va a salir desde: …") — nunca una elección, porque una
+respuesta siempre sale por el número al que llegó (ver "Qué hace, en
+resumen" más arriba).
+
+### Migrar desde una instalación de una sola cuenta
+
+Si estás actualizando una instalación de antes de multi-cuenta, no tenés
+que hacer nada a mano: la próxima vez que corras `./bin/wa-up`, migra tu
+instalación existente al formato `accounts.json` automáticamente, antes de
+levantar ningún contenedor. Vas a ver una de estas dos líneas:
+
+```
+migrated to accounts.json
+```
+o, en cada corrida después de la primera:
+```
+accounts.json already present
+```
+
+La migración crea una única cuenta llamada `personal` (`wuzapi_user:
+omarchy`, igual al usuario de wuzapi que tu instalación ya tenía), copia tu
+`WA_TOKEN` existente a `WA_TOKEN_PERSONAL` en `secrets.env` (el `WA_TOKEN`
+original se deja intacto), mueve las `quick_replies` que ya tenías en
+`config.json` a esa cuenta, y mueve tus archivos de contexto por chat
+existentes a `state/ctx/personal/`. **Tus conversaciones pendientes se
+preservan**: cada entrada de la cola que ya estaba en `queue.json` se
+reescribe para llevar `"account": "personal"` en vez de descartarse o
+reiniciarse, y ninguna de tus respuestas rápidas ni tu historial de
+contexto se pierde en el proceso. `groups_enabled` en `config.json` queda
+exactamente donde estaba.
+
+Es seguro correrla más de una vez y seguro interrumpirla: es un no-op una
+vez que existe `accounts.json`, y si se interrumpe a la mitad (un cuelgue a
+mitad de `wa-up`), el próximo `wa-up` retoma desde donde quedó en vez de
+rehacer pasos ya terminados o perder algo.
+
 ## Habilitar un grupo
 
-Los chats de grupo se ignoran por defecto. Para dejar pasar uno, agregá su
+Los chats de grupo se ignoran por defecto. `groups_enabled` es compartido
+por todas las cuentas configuradas, no se setea por cuenta — ver
+"Múltiples cuentas" más arriba para el motivo. Para dejar pasar uno, agregá su
 JID a `groups_enabled` en `~/.local/share/omarchy-wa/state/config.json`:
 
 ```json
@@ -321,25 +470,32 @@ envío en curso, y una entrada cuyo último envío quedó sin confirmar
 `Enviar` antes de dejar pasar una respuesta rápida — porque esa guarda
 vive del lado de `wa-reply send`, no en el botón.
 
-Las respuestas rápidas viven en `quick_replies`, en el mismo
-`~/.local/share/omarchy-wa/state/config.json` que `groups_enabled`, como
-una lista simple de strings:
+Las respuestas rápidas son por cuenta: la lista propia de cada cuenta vive
+en su campo `quick_replies` dentro de
+`~/.local/share/omarchy-wa/state/accounts.json` (ver "Múltiples cuentas"
+más arriba), como una lista simple de strings, por ejemplo:
 
 ```json
-{"groups_enabled": [], "quick_replies": [
-  "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
-  "Gracias, te respondo apenas pueda."
-]}
+[{"id": "personal", "label": "Personal", "wuzapi_user": "omarchy",
+  "agent": "respuesta.md",
+  "quick_replies": [
+    "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede responder pero responderá en breve.",
+    "Gracias, te respondo apenas pueda."
+  ]}]
 ```
 
-`wa-up` siembra esta clave con una entrada por defecto la primera vez que
-encuentra el archivo faltante o sin `quick_replies`; nunca sobrescribe ni
-reordena una lista que ya está ahí, y nunca toca `groups_enabled`.
+`wa-pair` siembra el `quick_replies` de una cuenta nueva con una entrada
+por defecto cuando la crea; nunca toca la lista de una cuenta que ya
+existe. Una instalación migrada desde una sola cuenta conserva sus
+`quick_replies` anteriores (que estaban en `config.json`) trasladadas a la
+cuenta `personal` — ver "Migrar desde una instalación de una sola cuenta"
+más arriba.
 
-Para agregar, editar o borrar una respuesta rápida: editá el arreglo
-`quick_replies` a mano (agregá un string, cambiá uno, o borrá uno) y
-guardá. No hace falta reiniciar nada — el panel lo relee con
-`wa-reply quick` cada vez que abrís un chat en el panel.
+Para agregar, editar o borrar una respuesta rápida de una cuenta dada:
+editá el arreglo `quick_replies` de esa cuenta en `accounts.json` a mano
+(agregá un string, cambiá uno, o borrá uno) y guardá. No hace falta
+reiniciar nada — el panel lo relee con `wa-reply quick` cada vez que abrís
+un chat que pertenece a esa cuenta.
 
 ## Logs de los contenedores y contenido de los mensajes
 
@@ -460,21 +616,30 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
 ├── secrets.env     modo 600 — NO se monta en ningún contenedor
 ├── state/          se monta en el sink como /state
 │   ├── queue.json
+│   ├── accounts.json
 │   ├── ctx/
+│   │   └── <account-id>/
 │   └── config.json
 └── wuzdata/        se monta en los dos contenedores
 ```
 
-- `secrets.env` — el token de admin, la clave de cifrado, el token de API
-  y (si lo pusiste) `WA_DRY_RUN=0`. Modo 600. Está **afuera** de `state/`
-  a propósito: el sink es el contenedor que recibe lo que llega de
-  internet, y no tiene por qué tener la credencial que puede mandar
-  mensajes en tu nombre. No está montado en ningún lado.
-- `state/queue.json` — los mensajes pendientes que se ven en el panel.
-- `state/ctx/` — un archivo JSON chico por chat, los últimos 10 mensajes
-  de contexto usados al redactar.
-- `state/config.json` — `groups_enabled`, `quick_replies`, y cualquier
-  otro ajuste editado a mano.
+- `secrets.env` — el token de admin, la clave de cifrado, y un token de API
+  por cada cuenta emparejada (`WA_TOKEN_<ID>`, por ejemplo
+  `WA_TOKEN_PERSONAL`, `WA_TOKEN_TRABAJO`), más (si lo pusiste)
+  `WA_DRY_RUN=0`. Modo 600. Está **afuera** de `state/` a propósito: el
+  sink es el contenedor que recibe lo que llega de internet, y no tiene
+  por qué tener una credencial que pueda mandar mensajes en tu nombre. No
+  está montado en ningún lado.
+- `state/queue.json` — los mensajes pendientes que se ven en el panel,
+  cada uno con la cuenta a la que llegó.
+- `state/accounts.json` — las cuentas configuradas: una entrada por
+  número, ver "Múltiples cuentas" más arriba.
+- `state/ctx/<account-id>/` — un archivo JSON chico por chat, por cuenta,
+  los últimos 10 mensajes de contexto usados al redactar.
+- `state/config.json` — `groups_enabled` (compartido por todas las
+  cuentas) y cualquier otro ajuste editado a mano, a nivel de toda la
+  instalación. Las respuestas rápidas ya no están acá — viven por cuenta
+  en `accounts.json`.
 - `wuzdata/` — la base SQLite y los datos de sesión propios de wuzapi,
   montados en los dos contenedores. Ahí es donde cae el volcado de
   historial antes de que `wa-pair`/el sink lo purguen.
@@ -515,13 +680,20 @@ rm -rf ~/.local/share/omarchy-wa
 
 ## Desvincular
 
-Hacé esto en orden:
+Los `docker rm -f`/`rm -rf` de abajo tiran abajo toda la instalación —
+todas las cuentas emparejadas de una, no solo una. Hacé esto en orden:
 
-1. En el teléfono: **WhatsApp > Dispositivos vinculados**, y sacá este
-   dispositivo de la lista. Hacé esto primero — es el paso que realmente le
-   avisa a WhatsApp que el vínculo terminó.
+1. En **cada número de teléfono** que emparejaste: **WhatsApp >
+   Dispositivos vinculados**, y sacá este dispositivo de la lista. Hacé
+   esto primero, para cada cuenta — es el paso que realmente le avisa a
+   WhatsApp que el vínculo terminó, y los pasos 2/3 borran el registro
+   local de qué números habías emparejado, así que después no queda nada
+   acá que te recuerde a qué teléfonos les falta.
 2. `docker rm -f omarchy-wuzapi omarchy-wa-sink`
 3. `rm -rf ~/.local/share/omarchy-wa`
+
+Hoy no hay un comando para desvincular una sola cuenta dejando las demás
+funcionando — esto tira abajo toda la instalación.
 
 Saltearse el paso 1 deja el dispositivo listado como vinculado del lado de
 WhatsApp aunque ya hayas tirado abajo los contenedores acá.

@@ -14,7 +14,10 @@ from sink import store
 
 # An account id is a slug, and the charset is not cosmetic: the id is
 # upper-cased to name that account's token variable
-# (WA_TOKEN_<ID_UPPER>, derived in bin/wa-reply's token_env_var). Any
+# (WA_TOKEN_<ID_UPPER>, derived below in this module's own token_env_var —
+# bin/wa-reply only re-exports it as `token_env_var = accounts.token_env_var`
+# and exposes it to bash through its `token-var` subcommand; it does not
+# derive it itself). Any
 # charset that survives upper-casing non-injectively lets two DIFFERENT
 # accounts — `trabajo` and `Trabajo`, which by_id treats as distinct —
 # resolve to the SAME token, and a message then goes out under the wrong
