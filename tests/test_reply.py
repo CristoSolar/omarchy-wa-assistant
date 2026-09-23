@@ -15,25 +15,74 @@ wa = importlib.util.module_from_spec(importlib.util.spec_from_loader("wa_reply",
 _loader.exec_module(wa)
 
 
-def _queue_entry(entry_id="1@s.whatsapp.net"):
-    return {"id": entry_id, "jid": entry_id, "push_name": "Ana", "text": "hola",
-            "count": 1, "ts": "2026-09-22T10:00:00", "status": "pending"}
+PERSONAL = {"id": "personal", "label": "Personal", "wuzapi_user": "omarchy",
+            "agent": "respuesta.md", "quick_replies": ["Uno", "Dos"]}
+TRABAJO = {"id": "trabajo", "label": "Trabajo", "wuzapi_user": "trabajo",
+           "agent": "respuesta-trabajo.md", "quick_replies": ["Cotizo mañana"]}
+
+TOKENS = {"personal": "tok-personal", "trabajo": "tok-trabajo"}
+
+
+def _queue_entry(jid="1@s.whatsapp.net", account="personal"):
+    return {"id": store.entry_id(account, jid), "jid": jid, "account": account,
+            "push_name": "Ana", "text": "hola", "count": 1,
+            "ts": "2026-09-22T10:00:00", "status": "pending"}
+
+
+def _prepare(d, accts=(PERSONAL,), tokens=TOKENS):
+    """accounts.json and a throwaway secrets.env for a test state dir.
+
+    The real layout keeps secrets.env OUTSIDE the sink-visible directory
+    (see test_the_secret_is_not_looked_for_inside_the_sink_mounted_data_dir,
+    which proves that resolution); here it is just a throwaway path fed to
+    WA_SECRETS_FILE, and the tokens in it are fake.
+    """
+    (d / "accounts.json").write_text(json.dumps(list(accts), ensure_ascii=False))
+    if tokens is not None:
+        (d / "secrets.env").write_text(
+            "".join(f"{wa.token_env_var(k)}={v}\n" for k, v in tokens.items()))
+    return d
+
+
+def _enqueue(d, entry):
+    """Queue an entry, seeding the default single-account setup if needed."""
+    if not (d / "accounts.json").exists():
+        _prepare(d)
+    return store.upsert_queue(d, entry)
+
+
+class _reply_env:
+    """Point wa-reply at a test state dir, with no inherited token in view.
+
+    Restores the whole environment afterwards: _load_secrets() uses
+    setdefault, so a WA_TOKEN_* left behind by an earlier test would mask
+    exactly the missing-token case one of these tests exists to prove.
+    """
+
+    def __init__(self, d):
+        self.d = Path(d)
+
+    def __enter__(self):
+        self._saved = dict(os.environ)
+        for key in [k for k in os.environ if k.startswith("WA_TOKEN")]:
+            del os.environ[key]
+        os.environ["WA_DATA_DIR"] = str(self.d)
+        os.environ["WA_SECRETS_FILE"] = str(self.d / "secrets.env")
+        return self.d
+
+    def __exit__(self, *a):
+        os.environ.clear()
+        os.environ.update(self._saved)
+        return False
 
 
 def _run_cmd_send(d, entry_id, text="hola", acknowledged=False):
     """Run cmd_send with WA_DATA_DIR pointed at d; return its one JSON line."""
-    previous_dir = os.environ.get("WA_DATA_DIR")
-    os.environ["WA_DATA_DIR"] = str(d)
     buf = io.StringIO()
-    try:
+    with _reply_env(d):
         with redirect_stdout(buf):
             wa.cmd_send(SimpleNamespace(id=entry_id, text=text,
                                         acknowledged=acknowledged))
-    finally:
-        if previous_dir is None:
-            os.environ.pop("WA_DATA_DIR", None)
-        else:
-            os.environ["WA_DATA_DIR"] = previous_dir
     return json.loads(buf.getvalue())
 
 
@@ -51,7 +100,7 @@ def test_plain_draft_is_untouched():
 
 def test_empty_draft_is_rejected_before_sending():
     try:
-        wa.send("56911111111@s.whatsapp.net", "   ")
+        wa.send("56911111111@s.whatsapp.net", "   ", "tok")
     except ValueError as exc:
         assert "empty" in str(exc).lower()
     else:
@@ -61,7 +110,7 @@ def test_empty_draft_is_rejected_before_sending():
 def test_bare_number_recipient_is_rejected():
     # wuzapi resolves a bare id through a PN/LID lookup that can be ambiguous.
     try:
-        wa.send("56911111111", "hola")
+        wa.send("56911111111", "hola", "tok")
     except ValueError as exc:
         assert "jid" in str(exc).lower()
     else:
@@ -74,7 +123,7 @@ def test_dry_run_does_not_call_the_api():
     previous = os.environ.get("WA_DRY_RUN")
     os.environ["WA_DRY_RUN"] = "1"
     try:
-        out = wa.send("56911111111@s.whatsapp.net", "hola")
+        out = wa.send("56911111111@s.whatsapp.net", "hola", "tok")
         assert out["dry_run"] is True
         assert called == [], "dry run must not reach the network"
     finally:
@@ -107,7 +156,7 @@ def test_dry_run_is_the_default_when_the_env_var_is_entirely_absent():
         os.environ["WA_SECRETS_FILE"] = str(d / "no-such-secrets.env")
         try:
             assert "WA_DRY_RUN" not in os.environ
-            out = wa.send("56911111111@s.whatsapp.net", "hola")
+            out = wa.send("56911111111@s.whatsapp.net", "hola", "tok")
             assert out["dry_run"] is True
             assert called == [], "a bare environment must still default to dry-run"
         finally:
@@ -127,7 +176,7 @@ def test_api_must_stay_on_loopback():
     original_api = wa.API
     wa.API = "http://evil.example.com:8080"
     try:
-        wa.send("56911111111@s.whatsapp.net", "hola")
+        wa.send("56911111111@s.whatsapp.net", "hola", "tok")
     except ValueError as exc:
         assert "127.0.0.1" in str(exc)
     else:
@@ -150,8 +199,8 @@ def test_draft_with_no_fence_at_all_is_unchanged():
 def test_a_successful_send_removes_the_queue_entry_and_reports_ok():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
-        original, wa.send = wa.send, lambda jid, text: {"data": {"Details": "Sent"}}
+        _enqueue(d, entry)
+        original, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
         try:
             out = _run_cmd_send(d, entry["id"])
         finally:
@@ -163,9 +212,9 @@ def test_a_successful_send_removes_the_queue_entry_and_reports_ok():
 def test_a_raised_send_leaves_the_entry_recoverable_as_failed():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
 
-        def _boom(jid, text):
+        def _boom(jid, text, token):
             raise RuntimeError("wuzapi said no")
 
         original, wa.send = wa.send, _boom
@@ -182,10 +231,10 @@ def test_a_raised_send_leaves_the_entry_recoverable_as_failed():
 def test_an_unconfirmed_response_leaves_the_entry_recoverable_as_failed():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         # A response shape that proves nothing — including the AttributeError
         # trap of a `data` key that is null rather than a dict.
-        original, wa.send = wa.send, lambda jid, text: {"data": None}
+        original, wa.send = wa.send, lambda jid, text, token: {"data": None}
         try:
             out = _run_cmd_send(d, entry["id"])
         finally:
@@ -202,9 +251,9 @@ def test_a_timeout_leaves_the_entry_as_unknown_not_failed():
     # the same message twice to a real person.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
 
-        def _timeout(jid, text):
+        def _timeout(jid, text, token):
             raise wa.SendOutcomeUnknown("timed out waiting for wuzapi")
 
         original, wa.send = wa.send, _timeout
@@ -340,9 +389,10 @@ def test_a_dry_run_send_leaves_the_queue_entry_exactly_as_it_was():
     # the DEFAULT, so every first-run user lost their queue this way.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
-        original, wa.send = wa.send, lambda jid, text: {"dry_run": True, "jid": jid,
-                                                        "text": text}
+        _enqueue(d, entry)
+        original, wa.send = wa.send, lambda jid, text, token: {"dry_run": True,
+                                                               "jid": jid,
+                                                               "text": text}
         try:
             out = _run_cmd_send(d, entry["id"])
         finally:
@@ -367,12 +417,12 @@ def test_an_unknown_entry_refuses_to_send_without_an_acknowledgement():
     with tmpdir() as d:
         entry = _queue_entry()
         entry["status"] = "unknown"
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         # upsert_queue forces "pending" only on an update; this is an insert.
         store.set_status(d, entry["id"], "unknown")
 
         called = []
-        original, wa.send = wa.send, lambda jid, text: called.append((jid, text))
+        original, wa.send = wa.send, lambda jid, text, token: called.append((jid, text))
         try:
             out = _run_cmd_send(d, entry["id"])
         finally:
@@ -389,12 +439,12 @@ def test_an_unknown_entry_refuses_to_send_without_an_acknowledgement():
 def test_an_unknown_entry_sends_once_the_acknowledgement_flag_is_passed():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         store.set_status(d, entry["id"], "unknown")
 
         called = []
 
-        def _ok(jid, text):
+        def _ok(jid, text, token):
             called.append((jid, text))
             return {"data": {"Details": "Sent"}}
 
@@ -414,9 +464,9 @@ def test_a_message_that_arrived_mid_draft_survives_a_successful_send():
     # landed after the draft began, and the user never learned it existed.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
 
-        def _send_then_new_message(jid, text):
+        def _send_then_new_message(jid, text, token):
             store.upsert_queue(d, {**entry, "text": "y otra cosa",
                                    "ts": "2026-09-22T10:05:00"})
             return {"data": {"Details": "Sent"}}
@@ -436,17 +486,10 @@ def test_a_message_that_arrived_mid_draft_survives_a_successful_send():
 
 
 def _run_cmd_draft(d, entry_id, idea="decile que si"):
-    previous_dir = os.environ.get("WA_DATA_DIR")
-    os.environ["WA_DATA_DIR"] = str(d)
     buf = io.StringIO()
-    try:
+    with _reply_env(d):
         with redirect_stdout(buf):
             wa.cmd_draft(SimpleNamespace(id=entry_id, idea=idea))
-    finally:
-        if previous_dir is None:
-            os.environ.pop("WA_DATA_DIR", None)
-        else:
-            os.environ["WA_DATA_DIR"] = previous_dir
     return json.loads(buf.getvalue())
 
 
@@ -455,7 +498,7 @@ def test_claude_exiting_clean_with_no_output_reports_an_error():
     # no explanation of why.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         original = wa.subprocess.run
         wa.subprocess.run = lambda *a, **k: SimpleNamespace(
             returncode=0, stdout="   \n", stderr="")
@@ -473,9 +516,9 @@ def test_a_dry_run_does_not_erase_a_stored_unknown_guard():
     # dry-run is the default mode.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         store.set_status(d, entry["id"], "unknown")
-        original, wa.send = wa.send, lambda jid, text: {"dry_run": True}
+        original, wa.send = wa.send, lambda jid, text, token: {"dry_run": True}
         try:
             out = _run_cmd_send(d, entry["id"], acknowledged=True)
         finally:
@@ -494,9 +537,9 @@ def test_a_dry_run_does_not_erase_a_stored_unknown_guard():
 def test_a_dry_run_leaves_a_failed_entry_failed():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         store.set_status(d, entry["id"], "failed")
-        original, wa.send = wa.send, lambda jid, text: {"dry_run": True}
+        original, wa.send = wa.send, lambda jid, text, token: {"dry_run": True}
         try:
             _run_cmd_send(d, entry["id"])
         finally:
@@ -511,11 +554,11 @@ def test_an_entry_stranded_at_sending_refuses_to_send_without_an_acknowledgement
     # as "unknown", so the same guard.
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         store.set_status(d, entry["id"], "sending")
 
         called = []
-        original, wa.send = wa.send, lambda jid, text: called.append((jid, text))
+        original, wa.send = wa.send, lambda jid, text, token: called.append((jid, text))
         try:
             out = _run_cmd_send(d, entry["id"])
         finally:
@@ -532,12 +575,12 @@ def test_an_entry_stranded_at_sending_refuses_to_send_without_an_acknowledgement
 def test_an_entry_stranded_at_sending_sends_once_acknowledged():
     with tmpdir() as d:
         entry = _queue_entry()
-        store.upsert_queue(d, entry)
+        _enqueue(d, entry)
         store.set_status(d, entry["id"], "sending")
 
         called = []
 
-        def _ok(jid, text):
+        def _ok(jid, text, token):
             called.append((jid, text))
             return {"data": {"Details": "Sent"}}
 
@@ -552,33 +595,54 @@ def test_an_entry_stranded_at_sending_sends_once_acknowledged():
         assert store.load_queue(d) == []
 
 
-def _run_cmd_quick(d):
+def _run_cmd_quick(d, entry_id):
     """Run cmd_quick with WA_DATA_DIR pointed at d; return its one JSON line."""
-    previous_dir = os.environ.get("WA_DATA_DIR")
-    os.environ["WA_DATA_DIR"] = str(d)
     buf = io.StringIO()
-    try:
+    with _reply_env(d):
         with redirect_stdout(buf):
-            wa.cmd_quick(SimpleNamespace())
-    finally:
-        if previous_dir is None:
-            os.environ.pop("WA_DATA_DIR", None)
-        else:
-            os.environ["WA_DATA_DIR"] = previous_dir
+            wa.cmd_quick(SimpleNamespace(id=entry_id))
     return json.loads(buf.getvalue())
 
 
-def test_quick_prints_the_configured_list():
+def test_quick_prints_the_configured_list_of_the_entrys_account():
     with tmpdir() as d:
-        (d / "config.json").write_text(
-            json.dumps({"quick_replies": ["Uno", "Dos"]}))
-        assert _run_cmd_quick(d) == ["Uno", "Dos"]
+        _prepare(d, (PERSONAL, TRABAJO))
+        personal = _queue_entry(account="personal")
+        trabajo = _queue_entry(account="trabajo")
+        _enqueue(d, personal)
+        _enqueue(d, trabajo)
+        assert _run_cmd_quick(d, personal["id"]) == PERSONAL["quick_replies"]
+        assert _run_cmd_quick(d, trabajo["id"]) == TRABAJO["quick_replies"]
+
+
+def test_quick_prints_an_empty_list_when_the_account_has_none():
+    with tmpdir() as d:
+        _prepare(d, ({**PERSONAL, "quick_replies": []},))
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        assert _run_cmd_quick(d, entry["id"]) == []
 
 
 def test_quick_prints_an_empty_list_when_the_key_is_absent():
     with tmpdir() as d:
-        (d / "config.json").write_text(json.dumps({"groups_enabled": []}))
-        assert _run_cmd_quick(d) == []
+        account = dict(PERSONAL)
+        del account["quick_replies"]
+        _prepare(d, (account,))
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        assert _run_cmd_quick(d, entry["id"]) == []
+
+
+def test_quick_refuses_an_entry_whose_account_is_unknown():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry(account="fantasma")
+        _enqueue(d, entry)
+        try:
+            _run_cmd_quick(d, entry["id"])
+            raise AssertionError("an unknown account must be refused, not guessed")
+        except wa.UnknownAccount as exc:
+            assert exc.payload["unknown_account"] == "fantasma"
 
 
 def test_quick_reports_a_store_read_error_the_same_way_other_subcommands_do():
@@ -588,20 +652,319 @@ def test_quick_reports_a_store_read_error_the_same_way_other_subcommands_do():
     # ever printing a bare `[]`. cmd_quick must behave identically: raise,
     # not swallow.
     with tmpdir() as d:
-        (d / "config.json").write_text("{not json")
-        previous_dir = os.environ.get("WA_DATA_DIR")
-        os.environ["WA_DATA_DIR"] = str(d)
-        try:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        (d / "accounts.json").write_text("{not json")
+        with _reply_env(d):
             try:
-                wa.cmd_quick(SimpleNamespace())
+                wa.cmd_quick(SimpleNamespace(id=entry["id"]))
                 raise AssertionError("expected StoreReadError for invalid JSON")
             except store.StoreReadError as exc:
-                assert "config.json" in str(exc)
+                assert "accounts.json" in str(exc)
+
+
+# --- Multi-account: the sending identity comes from the entry ----------
+
+
+def test_the_token_variable_name_is_derived_in_exactly_one_place():
+    # bin/wa-pair writes this variable and wa-reply reads it. The two must
+    # agree, so there is one derivation and wa-pair reaches it (directly or
+    # through the `token-var` subcommand) instead of rebuilding the name.
+    assert wa.token_env_var("personal") == "WA_TOKEN_PERSONAL"
+    assert wa.token_env_var("trabajo") == "WA_TOKEN_TRABAJO"
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        wa.cmd_token_var(SimpleNamespace(account_id="trabajo"))
+    assert buf.getvalue().strip() == "WA_TOKEN_TRABAJO"
+
+
+def test_each_account_sends_with_its_own_token():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        personal = _queue_entry(account="personal")
+        trabajo = _queue_entry(account="trabajo")
+        _enqueue(d, personal)
+        _enqueue(d, trabajo)
+        # The same contact wrote to both numbers: two entries, and each
+        # answer must leave by the number it arrived on.
+        assert personal["id"] != trabajo["id"]
+
+        sent = []
+
+        def _capture(jid, text, token):
+            sent.append((jid, text, token))
+            return {"data": {"Details": "Sent"}}
+
+        original, wa.send = wa.send, _capture
+        try:
+            assert _run_cmd_send(d, personal["id"])["ok"] is True
+            assert _run_cmd_send(d, trabajo["id"])["ok"] is True
         finally:
-            if previous_dir is None:
-                os.environ.pop("WA_DATA_DIR", None)
-            else:
-                os.environ["WA_DATA_DIR"] = previous_dir
+            wa.send = original
+
+        assert [t for _, _, t in sent] == ["tok-personal", "tok-trabajo"]
+
+
+def test_the_transport_receives_the_accounts_token_in_its_header():
+    # The last link of the chain: whatever token cmd_send resolved is the
+    # one that reaches the request. urlopen is stubbed, so no socket opens.
+    seen = []
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b'{"data": {"Details": "Sent"}}'
+
+    def _urlopen(req, *a, **k):
+        seen.append(req.get_header("Token"))
+        return _Resp()
+
+    original_urlopen = wa.urllib.request.urlopen
+    wa.urllib.request.urlopen = _urlopen
+    try:
+        wa._post("http://127.0.0.1:8080/chat/send/text",
+                 {"Phone": "1@s.whatsapp.net", "Body": "hola"}, "tok-trabajo")
+    finally:
+        wa.urllib.request.urlopen = original_urlopen
+    assert seen == ["tok-trabajo"]
+
+
+def test_account_token_reads_each_accounts_own_variable():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        with _reply_env(d):
+            assert wa.account_token(PERSONAL) == "tok-personal"
+            assert wa.account_token(TRABAJO) == "tok-trabajo"
+
+
+def test_no_environment_variable_can_redirect_a_send_to_another_account():
+    # The invariant: the account comes from the entry and from nothing
+    # else. A WA_TOKEN (the pre-multi-account variable, still present in a
+    # migrated secrets.env) or a stray WA_ACCOUNT must change nothing.
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        entry = _queue_entry(account="personal")
+        _enqueue(d, entry)
+
+        sent = []
+        original, wa.send = wa.send, (
+            lambda jid, text, token: sent.append(token)
+            or {"data": {"Details": "Sent"}})
+        previous = {k: os.environ.get(k) for k in ("WA_ACCOUNT", "WA_TOKEN")}
+        os.environ["WA_ACCOUNT"] = "trabajo"
+        os.environ["WA_TOKEN"] = "tok-trabajo"
+        try:
+            _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = original
+            for k, v in previous.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        assert sent == ["tok-personal"]
+
+
+def test_an_entry_whose_account_is_unknown_is_refused_and_never_posts():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry(account="fantasma")
+        _enqueue(d, entry)
+
+        posted = []
+        original_post, wa._post = wa._post, (
+            lambda *a, **k: posted.append(a))
+        try:
+            _run_cmd_send(d, entry["id"])
+            raise AssertionError(
+                "an entry whose account is not configured must be refused")
+        except wa.UnknownAccount as exc:
+            assert exc.payload["unknown_account"] == "fantasma"
+            assert exc.payload["ok"] is False
+        finally:
+            wa._post = original_post
+
+        assert posted == [], "a refused entry must never reach the network"
+        q = store.load_queue(d)
+        assert len(q) == 1, "a refusal must not remove the entry"
+        assert q[0]["status"] == "pending", \
+            "a refused entry must not even be marked 'sending'"
+
+
+def test_an_entry_with_no_account_field_at_all_is_refused():
+    # A pre-migration entry that somehow survived: it names no account, so
+    # there is no account to answer from. Refuse rather than assume one.
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry()
+        del entry["account"]
+        _enqueue(d, entry)
+        try:
+            _run_cmd_send(d, entry["id"])
+            raise AssertionError("an entry with no account must be refused")
+        except wa.UnknownAccount:
+            pass
+
+
+def test_a_known_account_without_a_token_is_refused_distinctly():
+    # Different problem, different fix: the accounts file is fine and the
+    # credential is missing (pairing unfinished, or secrets.env rewritten).
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO), tokens={"personal": "tok-personal"})
+        entry = _queue_entry(account="trabajo")
+        _enqueue(d, entry)
+
+        posted = []
+        original_post, wa._post = wa._post, (lambda *a, **k: posted.append(a))
+        try:
+            _run_cmd_send(d, entry["id"])
+            raise AssertionError("a missing token must be refused")
+        except wa.MissingToken as exc:
+            assert exc.payload["missing_token"] == "WA_TOKEN_TRABAJO"
+            assert exc.payload["account"] == "trabajo"
+            assert "unknown_account" not in exc.payload, \
+                "a missing token is not an unknown account"
+        finally:
+            wa._post = original_post
+
+        assert posted == []
+        assert store.load_queue(d)[0]["status"] == "pending"
+
+
+def test_the_two_refusals_are_different_types_with_different_messages():
+    assert issubclass(wa.UnknownAccount, wa.ReplyRefused)
+    assert issubclass(wa.MissingToken, wa.ReplyRefused)
+    assert not issubclass(wa.MissingToken, wa.UnknownAccount)
+    unknown = wa.UnknownAccount("fantasma").payload["error"]
+    missing = wa.MissingToken("trabajo", "WA_TOKEN_TRABAJO").payload["error"]
+    assert "accounts.json" in unknown and "secrets.env" not in unknown
+    assert "secrets.env" in missing and "wa-pair" in missing
+
+
+def _run_main(d, argv):
+    """Run main() as the CLI does; return (exit code, parsed stdout line)."""
+    buf = io.StringIO()
+    previous_argv = sys.argv
+    sys.argv = ["wa-reply"] + list(argv)
+    code = 0
+    with _reply_env(d):
+        try:
+            with redirect_stdout(buf):
+                wa.main()
+        except SystemExit as exc:
+            code = exc.code
+        finally:
+            sys.argv = previous_argv
+    return code, json.loads(buf.getvalue())
+
+
+def test_a_refusal_exits_non_zero_with_one_json_line_on_stdout():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry(account="fantasma")
+        _enqueue(d, entry)
+        posted = []
+        original_post, wa._post = wa._post, (lambda *a, **k: posted.append(a))
+        try:
+            code, out = _run_main(d, ["send", entry["id"], "--text", "hola"])
+        finally:
+            wa._post = original_post
+        assert code == 1, "a refusal must exit non-zero"
+        assert out["ok"] is False and out["unknown_account"] == "fantasma"
+        assert posted == []
+
+        _prepare(d, (PERSONAL, TRABAJO), tokens={"personal": "tok-personal"})
+        trabajo = _queue_entry(account="trabajo")
+        _enqueue(d, trabajo)
+        original_post, wa._post = wa._post, (lambda *a, **k: posted.append(a))
+        try:
+            code, out = _run_main(d, ["send", trabajo["id"], "--text", "hola"])
+        finally:
+            wa._post = original_post
+        assert code == 1
+        assert out["missing_token"] == "WA_TOKEN_TRABAJO"
+        assert "unknown_account" not in out
+        assert posted == []
+
+
+def test_the_tone_file_is_the_accounts_own_not_a_fixed_one():
+    with tmpdir() as d, tmpdir() as agents:
+        _prepare(d, (PERSONAL, TRABAJO))
+        (agents / "respuesta.md").write_text("Tono personal: relajado.")
+        (agents / "respuesta-trabajo.md").write_text("Tono trabajo: formal.")
+        personal = _queue_entry(account="personal")
+        trabajo = _queue_entry(account="trabajo")
+        _enqueue(d, personal)
+        _enqueue(d, trabajo)
+
+        prompts = []
+        original_agents, wa.AGENTS_DIR = wa.AGENTS_DIR, agents
+        original_run = wa.subprocess.run
+
+        def _capture(cmd, *a, **k):
+            prompts.append(cmd[-1])
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        wa.subprocess.run = _capture
+        try:
+            _run_cmd_draft(d, personal["id"])
+            _run_cmd_draft(d, trabajo["id"])
+        finally:
+            wa.subprocess.run = original_run
+            wa.AGENTS_DIR = original_agents
+
+        assert "Tono personal: relajado." in prompts[0]
+        assert "Tono trabajo: formal." not in prompts[0]
+        assert "Tono trabajo: formal." in prompts[1]
+        assert "Tono personal: relajado." not in prompts[1]
+
+
+def test_the_tone_file_cannot_escape_the_agents_directory():
+    account = {**PERSONAL, "agent": "../../etc/passwd"}
+    assert wa.agent_path(account).parent == wa.AGENTS_DIR
+
+
+def test_draft_reads_the_context_ring_of_the_entrys_account():
+    with tmpdir() as d, tmpdir() as agents:
+        _prepare(d, (PERSONAL, TRABAJO))
+        jid = "1@s.whatsapp.net"
+        store.append_context(d, jid, {"from": "Ana", "text": "cosa personal",
+                                      "ts": "2026-09-22T10:00:00"}, "personal")
+        store.append_context(d, jid, {"from": "Ana", "text": "cosa de trabajo",
+                                      "ts": "2026-09-22T10:00:00"}, "trabajo")
+        trabajo = _queue_entry(account="trabajo")
+        _enqueue(d, trabajo)
+
+        prompts = []
+        original_agents, wa.AGENTS_DIR = wa.AGENTS_DIR, agents
+        original_run = wa.subprocess.run
+        wa.subprocess.run = lambda cmd, *a, **k: (
+            prompts.append(cmd[-1])
+            or SimpleNamespace(returncode=0, stdout="ok", stderr=""))
+        try:
+            _run_cmd_draft(d, trabajo["id"])
+        finally:
+            wa.subprocess.run = original_run
+            wa.AGENTS_DIR = original_agents
+        assert "cosa de trabajo" in prompts[0]
+        assert "cosa personal" not in prompts[0]
+
+
+def test_draft_refuses_an_entry_whose_account_is_unknown():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry(account="fantasma")
+        _enqueue(d, entry)
+        original_run = wa.subprocess.run
+        wa.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("claude must not run for an unknown account"))
+        try:
+            _run_cmd_draft(d, entry["id"])
+            raise AssertionError("an unknown account must be refused")
+        except wa.UnknownAccount:
+            pass
+        finally:
+            wa.subprocess.run = original_run
 
 
 if __name__ == "__main__":

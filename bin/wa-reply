@@ -5,6 +5,17 @@
 The only component in this project that can send a message. It refuses to
 send an empty draft, refuses a recipient that is not a full JID, and does
 nothing at all unless WA_DRY_RUN is explicitly set to 0.
+
+It is also the component that decides WHICH of the user's numbers a reply
+leaves by, and that decision has exactly one source: the queue entry's own
+`account` field, written by the sink from the webhook's instanceName when
+the message arrived. From it come the token (WA_TOKEN_<ID_UPPER>) and the
+tone file. No flag, environment variable or argument can change it, and an
+entry naming an account that is not in accounts.json is refused — never
+sent under another account, never defaulted to the first one. Answering a
+client from the personal number is the failure this closes by
+construction, the same way the full-JID check closes writing to the wrong
+person.
 """
 import argparse
 import json
@@ -18,18 +29,11 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sink import store  # noqa: E402
+from sink import accounts, store  # noqa: E402
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
-AGENT = Path(__file__).resolve().parents[1] / "agents" / "respuesta.md"
-
-# TEMPORARY bridge until Task 3 resolves the sending account from the
-# queue entry's own "account" field. Until then wa-reply only ever serves
-# the single migrated account, and context must be read from the same
-# per-account location migration moved it to (ctx/personal/<jid>.json) —
-# store.load_context now requires an explicit account precisely so this
-# can never silently fall back to the pre-migration flat layout.
-_SINGLE_ACCOUNT_ID = "personal"
+AGENTS_DIR = Path(__file__).resolve().parents[1] / "agents"
+DEFAULT_AGENT_FILE = "respuesta.md"
 # Not anchored: a real `claude -p` reply often wraps the fenced block in a
 # preamble ("Claro, aca va:\n```\nHola\n```"), and the backticks must never
 # reach the recipient.
@@ -62,6 +66,117 @@ class SendOutcomeUnknown(Exception):
     failure: a caller that reacts by resending risks a double-send to a
     real person.
     """
+
+
+class ReplyRefused(Exception):
+    """A refusal that must be reported and must never become a send.
+
+    Carries the exact JSON object main() prints on stdout before exiting
+    non-zero, so every refusal looks like every other failure in this
+    script: one line of JSON, nothing on the network.
+    """
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        super().__init__(payload.get("error", "refused"))
+
+
+class UnknownAccount(ReplyRefused):
+    """The entry's `account` is not in accounts.json.
+
+    Deliberately distinct from MissingToken: this one means the entry is
+    stale (its account was renamed or removed) or accounts.json is wrong,
+    and the fix is on the accounts side. Never resolvable by picking some
+    other account — that is exactly how a client would get answered from
+    the personal number.
+    """
+
+    def __init__(self, account_id):
+        super().__init__({
+            "ok": False,
+            "unknown_account": account_id,
+            "error": (f"la entrada dice cuenta {account_id!r} y esa cuenta no "
+                      f"está en accounts.json; no se envía nada. Revisá "
+                      f"accounts.json o descartá la entrada."),
+        })
+
+
+class MissingToken(ReplyRefused):
+    """The account exists but secrets.env has no token for it.
+
+    Distinct from UnknownAccount: the accounts file is fine, the
+    credential is not there — pairing never finished, or secrets.env was
+    rewritten. The fix is `wa-pair <cuenta>`, not editing accounts.json.
+    """
+
+    def __init__(self, account_id, var):
+        super().__init__({
+            "ok": False,
+            "missing_token": var,
+            "account": account_id,
+            "error": (f"la cuenta {account_id!r} existe pero secrets.env no "
+                      f"tiene {var}; no se envía nada. Vinculá esa cuenta "
+                      f"(wa-pair) o restaurá el secreto."),
+        })
+
+
+def token_env_var(account_id: str) -> str:
+    """The name of the environment variable holding an account's token.
+
+    THE single definition of this derivation. bin/wa-pair (which writes
+    the variable) must reach this function rather than re-deriving the
+    name — a bash caller through `wa-reply token-var <id>`, a Python one
+    by importing it. Two independent derivations of a credential's name
+    agree in every test and disagree exactly once: at send time, on a real
+    message to a real person.
+
+    The id is a slug that never changes (the spec forbids renaming it), so
+    a plain upper-casing is total and reversible; no character is dropped
+    or folded, which keeps two distinct account ids from ever collapsing
+    onto one variable name.
+    """
+    if not account_id:
+        raise ValueError("an account id is required to name its token variable")
+    return f"WA_TOKEN_{account_id.upper()}"
+
+
+def resolve_account(d, entry) -> dict:
+    """The account an entry belongs to, from the entry alone.
+
+    The `account` field was written by the sink when the message arrived,
+    from the webhook's own instanceName. Nothing else — no flag, no
+    environment variable, no argument — may select it, and an account that
+    is not configured is refused rather than defaulted: answering from the
+    wrong number is the failure this whole design exists to make
+    impossible.
+    """
+    account_id = (entry or {}).get("account")
+    if not account_id:
+        raise UnknownAccount(account_id)
+    account = accounts.by_id(accounts.load(d), account_id)
+    if account is None:
+        raise UnknownAccount(account_id)
+    return account
+
+
+def account_token(account) -> str:
+    """The sending token for a resolved account, from secrets.env."""
+    account_id = account["id"]
+    var = token_env_var(account_id)
+    _load_secrets()
+    try:
+        return os.environ[var]
+    except KeyError:
+        raise MissingToken(account_id, var) from None
+
+
+def agent_path(account) -> Path:
+    """The tone file of this account, under the plugin's agents/.
+
+    `.name` keeps a stray path in accounts.json from reaching outside
+    agents/; the tone file is plugin content, not an arbitrary path.
+    """
+    return AGENTS_DIR / Path(account.get("agent") or DEFAULT_AGENT_FILE).name
 
 
 def _load_secrets() -> None:
@@ -141,7 +256,21 @@ def _is_dry_run(result) -> bool:
     return isinstance(result, dict) and bool(result.get("dry_run"))
 
 
-def send(jid: str, text: str) -> dict:
+def send(jid: str, text: str, token: str) -> dict:
+    """POST one message. The token is the caller's, already resolved.
+
+    `token` is not optional and is never looked up here: cmd_send derives
+    it from the queue entry's own account (account_token) before this
+    function is reached, so there is exactly one place where an identity
+    is chosen and it is the entry. A token argument also means this
+    function cannot silently fall back to a "default" account the way a
+    lookup of a fixed WA_TOKEN could.
+
+    _load_secrets() already ran during that derivation, so WA_DRY_RUN
+    coming from secrets.env is in the environment by the time it is read
+    below — still read at exactly one place, still defaulting to a dry
+    run when it is absent.
+    """
     text = (text or "").strip()
     if not text:
         raise ValueError("refusing to send an empty draft")
@@ -151,13 +280,10 @@ def send(jid: str, text: str) -> dict:
     if not API.startswith("http://127.0.0.1:"):
         raise ValueError(
             f"refusing to send: WA_API must stay on 127.0.0.1, got {API!r}")
-    _load_secrets()
     if os.environ.get("WA_DRY_RUN", "1") != "0":
         return {"dry_run": True, "jid": jid, "text": text}
-    try:
-        token = os.environ["WA_TOKEN"]
-    except KeyError:
-        raise ValueError("WA_TOKEN is not set and secrets.env has no entry for it")
+    if not token:
+        raise ValueError("refusing to send without a token")
     return _post(f"{API}/chat/send/text", {"Phone": jid, "Body": text}, token)
 
 
@@ -168,12 +294,41 @@ def _entry(d, entry_id):
     return None
 
 
+def cmd_token_var(args):
+    """Print the name of an account's token variable, for bin/wa-pair.
+
+    Not part of the panel's interface: it exists so the script that WRITES
+    the token into secrets.env derives its name from token_env_var() here
+    instead of building the same string a second time in bash. It prints a
+    variable NAME, never a value.
+    """
+    print(token_env_var(args.account_id))
+
+
 def cmd_list(args):
     print(json.dumps(store.load_queue(store.data_dir()), ensure_ascii=False))
 
 
 def cmd_quick(args):
-    print(json.dumps(store.load_quick_replies(store.data_dir()), ensure_ascii=False))
+    """The quick replies of the account the given entry belongs to.
+
+    It takes the SAME entry id the panel passes to `draft` and `send`,
+    not an account: the panel already knows which entry it is showing,
+    and deriving the account from the entry here (rather than letting the
+    caller name one) keeps every account decision in this script coming
+    from the one place the invariant allows. A stale id is the same
+    normal race cmd_draft/cmd_send handle; an unknown account is refused
+    like everywhere else.
+    """
+    d = store.data_dir()
+    entry = _entry(d, args.id)
+    if entry is None:
+        print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
+                         ensure_ascii=False))
+        return
+    account = resolve_account(d, entry)
+    quick = account.get("quick_replies", [])
+    print(json.dumps(quick if isinstance(quick, list) else [], ensure_ascii=False))
 
 
 def cmd_draft(args):
@@ -186,9 +341,11 @@ def cmd_draft(args):
         print(json.dumps({"ok": False, "error": f"no queue entry with id {args.id}"},
                          ensure_ascii=False))
         return
-    agent_text = AGENT.read_text() if AGENT.exists() else ""
+    account = resolve_account(d, entry)
+    agent_file = agent_path(account)
+    agent_text = agent_file.read_text() if agent_file.exists() else ""
     prompt = build_prompt(agent_text,
-                          store.load_context(d, entry["jid"], _SINGLE_ACCOUNT_ID),
+                          store.load_context(d, entry["jid"], account["id"]),
                           args.idea, entry["push_name"])
     try:
         out = subprocess.run(["claude", "-p", prompt], capture_output=True,
@@ -237,9 +394,16 @@ def cmd_send(args):
     # it silently and the user would never learn it existed.
     ts_at_start = entry.get("ts")
 
+    # The identity decision, made before anything is written or sent and
+    # made only from the entry. Both refusals raise out of here, so a
+    # refused entry is never even marked "sending" — it is left exactly as
+    # it was found, and nothing reaches the network.
+    account = resolve_account(d, entry)
+    token = account_token(account)
+
     store.set_status(d, entry["id"], "sending")
     try:
-        result = send(entry["jid"], args.text)
+        result = send(entry["jid"], args.text, token)
         if _is_dry_run(result):
             # A dry run sent nothing, so it must change nothing — including
             # the guard. Writing a literal "pending" here erased a stored
@@ -280,7 +444,10 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list").set_defaults(fn=cmd_list)
-    sub.add_parser("quick").set_defaults(fn=cmd_quick)
+    p = sub.add_parser("quick"); p.add_argument("id")
+    p.set_defaults(fn=cmd_quick)
+    p = sub.add_parser("token-var"); p.add_argument("account_id")
+    p.set_defaults(fn=cmd_token_var)
     p = sub.add_parser("draft"); p.add_argument("id"); p.add_argument("--idea", required=True)
     p.set_defaults(fn=cmd_draft)
     p = sub.add_parser("send"); p.add_argument("id"); p.add_argument("--text", required=True)
@@ -291,6 +458,14 @@ def main():
     args = ap.parse_args()
     try:
         args.fn(args)
+    except ReplyRefused as exc:
+        # An account this install cannot send as. One line of JSON on
+        # stdout like every other failure here, a human-readable line on
+        # stderr, and a non-zero exit — never a send under some other
+        # account, never a default.
+        print(f"wa-reply: {exc}", file=sys.stderr)
+        print(json.dumps(exc.payload, ensure_ascii=False))
+        sys.exit(1)
     except store.StoreReadError as exc:
         # A state file exists but could not be read (permissions, usually a
         # root-owned queue.json from before the sink ran as the invoking
