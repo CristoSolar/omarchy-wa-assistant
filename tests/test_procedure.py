@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 from tests.runner import run
 
 WA_UP = (ROOT / "bin" / "wa-up").read_text()
+WA_PAIR = (ROOT / "bin" / "wa-pair").read_text()
 PANEL = (ROOT / "Panel.qml").read_text()
 INSTALL = (ROOT / "install.sh").read_text()
 
@@ -127,6 +128,46 @@ def test_the_comment_above_the_quick_replies_names_sendblocked():
     before = PANEL[:_idx("model: root.quickReplies", PANEL)]
     block = before[before.rindex("// One-click quick replies"):]
     assert "sendBlocked" in block
+
+
+# --- C3: pairing state comes from wuzapi, not a marker file ---------------
+
+def test_wa_up_does_not_gate_the_heal_decision_on_a_marker_file():
+    """A real installation was paired before $STATE/.paired existed: no
+    marker, but wuzapi has held a real session the whole time. Gating the
+    whole self-heal block on the marker's existence made wa-up say
+    'no account paired yet' about an account wa-status reported as
+    logged in seconds later — leaving the webhook unre-asserted and every
+    incoming message silently dropped."""
+    assert '-f "$STATE/.paired"' not in WA_UP, (
+        "wa-up must not gate on whether a $STATE/.paired marker file exists")
+    assert "PAIRED_MARKER" not in WA_UP, (
+        "wa-up must not carry a variable for a marker path it no longer reads")
+
+
+def test_wa_pair_no_longer_writes_the_retired_marker():
+    assert 'touch "$STATE/.paired"' not in WA_PAIR, (
+        "wa-pair must not write a marker nothing reads any more")
+
+
+def test_wa_up_asks_wuzapi_for_the_persisted_jid_per_account():
+    """The real, per-account fact this decision needs: wuzapi persists a
+    session's jid in its own DB the first time a login ever succeeds, and
+    keeps echoing it back across a container restart even while loggedIn
+    is transiently false during reconnect. Empty jid is what an honestly
+    never-paired account looks like; that must be read from wuzapi, not
+    inferred from a local file."""
+    assert "data.get('jid')" in WA_UP or 'data.get("jid")' in WA_UP, (
+        "wa-up must derive ever-paired-or-not from wuzapi's own jid field")
+
+
+def test_the_never_paired_message_is_still_calm_and_per_account():
+    assert "not paired yet — nothing to wait for." in WA_UP
+
+
+def test_the_stuck_reconnect_message_is_still_loud_and_actionable():
+    for phrase in ("DROPPED", "wa-heal timer will retry", "bin/wa-heal $account_id"):
+        assert phrase in WA_UP, f"missing from the loud reconnect warning: {phrase!r}"
 
 
 # --- I3: install.sh prints a command that exists --------------------------

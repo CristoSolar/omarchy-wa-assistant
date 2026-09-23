@@ -210,15 +210,15 @@ for _ in $(seq 1 40); do
      | grep -q '"loggedIn":true'; then
     echo "linked."
 
-    # Marks this install as having reached loggedIn:true at least once, so
-    # `wa-up` can tell "never paired" (nothing to wait for or heal) apart
-    # from "paired, mid-reconnect after a restart" (worth a bounded wait)
-    # the next time it recreates the containers. Idempotent; safe to
-    # re-touch on every successful pairing. Shared across all accounts
-    # (deliberately): wa-up's wait applies to the whole stack coming back,
-    # not to one account, and any account having ever logged in makes that
-    # wait worthwhile.
-    touch "$STATE/.paired" 2>/dev/null || true
+    # wa-up used to need a $STATE/.paired marker touched here so it could
+    # tell "never paired" apart from "paired, mid-reconnect after a
+    # restart" on its next run. That marker is gone: wa-up now asks
+    # wuzapi's own /session/status for this account's persisted `jid`,
+    # which is the real fact (and which the login-poll loop just above
+    # this block is itself what causes wuzapi to persist, the moment it
+    # observes loggedIn:true) rather than a local claim about it that an
+    # install paired before the marker existed would have no record of.
+    # Nothing here needs to write anything for that purpose any more.
 
     # AUTHORITATIVE webhook set. wuzapi's session login rebuilds its
     # in-memory client record, wiping any webhook set before login even

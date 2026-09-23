@@ -223,18 +223,49 @@ echo "Pair with:  wa-pair <account-id> <number>"
 # wa-up caused this restart, so wa-up is the one that waits for the
 # reconnect, not wa-heal.
 #
-# $STATE/.paired (written by wa-pair once ANY account has ever logged in)
-# tells the two honest-but-opposite cases apart: no marker means nothing
-# has ever been paired, so loggedIn:false everywhere is simply the truth,
-# not a race — nothing to wait for or heal, and the whole block below is
-# skipped so a fresh install isn't held up for no reason. A marker means a
-# reconnect is expected for whichever accounts were already paired, so
-# it's worth a bounded wait — PER ACCOUNT, since each has its own token
-# and its own independent reconnect race with WhatsApp's servers; one
-# account still reconnecting must not stop another, already-reconnected
-# account from being healed promptly.
+# "Never paired" and "paired but mid-reconnect" must be told apart PER
+# ACCOUNT, since each has its own token and its own independent reconnect
+# race with WhatsApp's servers — one account still reconnecting must not
+# stop another, already-reconnected account from being healed promptly.
+#
+# This used to be decided up front, for the whole stack, from whether
+# $STATE/.paired existed — a marker file `wa-pair` touched the first time
+# any account ever logged in. That is a claim ABOUT reality, not reality:
+# an install paired before the marker existed has none, even though
+# wuzapi has held a real session the whole time, and `wa-up` then read the
+# absence as "nothing to heal" and said so — while `wa-status` reported
+# the same account as logged in seconds later. The marker also never
+# earned a place as a fast path: telling the two cases apart already
+# costs one GET /session/status call per account, the same call the wait
+# loop below needs anyway, so reading a local file first saved nothing.
+# It is dropped rather than kept as a "hint" that can go stale.
+#
+# Real state instead: wuzapi persists the account's JID in its own SQLite
+# the first time a login ever succeeds (see wuzapi's GetStatus handler —
+# it writes `UPDATE users SET jid=...` off the live client the moment it
+# observes IsLoggedIn(), and `wa-pair`'s own login-poll loop is what makes
+# that first write happen). `GET /session/status` keeps echoing that
+# persisted `jid` back even while `loggedIn` is transiently false during
+# a post-restart reconnect, because the DB row survives the restart. So:
+#   - `jid` empty      -> this account has never completed a login, ever.
+#                         Calm: nothing to wait for.
+#   - `jid` non-empty  -> a login happened at some point; `loggedIn:false`
+#                         right now is the reconnect race, not the truth.
+#                         Worth a bounded wait, loud if it doesn't land.
+#   - the token itself is unrecognized by wuzapi (401, no `data` at all)
+#     -> wuzapi has no user under this token, so there is nothing paired
+#        to find, same as `jid` empty. This is the normal shape of a
+#        fresh install: the migration above copies WA_TOKEN into
+#        WA_TOKEN_PERSONAL before `wa-pair` has ever created that wuzapi
+#        user, so the token exists in secrets.env with nothing behind it
+#        yet.
+#   - the read itself failed (curl error, unparsable body) even though
+#     the bare reachability probe below succeeded -> genuinely ambiguous.
+#     Treated as "assume paired, wait" on purpose: skipping the wait on a
+#     wrongly-guessed "never paired" silently drops a real account's
+#     messages, where waiting 30s on a wrongly-guessed "paired" costs
+#     nothing but a calm message anyway.
 API=http://127.0.0.1:8080
-PAIRED_MARKER="$STATE/.paired"
 READY=""
 for _ in $(seq 1 20); do
   if curl -s --max-time 2 "$API/session/status" >/dev/null 2>&1; then
@@ -246,8 +277,6 @@ done
 
 if [[ -z "$READY" ]]; then
   echo "warning: wuzapi did not respond in time; skipped webhook self-heal check." >&2
-elif [[ ! -f "$PAIRED_MARKER" ]]; then
-  echo "no account paired yet — nothing to heal. Run: wa-pair <account-id> <number>"
 else
   # Every configured account. accounts.json is guaranteed to exist by now
   # (the migration above ran unconditionally before this point); a broken
@@ -281,6 +310,33 @@ except store.StoreReadError:
       if [[ -z "$token" ]]; then
         echo "wa-up: $account_id: not paired yet — nothing to wait for."
         continue
+      fi
+
+      # Real-state probe: has this account EVER completed a login, per
+      # wuzapi's own persisted `jid` (see the block comment above this
+      # section for why this replaces the old marker-file check).
+      PROBE=$(curl -s --max-time 2 "$API/session/status" -H "token: $token" 2>/dev/null || true)
+      EVER_PAIRED=$(echo "$PROBE" | python3 -c "
+import json, sys
+raw = sys.stdin.read()
+try:
+    parsed = json.loads(raw)
+except Exception:
+    print('unknown')  # read failed even though wuzapi is reachable overall
+    sys.exit()
+data = parsed.get('data')
+if not isinstance(data, dict):
+    print('never')    # e.g. 401 for a token wuzapi has no user under
+    sys.exit()
+print('paired' if data.get('jid') else 'never')
+" 2>/dev/null || echo unknown)
+
+      if [[ "$EVER_PAIRED" == "never" ]]; then
+        echo "wa-up: $account_id: not paired yet — nothing to wait for."
+        continue
+      elif [[ "$EVER_PAIRED" == "unknown" ]]; then
+        echo "wa-up: $account_id: could not confirm pairing state from wuzapi;" >&2
+        echo "  assuming paired and waiting, to be safe." >&2
       fi
 
       # Bound chosen from what reconnecting a paired session actually
