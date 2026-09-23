@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+# bin/wa-media
+"""Download a queue entry's attachment and cache it, or clear the cache.
+
+Same account rule that governs bin/wa-reply, and it is not negotiable: the
+account comes from the queue entry's own `account` field and nothing else
+— no flag, no environment variable, no fallback. An entry naming an
+account that is not in accounts.json is refused, never downloaded under
+some other account's token.
+
+This script only ever talks to wuzapi's /chat/download* endpoints. It has
+no send path, no draft path, and must never grow one: viewing an
+attachment is not answering it.
+
+Cache layout: ~/.local/share/omarchy-wa/media/<account>/<key><ext>, mode
+0700 on every directory, exactly like the rest of the state
+(sink/store.py's data_dir()). `<key>` is never the raw message/entry id —
+see `_cache_key` for why — so a hostile id cannot walk the filename
+outside the cache directory no matter what characters it contains.
+
+Idempotent: `get` never re-downloads when the cache already holds the
+file for this exact attachment. Pruning runs only after a fresh write,
+by age first and then by total size (oldest first), and it excludes the
+file that write just produced — see `_prune`'s docstring for the reason
+that matters.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sink import accounts, store  # noqa: E402
+
+API = os.environ.get("WA_API", "http://127.0.0.1:8080")
+
+# The wuzapi endpoint suffix for each downloadable attachment type. Kept
+# here, not derived from sink.events.DOWNLOADABLE_TYPES's values, because
+# those are the SHORT type names stored on the entry ("image", "audio",
+# ...) and this is a distinct mapping (to a URL path segment) that happens
+# to use the same words today.
+ENDPOINTS = {
+    "image": "downloadimage",
+    "video": "downloadvideo",
+    "audio": "downloadaudio",
+    "document": "downloaddocument",
+    "sticker": "downloadsticker",
+}
+
+# The seven fields sink/events.py copies verbatim from the event, in the
+# exact spelling wuzapi's downloadImageStruct/... expect (see that
+# module's DOWNLOAD_FIELDS comment for the verification trail). Repeated
+# here, not imported, because importing sink.events for a tuple of string
+# literals would be a stranger coupling than just agreeing on the seven
+# names — and if events.py ever changes them, the "missing one or more
+# fields" branch below (len check) still refuses cleanly instead of
+# silently posting a partial payload.
+DOWNLOAD_FIELDS = ("URL", "mimetype", "mediaKey", "fileSHA256",
+                   "fileEncSHA256", "fileLength", "directPath")
+
+# A small, deliberately conservative allowlist: only mimetypes actually
+# reachable through DOWNLOADABLE_TYPES need an extension here, and a type
+# missing from this map still gets a safe (sanitised, capped) fallback
+# rather than failing outright — see `_extension`.
+EXTENSIONS = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
+    "audio/aac": ".aac", "audio/amr": ".amr",
+    "video/mp4": ".mp4", "video/3gpp": ".3gp",
+    "application/pdf": ".pdf",
+}
+
+DEFAULT_MAX_BYTES = 500 * 1024 * 1024  # 500 MiB
+DEFAULT_MAX_AGE_DAYS = 30
+
+
+class MediaRefused(Exception):
+    """A refusal that must be reported and must never become a download.
+
+    Same shape as bin/wa-reply's ReplyRefused: one JSON object, printed on
+    stdout, before a non-zero exit. Nothing on the network happens once
+    one of these is raised.
+    """
+
+    def __init__(self, payload: dict):
+        self.payload = payload
+        super().__init__(payload.get("error", "refused"))
+
+
+class EntryNotFound(MediaRefused):
+    def __init__(self, entry_id):
+        super().__init__({
+            "ok": False,
+            "error": f"no hay una entrada de cola con id {entry_id!r}; no se "
+                     f"descarga nada.",
+        })
+
+
+class AccountNotStated(MediaRefused):
+    def __init__(self, entry_id):
+        super().__init__({
+            "ok": False,
+            "unknown_account": None,
+            "error": (f"la entrada {entry_id!r} no dice de qué cuenta es, así "
+                      f"que no hay token con el cual pedirle el adjunto a "
+                      f"wuzapi; no se descarga nada."),
+        })
+
+
+class UnknownAccount(MediaRefused):
+    """The entry's `account` is not in accounts.json.
+
+    The same non-negotiable rule bin/wa-reply enforces on send: never
+    resolved to some other configured account, never defaulted.
+    """
+
+    def __init__(self, account_id):
+        super().__init__({
+            "ok": False,
+            "unknown_account": account_id,
+            "error": (f"la entrada dice cuenta {account_id!r} y esa cuenta no "
+                      f"está en accounts.json; no se descarga nada."),
+        })
+
+
+class MissingToken(MediaRefused):
+    def __init__(self, account_id, var):
+        super().__init__({
+            "ok": False,
+            "missing_token": var,
+            "account": account_id,
+            "error": (f"la cuenta {account_id!r} existe pero secrets.env no "
+                      f"tiene {var}; no se descarga nada. Vinculá esa cuenta "
+                      f"(wa-pair) o restaurá el secreto."),
+        })
+
+
+class NotDownloadable(MediaRefused):
+    """The entry's attachment cannot be fetched from wuzapi.
+
+    Covers three distinct causes with one message, all reached the same
+    way from a caller's point of view (there is nothing to download):
+    no attachment at all (a text entry), a type wuzapi has no download
+    endpoint for (location, contact), and a downloadable type whose event
+    was missing one of the seven required fields.
+    """
+
+    def __init__(self, entry_id, atype=None):
+        which = f" (tipo {atype!r})" if atype else ""
+        super().__init__({
+            "ok": False,
+            "downloadable": False,
+            "error": (f"la entrada {entry_id!r} no tiene un adjunto "
+                      f"descargable{which}; no se intenta nada."),
+        })
+
+
+class DownloadFailed(MediaRefused):
+    def __init__(self, entry_id, reason):
+        super().__init__({
+            "ok": False,
+            "error": f"la descarga de {entry_id!r} falló: {reason}",
+        })
+
+
+def _entry(d, entry_id):
+    for e in store.load_queue(d):
+        if e["id"] == entry_id:
+            return e
+    return None
+
+
+def resolve_account(d, entry, entry_id):
+    """The account an entry belongs to, from the entry alone.
+
+    Identical stance to bin/wa-reply's resolve_account: the `account`
+    field is the only source, and an entry naming an account that is not
+    configured is refused rather than defaulted.
+    """
+    account_id = (entry or {}).get("account")
+    if not account_id:
+        raise AccountNotStated(entry_id)
+    account = accounts.by_id(accounts.load(d), account_id)
+    if account is None:
+        raise UnknownAccount(account_id)
+    return account
+
+
+def _load_secrets() -> None:
+    """Read secrets.env into the environment when it is not already there.
+
+    Same logic as bin/wa-reply's _load_secrets (duplicated, not imported:
+    bin/wa-reply has no .py extension and this script must not depend on
+    another script's module, only on the sink package both share).
+    """
+    path = store.secrets_path()
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def account_token(account) -> str:
+    account_id = account["id"]
+    var = accounts.token_env_var(account_id)
+    _load_secrets()
+    try:
+        return os.environ[var]
+    except KeyError:
+        raise MissingToken(account_id, var) from None
+
+
+def _attachment_or_refuse(entry, entry_id) -> dict:
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict) or not attachment.get("downloadable"):
+        raise NotDownloadable(entry_id, (attachment or {}).get("type"))
+    missing = [f for f in DOWNLOAD_FIELDS if f not in attachment]
+    if missing:
+        # Belt and suspenders: sink/events.py already never stores a
+        # downloadable=True attachment with a field missing, but this
+        # script must not trust that invariant blindly either — a hand
+        # edited queue.json is exactly the kind of "legal JSON, hostile
+        # content" input the review focus calls out.
+        raise NotDownloadable(entry_id, attachment.get("type"))
+    return attachment
+
+
+# --- Cache key and path safety -------------------------------------------
+
+
+def _cache_key(account_id: str, entry_id: str, attachment: dict) -> str:
+    """A filename stem that cannot carry anything from `entry_id` outward.
+
+    `entry_id` is attacker-influenced: it is `<account>:<jid>` and the jid
+    is copied verbatim from the incoming event (sink/events.py's own
+    docstring says so), so a crafted contact JID reaches this script as
+    part of an id a caller passes on the command line. Any scheme that
+    puts characters from that id literally into a path — even after
+    stripping "/" or "..", even after a first-glance sanitiser — is one
+    missed separator away from writing outside the cache directory.
+
+    The fix is to never let it become a path component at all: hash it.
+    A sha256 hex digest is 64 lowercase hex characters, always, whatever
+    bytes went into it — there is no traversal shape, no absolute path,
+    no null byte, no unicode trick that survives being hashed. The
+    attachment's own `fileSHA256` (WhatsApp's content hash, already part
+    of what sink/events.py stored) is folded in too, so a new attachment
+    arriving on the same jid — which reuses the same entry id, since the
+    queue is keyed one entry per chat — gets its own cache key instead of
+    silently reusing (or clobbering) a previous photo's file.
+    """
+    material = "\x00".join([
+        account_id, entry_id, str(attachment.get("fileSHA256", "")),
+        str(attachment.get("URL", "")),
+    ])
+    return hashlib.sha256(material.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _extension(mimetype: str) -> str:
+    base = (mimetype or "").split(";", 1)[0].strip().lower()
+    if base in EXTENSIONS:
+        return EXTENSIONS[base]
+    # Fallback: the subtype, allowlist-filtered to a short, plain token.
+    # Never the raw mimetype string — that is also attacker-influenced
+    # (it comes from the same event as the jid) and must not reach a
+    # filename unfiltered, for the same reason `entry_id` is hashed above.
+    subtype = base.split("/", 1)[-1]
+    safe = "".join(c for c in subtype if c.isalnum())[:10]
+    return f".{safe}" if safe else ".bin"
+
+
+def media_root() -> Path:
+    """~/.local/share/omarchy-wa/media, 0700 — a sibling of state/, never
+    inside it: the sink container only ever sees data_dir(), and media is
+    fetched by this host-side script alone (see the module docstring)."""
+    root = store.state_root() / "media"
+    root.mkdir(parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return root
+
+
+def _account_dir(account_id: str) -> Path:
+    d = media_root() / account_id
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _cached_path(account_id: str, entry_id: str, attachment: dict) -> Path:
+    key = _cache_key(account_id, entry_id, attachment)
+    ext = _extension(attachment.get("mimetype", ""))
+    account_dir = _account_dir(account_id)
+    path = account_dir / f"{key}{ext}"
+    # Defense in depth: even though `key` and `ext` are constructed above
+    # so that this can never happen, refuse outright rather than proceed
+    # if the resolved path is somehow not a direct child of account_dir.
+    if path.resolve().parent != account_dir.resolve():
+        raise MediaRefused({
+            "ok": False,
+            "error": "ruta de caché calculada fuera del directorio de cuenta; "
+                     "no se escribe nada (esto es un error interno).",
+        })
+    return path
+
+
+# --- Limits ----------------------------------------------------------------
+
+
+def _limits(d) -> tuple:
+    config = store.load_config(d)
+    max_bytes = config.get("media_cache_max_bytes", DEFAULT_MAX_BYTES)
+    max_age_days = config.get("media_cache_max_age_days", DEFAULT_MAX_AGE_DAYS)
+    if not isinstance(max_bytes, (int, float)) or max_bytes <= 0:
+        max_bytes = DEFAULT_MAX_BYTES
+    if not isinstance(max_age_days, (int, float)) or max_age_days <= 0:
+        max_age_days = DEFAULT_MAX_AGE_DAYS
+    return max_bytes, max_age_days
+
+
+def _prune(root: Path, max_bytes, max_age_days, protect: Path) -> None:
+    """Enforce the age and size limits over the whole cache, oldest first.
+
+    Runs only right after a fresh write, with `protect` set to the file
+    that write just produced. `protect` is never a candidate for
+    deletion, under either limit, no matter how old or how far over
+    budget the cache is.
+
+    Why that matters (the review focus this exists to satisfy): the
+    panel (Task 3) downloads-then-displays in two separate steps — this
+    script writes the file and returns its path, and only afterwards does
+    the panel load it off disk. There is a real window between "wa-media
+    returned a path" and "the image is on screen", and pruning runs
+    inside THIS call, before that window opens. A prune pass that could
+    pick the file this very call just wrote — because it happens to be
+    the oldest-by-mtime entry in a cache already over its size limit, or
+    because a bad clock made it look old — would delete the one file
+    guaranteed to be shown next. Excluding `protect` unconditionally is
+    the only rule that holds regardless of clock skew, limit values, or
+    how small the configured budget is; it costs at most one file's
+    worth of extra space beyond the configured limit, which is a
+    strictly better failure than showing a broken image.
+
+    Beyond that one exclusion, this script has no way to know what else
+    the panel might currently be showing (no session/lock file records
+    it), so nothing else is protected. That is a deliberate, bounded gap:
+    the configured limits exist precisely so an old file survives long
+    enough in practice, and a user who reopens something pruned simply
+    triggers a fresh download.
+    """
+    protect = protect.resolve()
+    entries = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        rp = p.resolve()
+        if rp == protect:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        entries.append((st.st_mtime, st.st_size, p))
+
+    now = time.time()
+    max_age_seconds = max_age_days * 86400
+    kept = []
+    for mtime, size, p in entries:
+        if now - mtime > max_age_seconds:
+            p.unlink(missing_ok=True)
+        else:
+            kept.append((mtime, size, p))
+
+    try:
+        protect_size = protect.stat().st_size
+    except OSError:
+        protect_size = 0
+    total = protect_size + sum(size for _, size, _ in kept)
+    kept.sort(key=lambda t: t[0])  # oldest mtime first
+    i = 0
+    while total > max_bytes and i < len(kept):
+        _, size, p = kept[i]
+        p.unlink(missing_ok=True)
+        total -= size
+        i += 1
+
+
+# --- Download ---------------------------------------------------------------
+
+
+def _post_download(url, payload, token):
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "token": token})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+
+def _download_bytes(account, attachment, entry_id) -> bytes:
+    """POST the attachment's descriptor to wuzapi and decode its answer.
+
+    The only network call this script makes, and the only place `token`
+    is used. `API` is asserted onto the loopback interface first, the
+    same guard bin/wa-reply's send() applies before it ever opens a
+    socket.
+    """
+    if not API.startswith("http://127.0.0.1:"):
+        raise MediaRefused({
+            "ok": False,
+            "error": f"refusing to call wuzapi: WA_API must stay on "
+                     f"127.0.0.1, got {API!r}",
+        })
+    token = account_token(account)
+    endpoint = ENDPOINTS[attachment["type"]]
+    payload = {f: attachment[f] for f in DOWNLOAD_FIELDS}
+    try:
+        result = _post_download(f"{API}/chat/{endpoint}", payload, token)
+    except (urllib.error.URLError, OSError) as exc:
+        raise DownloadFailed(entry_id, str(exc)) from None
+    if not isinstance(result, dict):
+        raise DownloadFailed(entry_id, "respuesta de wuzapi no es un objeto JSON")
+    if result.get("success") is False:
+        raise DownloadFailed(entry_id, result.get("error", "wuzapi refused"))
+    data = result.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("Data"), str):
+        raise DownloadFailed(entry_id, "respuesta de wuzapi sin datos")
+    raw = data["Data"]
+    _, _, b64 = raw.partition(",")  # strip the "data:<mime>;base64," prefix
+    try:
+        return base64.b64decode(b64 or raw, validate=False)
+    except (ValueError, TypeError) as exc:
+        raise DownloadFailed(entry_id, f"no se pudo decodificar la respuesta: {exc}") from None
+
+
+def get_media_path(d, entry_id) -> Path:
+    """The cached path for an entry's attachment, downloading it once if needed."""
+    entry = _entry(d, entry_id)
+    if entry is None:
+        raise EntryNotFound(entry_id)
+    account = resolve_account(d, entry, entry_id)
+    attachment = _attachment_or_refuse(entry, entry_id)
+    path = _cached_path(account["id"], entry_id, attachment)
+    if path.exists():
+        return path
+
+    raw = _download_bytes(account, attachment, entry_id)
+    _atomic_write_bytes(path, raw)
+    os.chmod(path, 0o600)
+
+    max_bytes, max_age_days = _limits(d)
+    _prune(media_root(), max_bytes, max_age_days, path)
+    return path
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Binary sibling of store.atomic_write, which is text-only.
+
+    Same crash-safety shape: write to a sibling temp file in the same
+    directory, fsync, then os.replace — never a half-written media file
+    left behind if this process is killed mid-write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+# --- Clearing ----------------------------------------------------------------
+
+
+def clear_cache(account_id=None) -> None:
+    """Empty the whole cache, or just one account's, leaving a valid 0700 dir."""
+    root = media_root()
+    if account_id is None:
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        os.chmod(root, 0o700)
+        return
+    # validate_id keeps this consistent with every other place an account
+    # id reaches a filesystem path in this project, and refuses a
+    # traversal shape passed on the command line the same way an unknown
+    # id in a queue entry gets refused elsewhere.
+    accounts.validate_id(account_id)
+    shutil.rmtree(root / account_id, ignore_errors=True)
+
+
+# --- CLI ---------------------------------------------------------------------
+
+
+def cmd_get(args):
+    d = store.data_dir()
+    path = get_media_path(d, args.id)
+    print(json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False))
+
+
+def cmd_clear(args):
+    try:
+        clear_cache(args.account)
+    except ValueError as exc:
+        raise MediaRefused({"ok": False, "error": str(exc)}) from None
+    print(json.dumps({"ok": True, "cleared": args.account or "all"},
+                     ensure_ascii=False))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("get"); p.add_argument("id")
+    p.set_defaults(fn=cmd_get)
+    p = sub.add_parser("clear")
+    p.add_argument("--account", default=None,
+                   help="clear only this account's cache; omit for all")
+    p.set_defaults(fn=cmd_clear)
+    args = ap.parse_args()
+    try:
+        args.fn(args)
+    except MediaRefused as exc:
+        print(f"wa-media: {exc}", file=sys.stderr)
+        print(json.dumps(exc.payload, ensure_ascii=False))
+        sys.exit(1)
+    except store.StoreReadError as exc:
+        print(f"wa-media: {exc}", file=sys.stderr)
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
