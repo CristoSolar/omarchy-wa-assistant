@@ -18,6 +18,7 @@ construction, the same way the full-JID check closes writing to the wrong
 person.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -138,6 +139,92 @@ class AccountNotStated(UnknownAccount):
                       f"hay número desde el cual contestar; no se envía nada. "
                       f"Es una entrada anterior a la migración: corré wa-up "
                       f"(que migra) o descartála."),
+        })
+
+
+class UnknownAccountId(ReplyRefused):
+    """A settings subcommand was asked about an account id that does not exist.
+
+    Distinct from UnknownAccount: that one is reached from a QUEUE ENTRY
+    whose `account` field names a stale or wrong id. This one is reached
+    from the settings screen, which asks for an account id directly (no
+    entry involved) — wrong id, typo, or an account removed by wa-unlink
+    while the settings screen was still open. Same family (never guess a
+    different account), different caller, so a different, entry-free
+    message.
+    """
+
+    def __init__(self, account_id):
+        super().__init__({
+            "ok": False,
+            "unknown_account": account_id,
+            "error": (f"no existe una cuenta {account_id!r} en accounts.json; "
+                      f"no se lee ni se escribe nada."),
+        })
+
+
+class InvalidQuickReplies(ReplyRefused):
+    """The proposed quick-reply list is not a list of non-empty strings.
+
+    A tone file is free text — this script does not judge its content.
+    quick_replies is structured data the panel renders as buttons, and an
+    empty button or a non-string element is not a "weird but valid" quick
+    reply, it is a broken one. Refuse before writing rather than saving
+    something the panel could later crash on rendering.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__({
+            "ok": False,
+            "error": (f"lista de respuestas rápidas inválida: {reason}; no se "
+                      f"escribió nada."),
+        })
+
+
+class ToneConflict(ReplyRefused):
+    """The tone file changed on disk since the caller last read it.
+
+    agents/<account>.md is explicitly a file people edit by hand (see the
+    module docstring's design note) while the settings screen might be
+    holding a copy read minutes earlier. Writing blindly would silently
+    destroy that hand edit with no trace — worse than refusing, because
+    the person would not even know to look for their lost text. Refuse
+    instead: nothing is written, and the message says why and what to do.
+    """
+
+    def __init__(self, account_id):
+        super().__init__({
+            "ok": False,
+            "conflict": True,
+            "account": account_id,
+            "error": (f"el tono de la cuenta {account_id!r} cambió en disco "
+                      f"desde que se leyó — alguien lo editó a mano (o desde "
+                      f"otra ventana) mientras tanto. No se escribió nada, "
+                      f"para no perder ese cambio. Volvé a abrir el tono "
+                      f"actual, guardá tu texto aparte y aplicalo de nuevo "
+                      f"sobre la versión que hay ahora."),
+        })
+
+
+class QuickRepliesConflict(ReplyRefused):
+    """accounts.json changed on disk since the caller last read it.
+
+    Same reasoning as ToneConflict, but the shared file is accounts.json:
+    a person can be editing quick_replies (or anything else in that file)
+    by hand while the settings screen holds an older copy. Refuse rather
+    than overwrite the rest of the file with a stale snapshot.
+    """
+
+    def __init__(self, account_id):
+        super().__init__({
+            "ok": False,
+            "conflict": True,
+            "account": account_id,
+            "error": (f"accounts.json cambió en disco desde que se leyeron las "
+                      f"respuestas rápidas de {account_id!r} — alguien lo editó "
+                      f"a mano (o desde otra ventana) mientras tanto. No se "
+                      f"escribió nada. Volvé a cargar la lista actual y aplicá "
+                      f"tu cambio de nuevo sobre ella."),
         })
 
 
@@ -305,6 +392,68 @@ def _entry(d, entry_id):
     return None
 
 
+def _sha256_bytes(data: bytes) -> str:
+    """The clobber-protection token handed out by every settings read.
+
+    A content hash, not a modification time: two edits inside the same
+    wall-clock second are ordinary here (a person typing into an editor,
+    then the settings screen saving) and many filesystems only keep
+    mtime to one-second resolution, so an mtime check can miss exactly
+    the overlap it exists to catch. A hash of the bytes actually on disk
+    only ever agrees when the bytes are unchanged, whatever the clock
+    says — and it survives round-tripping through JSON as a plain string,
+    which an mtime float would not do as cleanly across the CLI boundary.
+    """
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_bytes_or_empty(path: Path) -> bytes:
+    """A file's raw bytes, or b"" when it does not exist yet.
+
+    A tone file or accounts.json that has never been written reads as
+    empty rather than raising: a fresh account or one whose tone file was
+    never created is a legitimate starting point, not a broken install
+    (the same stance store.read_json takes for a missing state file).
+    """
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return b""
+
+
+def _account_or_refuse(d, account_id) -> dict:
+    """An account by id, for the settings subcommands (no queue entry involved).
+
+    Distinct from resolve_account: that one starts from a queue entry and
+    raises UnknownAccount/AccountNotStated with entry-shaped messages. The
+    settings screen names an account id directly, so a miss here is
+    UnknownAccountId instead — same refuse-rather-than-guess stance, a
+    message that fits how this caller actually got here.
+    """
+    account = accounts.by_id(accounts.load(d), account_id)
+    if account is None:
+        raise UnknownAccountId(account_id)
+    return account
+
+
+def _validate_quick_replies(value):
+    """Raise InvalidQuickReplies unless value is a list of non-empty strings.
+
+    Whitespace-only counts as empty, the same stance the send path takes
+    on an empty draft (`text.strip()`): a button with nothing visible on
+    it is not a valid quick reply. An empty LIST is fine — "no quick
+    replies configured" is a normal state, not an error.
+    """
+    if not isinstance(value, list):
+        raise InvalidQuickReplies(
+            f"se esperaba una lista, se recibió {type(value).__name__}")
+    for i, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise InvalidQuickReplies(
+                f"el elemento {i} no es un texto no vacío: {item!r}")
+    return value
+
+
 def cmd_token_var(args):
     """Print the name of an account's token variable, for bin/wa-pair.
 
@@ -384,6 +533,113 @@ def cmd_quick(args):
     account = resolve_account(d, entry)
     quick = account.get("quick_replies", [])
     print(json.dumps(quick if isinstance(quick, list) else [], ensure_ascii=False))
+
+
+def cmd_tone_get(args):
+    """The tone file text of one account, plus a hash to hand back on write.
+
+    Read-only, for the settings screen. Prints only what was asked for —
+    the account id, the text and its hash — never the rest of the account
+    (wuzapi_user, agent path, quick_replies, a token): the same allowlist
+    stance cmd_accounts already takes, for the same reason.
+    """
+    d = store.data_dir()
+    account = _account_or_refuse(d, args.account_id)
+    data = _read_bytes_or_empty(agent_path(account))
+    print(json.dumps({
+        "ok": True,
+        "account": account["id"],
+        "text": data.decode("utf-8", errors="replace"),
+        "hash": _sha256_bytes(data),
+    }, ensure_ascii=False))
+
+
+def cmd_tone_set(args):
+    """Save an account's tone text, refusing a write over a hand edit.
+
+    `--hash` must be the hash cmd_tone_get returned for this same file;
+    a mismatch means the file changed since it was read (someone editing
+    it by hand, most likely) and the write is refused outright rather
+    than merged or overwritten — see ToneConflict. The text itself is
+    never validated: it is a prompt, and judging its content is not this
+    script's job, unlike quick_replies which the panel renders as
+    buttons.
+    """
+    d = store.data_dir()
+    account = _account_or_refuse(d, args.account_id)
+    path = agent_path(account)
+    current = _read_bytes_or_empty(path)
+    if _sha256_bytes(current) != args.hash:
+        raise ToneConflict(account["id"])
+    new_text = args.text or ""
+    store.atomic_write(path, new_text)
+    print(json.dumps({
+        "ok": True,
+        "account": account["id"],
+        "hash": _sha256_bytes(new_text.encode("utf-8")),
+    }, ensure_ascii=False))
+
+
+def cmd_quick_get(args):
+    """An account's quick_replies, plus a hash of accounts.json to write back.
+
+    Unlike `quick` (keyed by a queue entry, for the panel's active-chat
+    view), this takes the account id directly — the settings screen edits
+    an account, not a chat. Prints only the account id, its list and the
+    hash: never wuzapi_user, agent or another account's entry, the same
+    allowlist stance as cmd_accounts.
+    """
+    d = store.data_dir()
+    path = Path(d) / "accounts.json"
+    data = _read_bytes_or_empty(path)
+    account = _account_or_refuse(d, args.account_id)
+    quick = account.get("quick_replies", [])
+    print(json.dumps({
+        "ok": True,
+        "account": account["id"],
+        "quick_replies": quick if isinstance(quick, list) else [],
+        "hash": _sha256_bytes(data),
+    }, ensure_ascii=False))
+
+
+def cmd_quick_set(args):
+    """Save an account's quick_replies, refusing a stale or invalid write.
+
+    Two independent refusals, checked in this order: the shape of
+    `--replies` (a JSON array of non-empty strings, InvalidQuickReplies
+    otherwise) and, separately, whether accounts.json is still the file
+    `--hash` was taken from (QuickRepliesConflict otherwise) — a hand
+    edit to accounts.json, or to another account's field, since the
+    settings screen last read it. Only when both hold does this touch the
+    file, and even then it rewrites just this account's quick_replies
+    inside the freshly-loaded list, never a stale in-memory copy of the
+    other accounts.
+    """
+    d = store.data_dir()
+    try:
+        replies = json.loads(args.replies)
+    except ValueError as exc:
+        raise InvalidQuickReplies(f"no es JSON válido: {exc}") from None
+    replies = _validate_quick_replies(replies)
+
+    path = Path(d) / "accounts.json"
+    current = _read_bytes_or_empty(path)
+    if _sha256_bytes(current) != args.hash:
+        raise QuickRepliesConflict(args.account_id)
+
+    accts = accounts.load(d)
+    account = accounts.by_id(accts, args.account_id)
+    if account is None:
+        raise UnknownAccountId(args.account_id)
+    account["quick_replies"] = replies
+    new_text = json.dumps(accts, ensure_ascii=False)
+    store.atomic_write(path, new_text)
+    print(json.dumps({
+        "ok": True,
+        "account": args.account_id,
+        "quick_replies": replies,
+        "hash": _sha256_bytes(new_text.encode("utf-8")),
+    }, ensure_ascii=False))
 
 
 def cmd_draft(args):
@@ -534,6 +790,18 @@ def main():
     sub.add_parser("accounts").set_defaults(fn=cmd_accounts)
     p = sub.add_parser("quick"); p.add_argument("id")
     p.set_defaults(fn=cmd_quick)
+    p = sub.add_parser("tone-get"); p.add_argument("account_id")
+    p.set_defaults(fn=cmd_tone_get)
+    p = sub.add_parser("tone-set"); p.add_argument("account_id")
+    p.add_argument("--text", required=True)
+    p.add_argument("--hash", required=True)
+    p.set_defaults(fn=cmd_tone_set)
+    p = sub.add_parser("quick-get"); p.add_argument("account_id")
+    p.set_defaults(fn=cmd_quick_get)
+    p = sub.add_parser("quick-set"); p.add_argument("account_id")
+    p.add_argument("--replies", required=True)
+    p.add_argument("--hash", required=True)
+    p.set_defaults(fn=cmd_quick_set)
     p = sub.add_parser("token-var"); p.add_argument("account_id")
     p.set_defaults(fn=cmd_token_var)
     p = sub.add_parser("draft"); p.add_argument("id"); p.add_argument("--idea", required=True)

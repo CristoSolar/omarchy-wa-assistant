@@ -1165,5 +1165,191 @@ def test_an_entry_with_no_account_says_something_actionable():
     assert isinstance(wa.AccountNotStated(None), wa.UnknownAccount)
 
 
+# --- Settings screen: tone and quick-reply editing (Task 3) -------------
+
+
+def _run_cmd(d, fn, **kwargs):
+    """Run a wa-reply cmd_* function with WA_DATA_DIR pointed at d.
+
+    Returns its one JSON line on success; re-raises a ReplyRefused (or any
+    other exception) so callers can assert on the specific refusal type,
+    the same pattern _run_cmd_quick's siblings already use for that.
+    """
+    buf = io.StringIO()
+    with _reply_env(d):
+        with redirect_stdout(buf):
+            fn(SimpleNamespace(**kwargs))
+    return json.loads(buf.getvalue())
+
+
+def test_tone_round_trips_through_get_and_set():
+    with tmpdir() as d, tmpdir() as agents:
+        _prepare(d, (PERSONAL,))
+        original_agents, wa.AGENTS_DIR = wa.AGENTS_DIR, agents
+        try:
+            got = _run_cmd(d, wa.cmd_tone_get, account_id="personal")
+            assert got["ok"] is True
+            assert got["text"] == "", "no tone file yet reads as empty, not an error"
+
+            saved = _run_cmd(d, wa.cmd_tone_set, account_id="personal",
+                             text="Tono: relajado y breve.", hash=got["hash"])
+            assert saved["ok"] is True
+
+            got2 = _run_cmd(d, wa.cmd_tone_get, account_id="personal")
+            assert got2["text"] == "Tono: relajado y breve."
+            assert got2["hash"] == saved["hash"]
+        finally:
+            wa.AGENTS_DIR = original_agents
+
+
+def test_tone_set_refuses_a_concurrent_hand_edit_instead_of_clobbering_it():
+    with tmpdir() as d, tmpdir() as agents:
+        _prepare(d, (PERSONAL,))
+        original_agents, wa.AGENTS_DIR = wa.AGENTS_DIR, agents
+        try:
+            got = _run_cmd(d, wa.cmd_tone_get, account_id="personal")
+            # Someone edits the tone file by hand while the settings screen
+            # still holds the copy read above.
+            tone_path = wa.agent_path(PERSONAL)
+            tone_path.write_text("Tono editado a mano mientras tanto.")
+
+            try:
+                _run_cmd(d, wa.cmd_tone_set, account_id="personal",
+                        text="Tono desde la pantalla, ya viejo.", hash=got["hash"])
+                raise AssertionError("a stale hash must be refused, not written")
+            except wa.ToneConflict as exc:
+                assert exc.payload["conflict"] is True
+                assert exc.payload["account"] == "personal"
+                assert "cambió en disco" in exc.payload["error"]
+
+            # The hand edit survives untouched.
+            assert tone_path.read_text() == "Tono editado a mano mientras tanto."
+        finally:
+            wa.AGENTS_DIR = original_agents
+
+
+def test_tone_get_refuses_an_unknown_account():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        try:
+            _run_cmd(d, wa.cmd_tone_get, account_id="fantasma")
+            raise AssertionError("an unknown account must be refused")
+        except wa.UnknownAccountId as exc:
+            assert exc.payload["unknown_account"] == "fantasma"
+
+
+def test_quick_replies_round_trip_through_get_and_set():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        got = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+        assert got["ok"] is True
+        assert got["quick_replies"] == PERSONAL["quick_replies"]
+
+        saved = _run_cmd(d, wa.cmd_quick_set, account_id="personal",
+                         replies=json.dumps(["Nueva", "Lista"]), hash=got["hash"])
+        assert saved["ok"] is True
+        assert saved["quick_replies"] == ["Nueva", "Lista"]
+
+        got2 = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+        assert got2["quick_replies"] == ["Nueva", "Lista"]
+        assert got2["hash"] == saved["hash"]
+
+        # The other account is untouched by a write scoped to "personal".
+        assert _run_cmd(d, wa.cmd_quick_get,
+                        account_id="trabajo")["quick_replies"] == TRABAJO["quick_replies"]
+
+
+def test_quick_set_refuses_a_concurrent_hand_edit_instead_of_clobbering_it():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL, TRABAJO))
+        got = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+
+        # Someone edits accounts.json by hand (a different account's field,
+        # even) while the settings screen still holds the copy read above.
+        accts_path = d / "accounts.json"
+        accts = json.loads(accts_path.read_text())
+        for a in accts:
+            if a["id"] == "trabajo":
+                a["label"] = "Editado a mano"
+        accts_path.write_text(json.dumps(accts, ensure_ascii=False))
+
+        try:
+            _run_cmd(d, wa.cmd_quick_set, account_id="personal",
+                    replies=json.dumps(["Se hubiera perdido"]), hash=got["hash"])
+            raise AssertionError("a stale hash must be refused, not written")
+        except wa.QuickRepliesConflict as exc:
+            assert exc.payload["conflict"] is True
+            assert exc.payload["account"] == "personal"
+
+        # The hand edit survives untouched.
+        current = {a["id"]: a for a in json.loads(accts_path.read_text())}
+        assert current["trabajo"]["label"] == "Editado a mano"
+        assert current["personal"]["quick_replies"] == PERSONAL["quick_replies"]
+
+
+def test_quick_set_refuses_a_non_list_value():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        got = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+        try:
+            _run_cmd(d, wa.cmd_quick_set, account_id="personal",
+                    replies=json.dumps("no es una lista"), hash=got["hash"])
+            raise AssertionError("a non-list value must be refused")
+        except wa.InvalidQuickReplies:
+            pass
+        assert json.loads((d / "accounts.json").read_text())[0]["quick_replies"] \
+            == PERSONAL["quick_replies"], "a refused write must not touch the file"
+
+
+def test_quick_set_refuses_a_list_with_an_empty_or_blank_element():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        got = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+        for bad in (["Buena", ""], ["   "], ["Buena", 5]):
+            try:
+                _run_cmd(d, wa.cmd_quick_set, account_id="personal",
+                        replies=json.dumps(bad), hash=got["hash"])
+                raise AssertionError(f"{bad!r} must be refused")
+            except wa.InvalidQuickReplies:
+                pass
+        assert json.loads((d / "accounts.json").read_text())[0]["quick_replies"] \
+            == PERSONAL["quick_replies"], "a refused write must not touch the file"
+
+
+def test_quick_set_refuses_an_unknown_account():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        current = _read_bytes(d / "accounts.json")
+        try:
+            _run_cmd(d, wa.cmd_quick_set, account_id="fantasma",
+                    replies=json.dumps(["Hola"]), hash=wa._sha256_bytes(current))
+            raise AssertionError("an unknown account must be refused")
+        except wa.UnknownAccountId as exc:
+            assert exc.payload["unknown_account"] == "fantasma"
+
+
+def _read_bytes(path):
+    return Path(path).read_bytes()
+
+
+def test_tone_and_quick_settings_output_never_leaks_a_token_or_another_account():
+    with tmpdir() as d, tmpdir() as agents:
+        _prepare(d, (PERSONAL, TRABAJO))
+        original_agents, wa.AGENTS_DIR = wa.AGENTS_DIR, agents
+        try:
+            tone = _run_cmd(d, wa.cmd_tone_get, account_id="personal")
+            quick = _run_cmd(d, wa.cmd_quick_get, account_id="personal")
+        finally:
+            wa.AGENTS_DIR = original_agents
+
+        for out in (tone, quick):
+            assert set(out) <= {"ok", "account", "text", "hash", "quick_replies"}
+            dumped = json.dumps(out)
+            assert "tok-personal" not in dumped and "tok-trabajo" not in dumped
+            assert "wuzapi_user" not in dumped and "omarchy" not in dumped
+            assert "trabajo" not in dumped, \
+                "a request scoped to 'personal' must not mention the other account"
+
+
 if __name__ == "__main__":
     run(dict(globals()))
