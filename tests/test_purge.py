@@ -2,7 +2,7 @@ import sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
-from sink.purge import purge_history, count_history, wait_until_stable
+from sink.purge import purge_history, count_history, wait_until_stable, wuzapi_user_id
 
 
 def _db(tmp_path, rows=3):
@@ -11,6 +11,25 @@ def _db(tmp_path, rows=3):
     c.execute("CREATE TABLE message_history (id INTEGER PRIMARY KEY, text_content TEXT)")
     c.executemany("INSERT INTO message_history (text_content) VALUES (?)",
                   [(f"secreto {i}",) for i in range(rows)])
+    c.commit(); c.close()
+    return p
+
+
+def _multi_account_db(tmp_path, rows_by_user):
+    """A message_history table carrying a `user_id` column, plus a `users`
+    table mapping wuzapi user names to those ids — the real wuzapi shape,
+    which the single-column `_db` helper above deliberately does not model
+    (it exists only to exercise the whole-table, unscoped path)."""
+    p = tmp_path / "users.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT)")
+    c.execute("CREATE TABLE message_history "
+              "(id INTEGER PRIMARY KEY, user_id TEXT, text_content TEXT)")
+    for name, (user_id, rows) in rows_by_user.items():
+        c.execute("INSERT INTO users (id, name) VALUES (?, ?)", (user_id, name))
+        c.executemany(
+            "INSERT INTO message_history (user_id, text_content) VALUES (?, ?)",
+            [(user_id, f"secreto {i}") for i in range(rows)])
     c.commit(); c.close()
     return p
 
@@ -226,6 +245,75 @@ def test_purge_does_not_vacuum_an_empty_table():
         finally:
             sink.purge.sqlite3.connect = real_connect
         assert vacuums == [], "an empty table must not be vacuumed"
+
+
+# --- Multi-account: scoping a shared table to one account --------------
+
+
+def test_wuzapi_user_id_finds_the_id_for_a_name():
+    with tmpdir() as d:
+        p = _multi_account_db(d, {"personal": ("id-1", 2), "trabajo": ("id-2", 5)})
+        assert wuzapi_user_id(p, "trabajo") == "id-2"
+
+
+def test_wuzapi_user_id_returns_none_for_an_unknown_name():
+    with tmpdir() as d:
+        p = _multi_account_db(d, {"personal": ("id-1", 2)})
+        assert wuzapi_user_id(p, "nope") is None
+
+
+def test_wuzapi_user_id_returns_none_on_a_missing_database():
+    with tmpdir() as d:
+        assert wuzapi_user_id(d / "nope.db", "personal") is None
+
+
+def test_count_history_scoped_to_one_account_ignores_the_others():
+    with tmpdir() as d:
+        p = _multi_account_db(d, {"personal": ("id-1", 3), "trabajo": ("id-2", 7)})
+        assert count_history(p, user_id="id-2") == 7
+        assert count_history(p, user_id="id-1") == 3
+        assert count_history(p) == 10  # unscoped: everyone
+
+
+def test_wait_until_stable_scoped_ignores_another_accounts_concurrent_growth():
+    """The bug this closes: pairing account two while account one is live.
+
+    Account one's row count keeps growing on every poll (its own ordinary
+    traffic, unrelated to the dump being waited on) while account two's
+    count is already settled. Unscoped, that growth alone would stop the
+    combined count from ever settling within the timeout. Scoped to
+    account two's own wuzapi id, account one's growth is invisible and
+    settling is detected immediately.
+    """
+    with tmpdir() as d:
+        p = _multi_account_db(d, {"personal": ("id-1", 1), "trabajo": ("id-2", 4)})
+        conn = sqlite3.connect(p)
+
+        def mock_sleep(_):
+            # Simulate account "personal" (id-1) receiving an ordinary
+            # message on every poll, while "trabajo" (id-2) has already
+            # finished its dump and is not written to again.
+            conn.execute(
+                "INSERT INTO message_history (user_id, text_content) VALUES (?, ?)",
+                ("id-1", "msg"))
+            conn.commit()
+
+        poll_num = [0]
+        def mock_now():
+            return poll_num[0]
+        real_count_history = count_history
+        def counting_now(*a, **k):
+            poll_num[0] += 1
+            return poll_num[0]
+        try:
+            count, settled, saw_rows = wait_until_stable(
+                p, stable_checks=2, interval=1.0, timeout=100.0,
+                sleep_fn=mock_sleep, now_fn=counting_now, user_id="id-2")
+        finally:
+            conn.close()
+        assert settled is True
+        assert saw_rows is True
+        assert count == 4  # trabajo's own count, never touched by personal's growth
 
 
 if __name__ == "__main__":

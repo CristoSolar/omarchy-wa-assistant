@@ -86,6 +86,32 @@ fi
 # shellcheck disable=SC1090
 source "$SECRETS"
 
+# Migrate a pre-multi-account install to accounts.json before starting
+# anything: the sink and every account-aware script (wa-reply, wa-status,
+# wa-heal) assume accounts.json exists, so it must be there before the
+# containers that would otherwise see a half-migrated or missing file come
+# up. Idempotent (store.migrate_single_account's own gate: a no-op once
+# accounts.json exists), and safe to run on a brand-new install too — it
+# then seeds the "personal" account other scripts already expect. Runs
+# AFTER secrets.env exists so its own WA_TOKEN -> WA_TOKEN_PERSONAL copy
+# (spec step 2) has a source token to copy on a fresh install, not just a
+# real migration.
+MIGRATE_MSG=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink import store
+changed = store.migrate_single_account(sys.argv[2])
+print("migrated to accounts.json" if changed else "accounts.json already present")
+' "$ROOT" "$STATE") || {
+  echo "error: migration to accounts.json failed. Not starting anything." >&2
+  exit 1
+}
+echo "$MIGRATE_MSG"
+# Migration may have just appended WA_TOKEN_PERSONAL to secrets.env;
+# re-source so it is in this shell's environment too.
+# shellcheck disable=SC1090
+source "$SECRETS"
+
 docker network create omarchy-wa >/dev/null 2>&1 || true
 
 if ! docker image inspect omarchy-wa-sink >/dev/null 2>&1; then
@@ -137,7 +163,7 @@ docker run -d --name omarchy-wa-sink --network omarchy-wa \
   omarchy-wa-sink >/dev/null
 
 echo "up. wuzapi on 127.0.0.1:8080 (loopback only), sink on the private network."
-echo "Pair with:  wa-pair <number>"
+echo "Pair with:  wa-pair <account-id> <number>"
 
 # Self-heal: wuzapi's event-delivery path reads an in-memory webhook record
 # that gets rebuilt (and the webhook lost) whenever a session logs in. If a
@@ -164,56 +190,96 @@ echo "Pair with:  wa-pair <number>"
 # wa-up caused this restart, so wa-up is the one that waits for the
 # reconnect, not wa-heal.
 #
-# $STATE/.paired (written by wa-pair once a session has ever logged in)
-# tells the two honest-but-opposite cases apart: no marker means this
-# install has never been paired, so loggedIn:false is simply the truth,
-# not a race — nothing to wait for or heal, and the wait below is skipped
-# entirely so a fresh install isn't held up for no reason. A marker means
-# reconnect is expected, so it's worth a bounded wait.
+# $STATE/.paired (written by wa-pair once ANY account has ever logged in)
+# tells the two honest-but-opposite cases apart: no marker means nothing
+# has ever been paired, so loggedIn:false everywhere is simply the truth,
+# not a race — nothing to wait for or heal, and the whole block below is
+# skipped so a fresh install isn't held up for no reason. A marker means a
+# reconnect is expected for whichever accounts were already paired, so
+# it's worth a bounded wait — PER ACCOUNT, since each has its own token
+# and its own independent reconnect race with WhatsApp's servers; one
+# account still reconnecting must not stop another, already-reconnected
+# account from being healed promptly.
 API=http://127.0.0.1:8080
-WA_TOKEN="${WA_TOKEN:-}"
 PAIRED_MARKER="$STATE/.paired"
-if [[ -n "$WA_TOKEN" ]]; then
-  READY=""
-  for _ in $(seq 1 20); do
-    if curl -s --max-time 2 "$API/session/status" -H "token: $WA_TOKEN" >/dev/null 2>&1; then
-      READY=1
-      break
-    fi
-    sleep 1
-  done
-  if [[ -z "$READY" ]]; then
-    echo "warning: wuzapi did not respond in time; skipped webhook self-heal check." >&2
-  elif [[ ! -f "$PAIRED_MARKER" ]]; then
-    echo "no session paired yet — nothing to heal. Run: wa-pair <number>"
+READY=""
+for _ in $(seq 1 20); do
+  if curl -s --max-time 2 "$API/session/status" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ -z "$READY" ]]; then
+  echo "warning: wuzapi did not respond in time; skipped webhook self-heal check." >&2
+elif [[ ! -f "$PAIRED_MARKER" ]]; then
+  echo "no account paired yet — nothing to heal. Run: wa-pair <account-id> <number>"
+else
+  # Every configured account. accounts.json is guaranteed to exist by now
+  # (the migration above ran unconditionally before this point); a broken
+  # accounts.json here falls through to ACCOUNT_LIST being empty, and
+  # bin/wa-heal (called below with no argument) is what actually reports
+  # that loudly — this loop does not duplicate that diagnostic.
+  ACCOUNT_LIST=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink import accounts, store
+try:
+    for a in accounts.load(sys.argv[2]):
+        aid = a.get("id")
+        if aid:
+            print(aid)
+except store.StoreReadError:
+    pass
+' "$ROOT" "$DATA")
+
+  if [[ -z "$ACCOUNT_LIST" ]]; then
+    echo "warning: no readable accounts found to heal; asking wa-heal to explain why:" >&2
+    WA_STATE_ROOT="$STATE" WA_DATA_DIR="$DATA" WA_SECRETS_FILE="$SECRETS" WA_API="$API" "$ROOT/bin/wa-heal" || true
   else
-    # Bound chosen from what reconnecting a paired session actually takes
-    # (a few seconds, per wa-pair's own observed handshake) with generous
-    # headroom for a slow network — 30s, well short of the 5-minute timer
-    # interval, so a genuinely stuck reconnect is reported promptly instead
-    # of wa-up hanging.
-    LOGGED_IN=""
-    for _ in $(seq 1 30); do
-      STATUS=$(curl -s --max-time 2 "$API/session/status" -H "token: $WA_TOKEN" 2>/dev/null || true)
-      if echo "$STATUS" | python3 -c "
+    while IFS= read -r account_id; do
+      [[ -z "$account_id" ]] && continue
+      # The token variable's name has exactly one derivation — reached
+      # through `wa-reply token-var`, never re-derived here. An id
+      # straight from accounts.load() is already validated.
+      token_var=$("$ROOT/bin/wa-reply" token-var "$account_id") || continue
+      token="${!token_var:-}"
+      if [[ -z "$token" ]]; then
+        echo "wa-up: $account_id: not paired yet — nothing to wait for."
+        continue
+      fi
+
+      # Bound chosen from what reconnecting a paired session actually
+      # takes (a few seconds, per wa-pair's own observed handshake) with
+      # generous headroom for a slow network — 30s, well short of the
+      # 5-minute timer interval, so a genuinely stuck reconnect is
+      # reported promptly instead of wa-up hanging on one account while
+      # another, already-reconnected account waits behind it.
+      LOGGED_IN=""
+      for _ in $(seq 1 30); do
+        STATUS=$(curl -s --max-time 2 "$API/session/status" -H "token: $token" 2>/dev/null || true)
+        if echo "$STATUS" | python3 -c "
 import json, sys
 try:
     sys.exit(0 if json.load(sys.stdin)['data']['loggedIn'] else 1)
 except Exception:
     sys.exit(1)
 " 2>/dev/null; then
-        LOGGED_IN=1
-        break
+          LOGGED_IN=1
+          break
+        fi
+        sleep 1
+      done
+      if [[ -n "$LOGGED_IN" ]]; then
+        WA_STATE_ROOT="$STATE" WA_DATA_DIR="$DATA" WA_SECRETS_FILE="$SECRETS" WA_API="$API" \
+          "$ROOT/bin/wa-heal" "$account_id" || true
+      else
+        echo "warning: $account_id did not log back in within 30s — the webhook" >&2
+        echo "  could NOT be re-asserted for this account. Incoming messages will" >&2
+        echo "  be DROPPED until it is. The wa-heal timer will retry within 5" >&2
+        echo "  minutes, or run it now: bin/wa-heal $account_id" >&2
       fi
-      sleep 1
-    done
-    if [[ -n "$LOGGED_IN" ]]; then
-      WA_STATE_ROOT="$STATE" WA_SECRETS_FILE="$SECRETS" WA_API="$API" "$ROOT/bin/wa-heal" || true
-    else
-      echo "warning: session did not log back in within 30s — the webhook" >&2
-      echo "  could NOT be re-asserted. Incoming messages will be DROPPED" >&2
-      echo "  until it is. The wa-heal timer will retry within 5 minutes," >&2
-      echo "  or run it now: bin/wa-heal" >&2
-    fi
+    done <<<"$ACCOUNT_LIST"
   fi
 fi

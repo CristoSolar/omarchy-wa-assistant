@@ -1,48 +1,145 @@
 #!/usr/bin/env bash
-# bin/wa-status — one JSON line for the bar widget.
+# bin/wa-status — one JSON line for the bar widget, aggregated across every
+# configured account.
+#
+# BarWidget.qml parses this today and reads exactly three keys — `ok`,
+# `logged_in` and `pending` — and nothing else. Their MEANING must not
+# change: `pending` is the total number of queue entries waiting across
+# every account (the queue already holds composite `<account>:<jid>` ids,
+# so a plain count is already the right total — no per-account summing
+# needed); `logged_in` is true only when every configured account's
+# WhatsApp session is logged in, false if any one of them is not (a
+# generalization of the old single-account meaning, not a change to it —
+# with one account the two are identical); `ok` is true only when the
+# queue is readable, wuzapi itself answers, and (when at least one account
+# is configured) every configured account is logged in — so a stack with
+# two accounts where one has silently logged out must show unhealthy,
+# never a false "all good" that hides the dead account. A fresh install
+# with no accounts configured yet is not itself an "unhealthy account":
+# `ok` there falls back to the old bridge-reachable signal, exactly like
+# it did before multi-account existed.
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
 SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
 DATA="${WA_DATA_DIR:-$STATE/state}"
-# Go through sink.store (not a hand-rolled json.load) so a queue.json that
-# EXISTS but cannot be read (permissions — the root-owned-state bug — or
-# corruption) is told apart from "no queue yet". A missing file must stay
-# silent (pending: 0, queue_ok: true); an unreadable/corrupt one must not,
-# because the widget uses `ok` to decide whether to show the healthy state,
-# and "pending: 0" on a broken install is exactly the lie that made the
-# whole product look dead while it was working.
-STATUS_JSON=$(python3 - "$ROOT" "$DATA" <<'PY'
-import json, sys
-sys.path.insert(0, sys.argv[1])
-from sink import store
+API="${WA_API:-http://127.0.0.1:8080}"
 
-d = sys.argv[2]
+# Go through sink.store/sink.accounts (not hand-rolled json.load) so a
+# queue.json or accounts.json that EXISTS but cannot be read (permissions —
+# the root-owned-state bug — or corruption) is told apart from "nothing
+# configured yet". A missing file must stay silent; an unreadable/corrupt
+# one must not, because the widget uses `ok` to decide whether to show the
+# healthy state, and "pending: 0" on a broken install is exactly the lie
+# that made the whole product look dead while it was working.
+python3 - "$ROOT" "$DATA" "$SECRETS" "$API" <<'PY'
+import json, sys, urllib.error, urllib.request
+
+sys.path.insert(0, sys.argv[1])
+from sink import accounts as accounts_module, store
+
+data_dir, secrets_path, api = sys.argv[2], sys.argv[3], sys.argv[4]
+
 try:
-    queue = store.load_queue(d)
-    print(json.dumps({"pending": len(queue), "queue_ok": True}))
+    pending = len(store.load_queue(data_dir))
+    queue_ok = True
+    queue_error = None
 except store.StoreReadError as exc:
-    print(f"wa-status: {exc}", file=sys.stderr)
-    print(f"wa-status: fix with: docker exec omarchy-wa-sink chown -R "
-          f"$(id -u):$(id -g) /state   (or re-run wa-up, which now detects "
-          f"and repairs this)", file=sys.stderr)
-    print(json.dumps({"pending": 0, "queue_ok": False, "queue_error": str(exc)}))
+    pending = 0
+    queue_ok = False
+    queue_error = str(exc)
+
+try:
+    accts = accounts_module.load(data_dir)
+    accounts_ok = True
+    accounts_error = None
+except store.StoreReadError as exc:
+    accts = []
+    accounts_ok = False
+    accounts_error = str(exc)
+
+# secrets.env -> {VAR: value}. Best-effort: a fresh install has no secrets
+# file at all yet, and that must not be an error here — wa-status is a
+# read-only diagnostic, never the thing that creates state.
+secrets = {}
+try:
+    for line in open(secrets_path).read().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        secrets[k.strip()] = v.strip()
+except OSError:
+    pass
+
+
+def session_status(token):
+    """(reachable, logged_in) for one token. Never raises.
+
+    `reachable` is true the instant wuzapi answers at all, independent of
+    whether the token is valid or the session is logged in — same
+    signal `BRIDGE_OK` used before multi-account existed (any answer at
+    all, not `{}`/nothing).
+    """
+    if not token:
+        return False, False
+    req = urllib.request.Request(f"{api}/session/status",
+                                 headers={"token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return False, False
+    return True, bool((data.get("data") or {}).get("loggedIn"))
+
+
+detail = []
+any_reachable = False
+all_logged_in = True
+for acct in accts:
+    account_id = acct.get("id")
+    var = f"WA_TOKEN_{account_id.upper()}" if isinstance(account_id, str) else None
+    token = secrets.get(var, "") if var else ""
+    reachable, logged_in = session_status(token)
+    any_reachable = any_reachable or reachable
+    if not (reachable and logged_in):
+        all_logged_in = False
+    detail.append({
+        "id": account_id,
+        "label": acct.get("label", account_id),
+        "paired": bool(token),
+        "reachable": reachable,
+        "logged_in": logged_in,
+    })
+
+if accts:
+    logged_in_overall = all_logged_in
+    ok = queue_ok and accounts_ok and any_reachable and all_logged_in
+else:
+    # No accounts configured yet: there is nothing to be an "unhealthy
+    # account", so `ok` falls back to the pre-multi-account signal (queue
+    # readable, wuzapi reachable) instead of a login check that has
+    # nothing to check — exactly the state a never-paired fresh install
+    # reported before this file learned about accounts at all. This also
+    # covers a not-yet-migrated install: `wa-up` migrates before this
+    # script would ever see accounts.json missing in practice, but
+    # `wa-status` must never crash or lie just because it ran first.
+    token = secrets.get("WA_TOKEN", "")
+    reachable, logged_in_overall = session_status(token)
+    any_reachable = reachable
+    ok = queue_ok and accounts_ok and any_reachable
+
+result = {"ok": ok, "logged_in": logged_in_overall, "pending": pending,
+          "accounts": detail}
+print(json.dumps(result, ensure_ascii=False))
+
+if not queue_ok:
+    print(f"wa-status: {queue_error}", file=sys.stderr)
+    print("wa-status: fix with: docker exec omarchy-wa-sink chown -R "
+          "$(id -u):$(id -g) /state   (or re-run wa-up, which now detects "
+          "and repairs this)", file=sys.stderr)
+if not accounts_ok:
+    print(f"wa-status: {accounts_error}", file=sys.stderr)
+    print("wa-status: accounts.json exists but could not be read; fix or "
+          "remove it, or re-run wa-up.", file=sys.stderr)
 PY
-)
-PENDING=$(echo "$STATUS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending'])")
-QUEUE_OK=$(echo "$STATUS_JSON" | python3 -c "import json,sys; print('true' if json.load(sys.stdin)['queue_ok'] else 'false')")
-# shellcheck disable=SC1090
-if [[ -f "$SECRETS" ]]; then source "$SECRETS"; fi
-ST=$(curl -s --max-time 3 http://127.0.0.1:8080/session/status -H "token: ${WA_TOKEN:-}" || echo '{}')
-LOGGED=$(echo "$ST" | python3 -c "
-import json,sys
-try: print('true' if json.load(sys.stdin)['data']['loggedIn'] else 'false')
-except Exception: print('false')
-")
-BRIDGE_OK=$([[ "$ST" == "{}" || -z "$ST" ]] && echo false || echo true)
-if [[ "$QUEUE_OK" == "false" ]]; then
-  OK=false
-else
-  OK=$BRIDGE_OK
-fi
-echo "{\"ok\": $OK, \"logged_in\": $LOGGED, \"pending\": $PENDING}"

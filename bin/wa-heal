@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# bin/wa-heal — re-assert the wuzapi webhook when a session is logged in.
+# bin/wa-heal [account-id] — re-assert the wuzapi webhook for every account
+# that is logged in, or just one.
 #
 # wuzapi's webhook registration lives only in memory and is lost on every
 # process restart — a crash, `docker restart`, a reboot — even though
@@ -19,15 +20,30 @@
 # This script is the single implementation of the re-assert: `wa-up` calls
 # it too rather than keeping its own copy, so the two can never drift.
 #
-# Safe to run repeatedly and often:
-#   - no WA_TOKEN yet (never paired)        -> no-op, exit 0
-#   - wuzapi unreachable                     -> exit 1, quiet failure, retried
-#                                                by the timer next interval
-#   - no session logged in                   -> no-op, exit 0
+# Every account is healed independently: one account with no token, an
+# unreachable wuzapi, or a webhook that will not stick must never stop the
+# next account from being checked. With no argument, every configured
+# account is healed (the timer's normal periodic run, and a no-accounts
+# install falls back to the single pre-multi-account WA_TOKEN so it behaves
+# exactly as it did before accounts existed). With an account id argument,
+# only that one account is healed — this is what `wa-up` uses, right after
+# it has already waited for THAT account's own `loggedIn`, so it does not
+# also re-check every other account's login race at the same moment.
+#
+# Safe to run repeatedly and often, per account:
+#   - no token yet (never paired)             -> no-op, that account "ok"
+#   - wuzapi unreachable                       -> that account "failed",
+#                                                  retried next interval
+#   - no session logged in                     -> no-op, that account "ok"
 #   - session logged in, webhook re-asserted
-#     and confirmed via GET /webhook         -> exit 0
+#     and confirmed via GET /webhook           -> that account "ok"
 #   - re-assert does not stick (GET /webhook
-#     still doesn't match after the POST)    -> exit 1, loud message on stderr
+#     still doesn't match after the POST)      -> that account "failed",
+#                                                  loud message on stderr
+#
+# Exits 0 only if every account it looked at came back "ok"; exits 1 if any
+# one of them failed — but only after every other account was still given
+# its own chance to heal.
 #
 # Installed as a systemd --user timer (wa-heal.timer next to this file) that
 # runs it every few minutes and once at login, so a crash, a `docker
@@ -35,29 +51,41 @@
 # notice there was a problem and run `wa-up` by hand.
 set -uo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
 SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
+DATA="${WA_DATA_DIR:-$STATE/state}"
 API="${WA_API:-http://127.0.0.1:8080}"
 WEBHOOK_URL="${WA_WEBHOOK_URL:-http://omarchy-wa-sink:8099}"
+ONLY_ACCOUNT="${1:-}"
 
 if [[ -f "$SECRETS" ]]; then
   # shellcheck disable=SC1090
   source "$SECRETS"
 fi
-WA_TOKEN="${WA_TOKEN:-}"
 
-if [[ -z "$WA_TOKEN" ]]; then
-  echo "wa-heal: no WA_TOKEN yet (not paired) — nothing to heal."
-  exit 0
-fi
+# Heals one account, given its display label and its token (already
+# resolved by the caller — this function never re-derives a token
+# variable name itself; see bin/wa-reply's token_env_var for why that
+# derivation has exactly one place). Returns non-zero only when healing
+# was actually attempted and failed to stick; a token-less or
+# not-logged-in account is a legitimate no-op, not a failure.
+heal_one() {
+  local label="$1" token="$2"
 
-if ! curl -s --max-time 3 "$API/session/status" -H "token: $WA_TOKEN" >/dev/null 2>&1; then
-  echo "wa-heal: wuzapi not reachable at $API — skipping this run." >&2
-  exit 1
-fi
+  if [[ -z "$token" ]]; then
+    echo "wa-heal: $label: not paired yet — nothing to heal."
+    return 0
+  fi
 
-STATUS=$(curl -s --max-time 3 "$API/session/status" -H "token: $WA_TOKEN" 2>/dev/null || true)
-LOGGED_IN=$(echo "$STATUS" | python3 -c "
+  if ! curl -s --max-time 3 "$API/session/status" -H "token: $token" >/dev/null 2>&1; then
+    echo "wa-heal: $label: wuzapi not reachable at $API — skipping this run." >&2
+    return 1
+  fi
+
+  local status logged_in
+  status=$(curl -s --max-time 3 "$API/session/status" -H "token: $token" 2>/dev/null || true)
+  logged_in=$(echo "$status" | python3 -c "
 import json, sys
 try:
     print('true' if json.load(sys.stdin)['data']['loggedIn'] else 'false')
@@ -65,28 +93,81 @@ except Exception:
     print('false')
 " 2>/dev/null || echo false)
 
-if [[ "$LOGGED_IN" != "true" ]]; then
-  echo "wa-heal: no session logged in — nothing to heal."
-  exit 0
+  if [[ "$logged_in" != "true" ]]; then
+    echo "wa-heal: $label: no session logged in — nothing to heal."
+    return 0
+  fi
+
+  curl -s -X POST "$API/webhook" -H "token: $token" \
+    -H "Content-Type: application/json" \
+    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
+
+  # Verify by reading it back rather than trusting the POST's 200: the
+  # whole point is that a re-assert can silently not stick.
+  local got
+  got=$(curl -s --max-time 3 "$API/webhook" -H "token: $token" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['webhook'])" 2>/dev/null || echo "")
+
+  if [[ "$got" == "$WEBHOOK_URL" ]]; then
+    echo "wa-heal: $label: webhook healthy ($WEBHOOK_URL)."
+    return 0
+  fi
+
+  echo "wa-heal: $label: FAILED to re-assert the webhook. Messages will NOT be delivered." >&2
+  echo "  GET /webhook shows: ${got:-<unreadable>}" >&2
+  echo "  expected:           $WEBHOOK_URL" >&2
+  echo "  Check manually with:" >&2
+  echo "    curl -s $API/webhook -H \"token: <this account's token>\"" >&2
+  return 1
+}
+
+# The accounts to iterate: every configured one normally, or a single
+# named one when a caller (wa-up) already knows which account it means.
+# `wa-reply token-var` is the single source of the WA_TOKEN_<ID> naming —
+# never re-derived here.
+if [[ -n "$ONLY_ACCOUNT" ]]; then
+  ACCOUNT_LIST="$ONLY_ACCOUNT"
+else
+  ACCOUNT_LIST=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink import accounts, store
+try:
+    for a in accounts.load(sys.argv[2]):
+        aid = a.get("id")
+        if aid:
+            print(aid)
+except store.StoreReadError as exc:
+    print(f"wa-heal: accounts.json is broken, cannot heal by account: {exc}",
+          file=sys.stderr)
+    sys.exit(1)
+' "$ROOT" "$DATA") || ACCOUNT_LIST=""
 fi
 
-curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
-
-# Verify by reading it back rather than trusting the POST's 200: the whole
-# point is that a re-assert can silently not stick.
-GOT=$(curl -s --max-time 3 "$API/webhook" -H "token: $WA_TOKEN" \
-  | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['webhook'])" 2>/dev/null || echo "")
-
-if [[ "$GOT" == "$WEBHOOK_URL" ]]; then
-  echo "wa-heal: webhook healthy ($WEBHOOK_URL)."
-  exit 0
+FAILED=0
+if [[ -z "$ACCOUNT_LIST" ]]; then
+  # No accounts configured at all yet (a not-yet-migrated or brand-new
+  # install `wa-up` has not run against, or accounts.json was unreadable).
+  # Fall back to the single pre-multi-account WA_TOKEN so this script
+  # keeps doing exactly what it did before accounts existed, rather than
+  # silently healing nothing.
+  heal_one "default" "${WA_TOKEN:-}" || FAILED=1
+else
+  while IFS= read -r account_id; do
+    [[ -z "$account_id" ]] && continue
+    # The token variable's name has exactly one derivation
+    # (accounts.validate_id + token_env_var in bin/wa-reply), reached here
+    # through `wa-reply token-var` rather than re-derived in bash — same
+    # rule bin/wa-pair follows. An id straight from accounts.load() is
+    # already known valid (load() validates every id itself), so this can
+    # only fail if accounts.json changed between the two reads.
+    token_var=$("$ROOT/bin/wa-reply" token-var "$account_id") || {
+      echo "wa-heal: $account_id: invalid account id, skipping." >&2
+      FAILED=1
+      continue
+    }
+    heal_one "$account_id" "${!token_var:-}" || FAILED=1
+  done <<<"$ACCOUNT_LIST"
 fi
 
-echo "wa-heal: FAILED to re-assert the webhook. Messages will NOT be delivered." >&2
-echo "  GET /webhook shows: ${GOT:-<unreadable>}" >&2
-echo "  expected:           $WEBHOOK_URL" >&2
-echo "  Check manually with:" >&2
-echo "    curl -s $API/webhook -H \"token: \$WA_TOKEN\"" >&2
-exit 1
+exit "$FAILED"

@@ -1,30 +1,76 @@
 #!/usr/bin/env bash
-# bin/wa-pair — link a WhatsApp account by 8-digit code.
-# Pairing makes WhatsApp dump the account history into wuzapi's SQLite;
+# bin/wa-pair <account-id> <number> — create a wuzapi user for an account
+# and link it to a WhatsApp number by 8-digit code.
+# Pairing makes WhatsApp dump the account's history into wuzapi's SQLite;
 # days_to_sync_history cannot prevent it, so we purge right afterwards.
 set -euo pipefail
 
-NUMBER="${1:?usage: wa-pair <number, international, no +>}"
+ACCOUNT_ID="${1:?usage: wa-pair <account-id> <number, international, no +>}"
+NUMBER="${2:?usage: wa-pair <account-id> <number, international, no +>}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
 SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
-# shellcheck disable=SC1090
-source "$SECRETS"
+DATA="${WA_DATA_DIR:-$STATE/state}"
 API=http://127.0.0.1:8080
 DB="$STATE/wuzdata/users.db"
 
+# The account id is validated in exactly one place — accounts.validate_id,
+# reached here through `wa-reply token-var` — never re-derived in bash.
+# This is also where an account id first enters the system from a human,
+# so it is where refusing a bad one matters most: validating it BEFORE
+# creating the wuzapi user, writing a token or touching accounts.json means
+# a bad id can never leave a half-made account behind. `token-var` prints
+# nothing on stdout and exits non-zero for an invalid id, and it has
+# already printed a clear reason on stderr, so there is nothing to add
+# here beyond stopping.
+TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || exit 1
+
+if [[ ! -f "$SECRETS" ]]; then
+  echo "error: $SECRETS does not exist yet. Run wa-up first." >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$SECRETS"
+
+# Each account gets its own token; a fresh one is generated the first time
+# this account is paired and then reused on every re-run (re-pairing after
+# a logout, or resuming an interrupted pairing) so it never invalidates an
+# already-issued token. Indirect expansion (`${!TOKEN_VAR:-}`) reads the
+# variable NAMED by TOKEN_VAR, which is exactly what secrets.env already
+# stores it as after a `source`.
+if [[ -z "${!TOKEN_VAR:-}" ]]; then
+  TOKEN_VALUE=$(openssl rand -hex 12)
+  printf '\n%s=%s\n' "$TOKEN_VAR" "$TOKEN_VALUE" >> "$SECRETS"
+  chmod 600 "$SECRETS"
+else
+  TOKEN_VALUE="${!TOKEN_VAR}"
+fi
+
 wait_for_history() {
-  # Prints "<count> <settled> <saw_rows>".
+  # Prints "<count> <settled> <saw_rows>". Scoped to this account's own
+  # wuzapi id when it can be resolved (see the module docstring in
+  # sink/purge.py: a second account pairing while a first is already live
+  # would otherwise see the first account's ordinary, unrelated traffic as
+  # if it were part of the dump being waited on, and could wait the full
+  # timeout without ever detecting settlement). An id that cannot be
+  # resolved yet falls back to the old, unscoped, whole-table wait rather
+  # than block pairing on a lookup that failed for an unrelated reason.
   python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
-from sink.purge import wait_until_stable
-count, settled, saw_rows = wait_until_stable(sys.argv[2])
+from sink.purge import wait_until_stable, wuzapi_user_id
+uid = wuzapi_user_id(sys.argv[2], sys.argv[3]) or None
+count, settled, saw_rows = wait_until_stable(sys.argv[2], user_id=uid)
 print(count, settled, saw_rows)
-' "$ROOT" "$DB"
+' "$ROOT" "$DB" "$WUZAPI_USER"
 }
 
 count_history() {
+  # Deliberately UNSCOPED: this checks the table after the sink's startup
+  # purge, which empties the whole shared table for every account, not
+  # just this one (see sink/server.py's purge_or_warn) — the same full
+  # count this script has always checked, and the right one to check
+  # here.
   python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -33,19 +79,97 @@ print(count_history(sys.argv[2]))
 ' "$ROOT" "$DB"
 }
 
-# Create user; "already exists" is not an error
+# The wuzapi user's NAME. Normally that is the account id itself (a new
+# account, e.g. "trabajo" -> wuzapi user "trabajo"), but store.
+# migrate_single_account() pre-seeds accounts.json with an account "personal"
+# whose wuzapi_user is "omarchy" — the name every single-account install
+# already created its (one) wuzapi user under, long before accounts.json
+# existed. wa-up runs that migration before this script can ever run, so on
+# a fresh install "personal" is already in accounts.json by the time
+# `wa-pair personal <number>` is first run. Re-deriving the name as
+# `$ACCOUNT_ID` here instead of reading it back would create a SECOND
+# wuzapi user literally named "personal", never linked to whatever
+# accounts.json says "personal" means — this is why an already-configured
+# account's `wuzapi_user` is read back rather than assumed. A brand-new
+# account has no existing entry to read, so it gets one seeded here (tone
+# file, quick replies, accounts.json) with wuzapi_user == the account id,
+# matching the spec's own example.
+#
+# Every write below goes through accounts.validate_id one more time inside
+# the Python helper — never trust the shell's own check to be the last
+# word on what reaches the file, the same rule store.migrate_single_account
+# was flagged for NOT following.
+RESOLVE_OUT=$(python3 -c '
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sink import accounts, store
+
+data_dir, account_id = sys.argv[2], sys.argv[3]
+accounts.validate_id(account_id)
+path = Path(data_dir) / "accounts.json"
+existing = accounts.load(data_dir)
+found = accounts.by_id(existing, account_id)
+if found is not None:
+    wuzapi_user = found.get("wuzapi_user") or account_id
+    print(f"existing {wuzapi_user}")
+    sys.exit(0)
+existing.append({
+    "id": account_id,
+    "label": account_id.replace("_", " ").title(),
+    "wuzapi_user": account_id,
+    "agent": f"{account_id}.md",
+    "quick_replies": [
+        "Hola, soy el asistente AI de Cristóbal, en estos momentos no puede "
+        "responder pero responderá en breve."
+    ],
+})
+store.atomic_write(path, json.dumps(existing, ensure_ascii=False))
+print(f"added {account_id}")
+' "$ROOT" "$DATA" "$ACCOUNT_ID")
+read -r ACCOUNTS_STATUS WUZAPI_USER <<<"$RESOLVE_OUT"
+if [[ -z "$WUZAPI_USER" ]]; then
+  echo "error: could not resolve or create accounts.json entry for $ACCOUNT_ID:" >&2
+  echo "  $RESOLVE_OUT" >&2
+  exit 1
+fi
+echo "accounts.json: $ACCOUNT_ID ($ACCOUNTS_STATUS), wuzapi user: $WUZAPI_USER"
+
+if [[ "$ACCOUNTS_STATUS" == "added" ]]; then
+  # Seed this account's tone file — only for a genuinely new account. An
+  # existing one (e.g. "personal" from migration) already has its own
+  # `agent` file, possibly already edited by the user; nothing here may
+  # touch it.
+  AGENT_FILE="$ROOT/agents/$ACCOUNT_ID.md"
+  DEFAULT_AGENT_FILE="$ROOT/agents/respuesta.md"
+  if [[ ! -f "$AGENT_FILE" ]]; then
+    if [[ -f "$DEFAULT_AGENT_FILE" ]]; then
+      cp "$DEFAULT_AGENT_FILE" "$AGENT_FILE"
+    else
+      touch "$AGENT_FILE"
+    fi
+    echo "seeded tone file: $AGENT_FILE (edit this to change how $ACCOUNT_ID replies)"
+  fi
+fi
+
+# Create the wuzapi user; "already exists" is not an error — a re-run of
+# wa-pair for an account already created (interrupted pairing, re-pairing
+# after a logout, or "personal" already existing from before accounts.json
+# did) must not fail here. `wuzapi_user` is exactly this name: it is what
+# arrives as the webhook's instanceName, and the sink maps it straight
+# back to this account id.
 RESP=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/users" \
   -H "Authorization: $WUZAPI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"omarchy\",\"token\":\"$WA_TOKEN\",\"events\":\"Message\"}")
+  -d "{\"name\":\"$WUZAPI_USER\",\"token\":\"$TOKEN_VALUE\",\"events\":\"Message\"}")
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
-if [[ "$HTTP_CODE" != "200" && ! "$BODY" =~ "already" ]]; then
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" && ! "$BODY" =~ "already" ]]; then
   echo "error: failed to create wuzapi user (HTTP $HTTP_CODE): $BODY" >&2
   exit 1
 fi
 
-curl -s -X POST "$API/session/connect" -H "token: $WA_TOKEN" \
+curl -s -X POST "$API/session/connect" -H "token: $TOKEN_VALUE" \
   -H "Content-Type: application/json" \
   -d '{"Subscribe":["Message"],"Immediate":true}' >/dev/null
 sleep 3
@@ -53,7 +177,7 @@ sleep 3
 WEBHOOK_URL="http://omarchy-wa-sink:8099"
 
 set_webhook() {
-  curl -s -X POST "$API/webhook" -H "token: $WA_TOKEN" \
+  curl -s -X POST "$API/webhook" -H "token: $TOKEN_VALUE" \
     -H "Content-Type: application/json" \
     -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
 }
@@ -65,7 +189,7 @@ verify_webhook() {
   # sufficient: only a webhook set AFTER login is guaranteed to also be in
   # the in-memory record that actually delivers events. Never assume a POST
   # stuck; always read it back.
-  GOT=$(curl -s "$API/webhook" -H "token: $WA_TOKEN" \
+  GOT=$(curl -s "$API/webhook" -H "token: $TOKEN_VALUE" \
     | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['webhook'])" 2>/dev/null)
   [[ "$GOT" == "$WEBHOOK_URL" ]]
 }
@@ -74,7 +198,7 @@ verify_webhook() {
 # post-login set_webhook call below, which is the one that actually sticks.
 set_webhook
 
-CODE=$(curl -s -X POST "$API/session/pairphone" -H "token: $WA_TOKEN" \
+CODE=$(curl -s -X POST "$API/session/pairphone" -H "token: $TOKEN_VALUE" \
   -H "Content-Type: application/json" -d "{\"Phone\":\"$NUMBER\"}" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['LinkingCode'])")
 
@@ -82,7 +206,7 @@ echo "Linking code: $CODE"
 echo "WhatsApp > Linked devices > Link device > Link with phone number"
 
 for _ in $(seq 1 40); do
-  if curl -s "$API/session/status" -H "token: $WA_TOKEN" \
+  if curl -s "$API/session/status" -H "token: $TOKEN_VALUE" \
      | grep -q '"loggedIn":true'; then
     echo "linked."
 
@@ -90,7 +214,10 @@ for _ in $(seq 1 40); do
     # `wa-up` can tell "never paired" (nothing to wait for or heal) apart
     # from "paired, mid-reconnect after a restart" (worth a bounded wait)
     # the next time it recreates the containers. Idempotent; safe to
-    # re-touch on every successful pairing.
+    # re-touch on every successful pairing. Shared across all accounts
+    # (deliberately): wa-up's wait applies to the whole stack coming back,
+    # not to one account, and any account having ever logged in makes that
+    # wait worthwhile.
     touch "$STATE/.paired" 2>/dev/null || true
 
     # AUTHORITATIVE webhook set. wuzapi's session login rebuilds its
@@ -104,10 +231,10 @@ for _ in $(seq 1 40); do
       echo "  ${GOT:-<unreadable>}" >&2
       echo "  expected: $WEBHOOK_URL" >&2
       echo "  Messages will NOT be delivered until this is fixed. Try:" >&2
-      echo "    curl -s -X POST $API/webhook -H 'token: \$WA_TOKEN' \\" >&2
+      echo "    curl -s -X POST $API/webhook -H 'token: \$$TOKEN_VAR' \\" >&2
       echo "      -H 'Content-Type: application/json' \\" >&2
       echo "      -d '{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}'" >&2
-      echo "  then confirm with: curl -s $API/webhook -H 'token: \$WA_TOKEN'" >&2
+      echo "  then confirm with: curl -s $API/webhook -H 'token: \$$TOKEN_VAR'" >&2
       exit 1
     fi
     echo "webhook confirmed: $WEBHOOK_URL"
@@ -136,11 +263,15 @@ for _ in $(seq 1 40); do
 
     docker restart omarchy-wa-sink >/dev/null
 
-    # The sink purges on startup. Container start + Python + deleting ~15k
-    # rows + VACUUM does not fit in a fixed one-second sleep, and a sleep
-    # that is too short fires the warning on the happy path — which trains
-    # the user to ignore the one warning that protects their history. Poll
-    # instead, with a bound.
+    # The sink purges on startup, and it purges the WHOLE shared table —
+    # every account's rows, not just this one — because that purge exists
+    # to keep WhatsApp history off disk at all, for every account, on
+    # every sink restart; scoping it to this account would leave another
+    # account's already-should-be-purged rows sitting there instead.
+    # Container start + Python + deleting rows + VACUUM does not fit in a
+    # fixed one-second sleep, and a sleep that is too short fires the
+    # warning on the happy path — which trains the user to ignore the one
+    # warning that protects their history. Poll instead, with a bound.
     if ! POST_PURGE=$(count_history); then
       echo "error: could not re-count wuzapi's history table after the purge." >&2
       exit 1
@@ -159,10 +290,11 @@ for _ in $(seq 1 40); do
       # Honest uncertainty. We cannot tell "this account has no history"
       # from "the dump has not started" by looking at the database, so we
       # do not claim either. This is NOT a success message.
-      echo "history: no rows were ever observed in wuzapi's message_history table."
-      echo "  That may mean this account has no history to sync, or it may mean"
-      echo "  WhatsApp had not started sending it yet. This run cannot tell which."
-      echo "  Nothing was confirmed purged, because nothing was ever seen."
+      echo "history: no rows for $ACCOUNT_ID were ever observed in wuzapi's"
+      echo "  message_history table. That may mean this account has no"
+      echo "  history to sync, or it may mean WhatsApp had not started"
+      echo "  sending it yet. This run cannot tell which. Nothing was"
+      echo "  confirmed purged for this account, because nothing was ever seen."
       echo "  If you want certainty, wait a few minutes and then run:"
       echo "    docker restart omarchy-wa-sink"
       echo "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line"
@@ -170,13 +302,13 @@ for _ in $(seq 1 40); do
     fi
 
     if [[ "$SETTLED" == "True" && "$POST_PURGE" == "0" ]]; then
-      echo "history purged: $PRE_PURGE rows deleted, table now empty."
+      echo "history purged: $PRE_PURGE row(s) seen for $ACCOUNT_ID, table now empty."
       exit 0
     fi
 
     echo "WARNING: history may NOT have been fully cleared." >&2
     echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
-    echo "  Rows before restart: $PRE_PURGE, rows remaining: $POST_PURGE" >&2
+    echo "  Rows seen for $ACCOUNT_ID before restart: $PRE_PURGE, rows remaining (all accounts): $POST_PURGE" >&2
     echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
     exit 1
   fi
