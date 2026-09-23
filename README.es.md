@@ -545,6 +545,29 @@ Eso es deliberado: no tiene ninguna credencial, es prosa que escribiste y
 editaste a mano, y volver a emparejar el mismo id de cuenta más adelante te
 lo devuelve en vez de hacerte escribirlo de nuevo.
 
+**Desvincular sí borra el usuario de wuzapi** de esa cuenta, no solo su
+sesión. Eso es lo que hace que desvincular y volver a vincular el mismo id
+funcione: un usuario que queda en wuzapi sigue siendo dueño del token
+viejo, así que el siguiente `wa-pair` para ese id genera un token nuevo,
+recibe un "already exists" al crear el usuario, y después falla en cada
+llamada con un token que wuzapi no reconoce. Si el usuario no se puede
+borrar — wuzapi inalcanzable, o sin `WUZAPI_ADMIN_TOKEN` en el archivo —
+la limpieza local igual termina (un contenedor caído nunca puede dejar una
+cuenta imposible de sacar de acá), pero la pantalla lo dice explícitamente
+en vez de informar una desvinculación limpia, porque ese usuario que quedó
+es justamente lo que te rompería el próximo intento de vincular ese id.
+
+**Si un paso falla, la desvinculación se detiene ahí y dice cuál.** Cada
+paso local — `accounts.json`, el token, el anillo de contexto, las
+entradas de la cola — se verifica, y una falla (un directorio de estado
+sin permiso de escritura, un disco lleno) termina la corrida con un error
+que nombra ese paso, en vez de anunciar "desvinculada" sobre una cuenta
+que sigue en disco. Sacar la cuenta de `accounts.json` es el punto de
+commit: una falla antes no cambia nada, y una falla después deja una
+cuenta que `wa-reply` ya rechaza como desconocida, así que volver a correr
+`./bin/wa-unlink <account-id>` una vez arreglada la causa termina el
+trabajo.
+
 El comando equivalente en terminal:
 
 ```sh
@@ -573,7 +596,14 @@ un hash de ese contenido al abrirse, y mandan ese hash de vuelta al
 guardar. Si el archivo cambió en disco desde que se leyó, el guardado se
 rechaza directamente y no se escribe nada — nunca se combina, nunca se
 sobrescribe en silencio. Usá "Recargar" para traer el contenido actual y
-volver a aplicar tu cambio.
+volver a aplicar tu cambio. "Recargar" descarta lo que haya en el cuadro,
+así que con cambios sin guardar pregunta primero: el botón pasa a decir
+"¿Descartar cambios?" y recién el segundo clic recarga.
+
+El editor de tono arranca vacío y su botón "Guardar" queda deshabilitado
+hasta que el texto de esa cuenta llegó de verdad. Abrir Tono para una
+cuenta, volver, y abrirlo para otra no muestra el texto de la primera
+debajo del título de la segunda: no muestra nada hasta que llega el suyo.
 
 La protección de respuestas rápidas es más burda que la del tono: calcula
 el hash de *todo* el archivo `accounts.json`, no solo de la entrada
@@ -858,10 +888,15 @@ funcionando, usá:
 
 o el botón "Desvincular" de la pantalla de configuración (ver "Pantalla de
 configuración" más arriba para el flujo de confirmación, qué descarta, y
-por qué). Esto cierra la sesión de esa cuenta en wuzapi, la saca de
-`accounts.json`, borra su token de `secrets.env`, borra su anillo de
-contexto, y descarta sus entradas pendientes en la cola — pero deja a
-propósito `agents/<account-id>.md` (su archivo de tono) intacto. No saca
+por qué). Esto cierra la sesión de esa cuenta en wuzapi, borra el usuario
+de wuzapi de esa cuenta (para que volver a vincular el mismo id después
+funcione en vez de chocar con el viejo), la saca de `accounts.json`, borra
+su token de `secrets.env`, borra su anillo de contexto, y descarta sus
+entradas pendientes en la cola — pero deja a propósito
+`agents/<account-id>.md` (su archivo de tono) intacto. Los dos pasos
+contra wuzapi son best-effort, porque un contenedor inalcanzable no puede
+dejar una cuenta imposible de sacar localmente; que cualquiera de los dos
+falle se informa, nunca se traga en silencio. No saca
 por sí solo el dispositivo de la lista de "Dispositivos vinculados" de
 WhatsApp; hacelo también en el teléfono si querés que WhatsApp considere
 desvinculado el número, no solo esta instalación.

@@ -50,6 +50,21 @@
 #      a session that stays logged in on a wuzapi we cannot currently
 #      reach. Attempted best-effort; the outcome is reported, never
 #      assumed.
+#   1b. Remove the wuzapi USER itself (admin API), while accounts.json
+#      still says which wuzapi user this account owns. Logging the session
+#      out is not enough: wuzapi keeps the user row, and a later re-link of
+#      the same id generates a FRESH token, whereupon `POST /admin/users`
+#      answers "already exists", wuzapi keeps serving the OLD token, and
+#      every call wa-pair makes afterwards fails with an unknown token —
+#      the pairing dies on a JSON parse with no usable explanation. Cleaning
+#      up and retrying is the obvious thing to do after a link goes wrong,
+#      so it has to work. Like the logout this is best-effort (an
+#      unreachable wuzapi must not make a local account permanently
+#      un-removable) but, unlike a leftover logged-in session, a leftover
+#      user BREAKS the next link — so a failure here is reported loudly, as
+#      its own `user_removed ok=false` event and a stderr warning, never
+#      swallowed. It runs BEFORE step 2 because step 2 destroys the only
+#      record of which wuzapi user this account owned.
 #   2. Remove the accounts.json entry. This is the COMMIT POINT: once it
 #      is gone, bin/wa-reply already treats every queue entry for this id
 #      as UnknownAccount, and the settings screen already stops listing
@@ -99,6 +114,36 @@
 # The last account can be unlinked the same way: accounts.json becomes
 # `[]`, which sink.accounts.load() and bin/wa-status already treat as a
 # valid, empty, configured state.
+# --- Why `set -e` is deliberately OFF here ---------------------------------
+#
+# bin/wa-pair runs under `set -euo pipefail`; this script does not, and that
+# is a choice, not an oversight. Two kinds of command here legitimately
+# return non-zero and must NOT abort the run:
+#
+#   * the best-effort remote steps (the wuzapi logout and the wuzapi user
+#     removal). A wuzapi that cannot be reached must never leave a local
+#     account permanently un-removable — see the ordering notes below.
+#   * the `(( ... ))` and `[[ ... ]] &&` idioms used throughout to branch on
+#     human vs --json mode, each of which evaluates false on a perfectly
+#     normal run.
+#
+# But that reasoning covers exactly those; it does NOT extend to the local
+# MUTATIONS. `set -e` would have caught a failing one — under `set -uo`
+# alone a python3 that died printed its traceback to stderr, which the
+# settings screen never reads, and the script carried on to emit that
+# step's success event, then `done`, then exit 0. An unwritable state
+# directory or a full disk produced "Cuenta desvinculada." over an account
+# that was still fully present on disk except for its token: the exact
+# half-unlinked state this script's ordering exists to prevent, and the one
+# that makes wa-reply report the misleading MissingToken.
+#
+# So rather than switch `set -e` on (which would abort the best-effort
+# steps too, and hand the GUI only the trap's generic "exited
+# unexpectedly"), EVERY mutation below checks its own exit status and emits
+# a terminal `error` naming the step that failed and what it printed. An
+# explicit check per step also stops at the right place: the ordering above
+# is only a guarantee about crash states if a failed step stops the run
+# instead of letting the next one proceed.
 set -uo pipefail
 
 JSON_MODE=0
@@ -113,48 +158,31 @@ for _arg in "$@"; do
 done
 set -- "${ARGS[@]}"
 
-# --- --json event emission, same mechanism as bin/wa-pair -------------------
-JSON_TERMINAL_EMITTED=0
-
-emit_json() {
-  (( JSON_MODE )) || return 0
-  python3 -c '
-import json, sys
-obj = {"event": sys.argv[1]}
-for kv in sys.argv[2:]:
-    k, v = kv.split("=", 1)
-    if v in ("true", "false"):
-        obj[k] = (v == "true")
-    else:
-        try:
-            obj[k] = int(v)
-        except ValueError:
-            obj[k] = v
-print(json.dumps(obj), flush=True)
-' "$@"
-}
-
-emit_terminal() {
-  # Only latch once the emission actually reached stdout — see wa-pair's
-  # emit_terminal for why a latch set before a possibly-failed emit_json
-  # would let the EXIT trap wrongly believe a terminal event went out.
-  if emit_json "$@"; then
-    JSON_TERMINAL_EMITTED=1
+# --- --json event emission --------------------------------------------------
+#
+# emit_json(), emit_terminal() and the EXIT trap live in one place —
+# bin/lib/wa-common.sh — sourced by both this script and bin/wa-pair. They
+# used to be a verbatim copy in each. Sourced here, BEFORE the positional
+# args are even parsed, so a missing-argument usage error (an `exit` bash
+# takes on its own from `${1:?...}` under `set -u`) is still caught by the
+# trap the helper installs.
+#
+# A failure to source it is FATAL and loud, never a silent downgrade to a
+# run with no event stream: the settings screen reading --json would
+# otherwise see nothing at all while this script destroyed an account. The
+# JSON error line here is a printf of a fixed literal for the same reason
+# the trap's fallback is — the helper that would have formatted it is
+# exactly what is missing.
+WA_EVENT_SCRIPT=wa-unlink
+WA_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/wa-common.sh"
+# shellcheck source=lib/wa-common.sh
+if ! source "$WA_COMMON"; then
+  echo "error: could not load $WA_COMMON — wa-unlink cannot run without it." >&2
+  if (( JSON_MODE )); then
+    printf '%s\n' '{"event":"error","reason":"wa-unlink could not load bin/lib/wa-common.sh; the install is incomplete","fatal":true}'
   fi
-}
-
-on_exit() {
-  local code=$?
-  if (( JSON_MODE )) && (( ! JSON_TERMINAL_EMITTED )); then
-    if (( code == 0 )); then
-      printf '%s\n' '{"event":"done"}'
-    else
-      printf '{"event":"error","reason":"wa-unlink exited unexpectedly (exit code %d)","fatal":true}\n' "$code"
-    fi
-  fi
-  exit "$code"
-}
-trap on_exit EXIT
+  exit 1
+fi
 
 ACCOUNT_ID="${1:?usage: wa-unlink [--json] [--count-only] <account-id>}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -166,13 +194,16 @@ API="${WA_API:-http://127.0.0.1:8080}"
 # The account id is validated in exactly one place — accounts.validate_id
 # — reached the same way bin/wa-pair reaches it: through
 # `wa-reply token-var`, never re-derived here.
-if (( JSON_MODE )); then
-  TOKEN_VAR_ERR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID" 2>&1 >/dev/null) || true
-fi
-TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || {
+if ! wa_token_var "$ROOT/bin/wa-reply" "$ACCOUNT_ID"; then
+  # Not `[[ ... ]] && echo`: under `set -e` (bin/wa-pair) a false test as a
+  # bare command aborts the script right here, and the EXIT trap would then
+  # replace the specific refusal below with its generic fallback.
+  if [[ -n "$TOKEN_VAR_ERR" ]]; then
+    echo "$TOKEN_VAR_ERR" >&2
+  fi
   emit_terminal error reason="${TOKEN_VAR_ERR:-invalid account id: $ACCOUNT_ID}" fatal=true
   exit 1
-}
+fi
 
 emit_json validating account="$ACCOUNT_ID"
 
@@ -191,7 +222,16 @@ from sink import accounts, store
 data_dir, secrets_path, account_id, token_var = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 
 accts = accounts.load(data_dir)
-found = accounts.by_id(accts, account_id) is not None
+entry = accounts.by_id(accts, account_id)
+found = entry is not None
+# The wuzapi user this account owns, read back rather than assumed to be
+# the account id: a single-account install migrated to accounts.json has
+# account "personal" whose wuzapi user is "omarchy" (see
+# store.migrate_single_account and the RESOLVE_OUT block in bin/wa-pair).
+# Deleting a
+# wuzapi user named after the account id would miss it entirely and,
+# worse, could name the wuzapi user of a DIFFERENT account.
+wuzapi_user = (entry or {}).get("wuzapi_user") or (account_id if found else "")
 
 token_present = False
 try:
@@ -207,12 +247,15 @@ ctx_present = (Path(data_dir) / "ctx" / account_id).is_dir()
 queue = store.load_queue(data_dir)
 queue_count = sum(1 for e in queue if e.get("account") == account_id)
 
-print(int(found), int(token_present), int(ctx_present), queue_count)
+# wuzapi_user is printed LAST so a name containing whitespace (nothing
+# creates one, but nothing validates it either) lands whole in the last
+# field of the `read` in the shell below.
+print(int(found), int(token_present), int(ctx_present), queue_count, wuzapi_user)
 ' "$ROOT" "$DATA" "$SECRETS" "$ACCOUNT_ID" "$TOKEN_VAR") || {
   emit_terminal error reason="could not inspect state for $ACCOUNT_ID: $INSPECT_OUT" fatal=true
   exit 1
 }
-read -r FOUND TOKEN_PRESENT CTX_PRESENT QUEUE_COUNT <<<"$INSPECT_OUT"
+read -r FOUND TOKEN_PRESENT CTX_PRESENT QUEUE_COUNT WUZAPI_USER <<<"$INSPECT_OUT"
 
 if (( COUNT_ONLY )); then
   emit_terminal count account="$ACCOUNT_ID" pending="$QUEUE_COUNT"
@@ -231,9 +274,14 @@ if (( ! FOUND )) && (( ! TOKEN_PRESENT )) && (( ! CTX_PRESENT )) && (( QUEUE_COU
 fi
 
 if (( FOUND )); then
-  if (( TOKEN_PRESENT )); then
+  # Sourced whether or not this account has a token line: the admin token
+  # used to delete the wuzapi user below lives in the same file and is not
+  # this account's.
+  if [[ -f "$SECRETS" ]]; then
     # shellcheck disable=SC1090
     source "$SECRETS"
+  fi
+  if (( TOKEN_PRESENT )); then
     TOKEN_VALUE="${!TOKEN_VAR:-}"
   else
     TOKEN_VALUE=""
@@ -265,11 +313,108 @@ if (( FOUND )); then
     emit_json logged_out ok=false reason="no token on file"
   fi
 
+  # Step 1b — remove the wuzapi user itself. See the ordering notes in the
+  # header: a logout alone leaves the user row behind, and a re-link of the
+  # same account id then collides with it ("already exists"), keeps the old
+  # token, and fails every subsequent call with an unknown token. This is
+  # the step that makes unlink-then-relink work.
+  #
+  # Best-effort like the logout — an unreachable wuzapi must not make the
+  # account un-removable locally — but NOT silent: a user left behind is
+  # the thing that breaks the next link, so the outcome is always reported,
+  # on stderr in human mode and as `user_removed ok=false` in --json, and
+  # the settings screen shows it next to the success line.
+  if [[ -z "$WUZAPI_USER" ]]; then
+    (( JSON_MODE )) || echo "wa-unlink: no wuzapi user recorded for $ACCOUNT_ID; nothing to remove there" >&2
+    emit_json user_removed ok=false reason="no wuzapi user recorded for this account"
+  elif [[ -z "${WUZAPI_ADMIN_TOKEN:-}" ]]; then
+    (( JSON_MODE )) || echo "wa-unlink: no WUZAPI_ADMIN_TOKEN in $SECRETS; the wuzapi user '$WUZAPI_USER' was NOT removed. Re-linking '$ACCOUNT_ID' will collide with it — remove it by hand first." >&2
+    emit_json user_removed ok=false user="$WUZAPI_USER" reason="no WUZAPI_ADMIN_TOKEN in $SECRETS; re-linking this account will collide with the leftover wuzapi user"
+  else
+    # One python3 process for the whole GET-find-DELETE: the user's
+    # wuzapi-internal id (wuzapi's own GenerateRandomID, not the account id
+    # and not the token) has to be looked up by name before it can be
+    # deleted, and doing that in bash would mean a second curl plus a JSON
+    # parse in the shell. Prints one word/line describing the outcome;
+    # exit 0 means the user is gone (or was never there), non-zero means it
+    # may still be there.
+    USER_DEL_OUT=$(python3 -c '
+import json, sys, urllib.error, urllib.request
+
+api, admin_token, name = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def call(method, path):
+    req = urllib.request.Request(api.rstrip("/") + path, method=method,
+                                 headers={"Authorization": admin_token})
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read().decode("utf-8", "replace")
+
+try:
+    status, body = call("GET", "/admin/users")
+except urllib.error.HTTPError as exc:
+    print(f"could not list wuzapi users (HTTP {exc.code})")
+    sys.exit(1)
+except Exception as exc:
+    print(f"could not reach wuzapi to list users: {exc}")
+    sys.exit(1)
+
+try:
+    payload = json.loads(body)
+except ValueError:
+    print("wuzapi returned a non-JSON user list")
+    sys.exit(1)
+
+rows = payload.get("data") if isinstance(payload, dict) else payload
+if not isinstance(rows, list):
+    print("wuzapi returned an unexpected user list shape")
+    sys.exit(1)
+
+match = next((r for r in rows
+              if isinstance(r, dict) and r.get("name") == name), None)
+if match is None:
+    # Already gone: a re-run after a crash, or a user wuzapi never had.
+    # Both mean the next link will not collide, which is all this step is
+    # for, so it is a success.
+    print("absent")
+    sys.exit(0)
+
+user_id = match.get("id")
+if user_id in (None, ""):
+    print("wuzapi listed the user without an id")
+    sys.exit(1)
+
+try:
+    status, _ = call("DELETE", f"/admin/users/{user_id}")
+except urllib.error.HTTPError as exc:
+    if exc.code == 404:
+        print("absent")
+        sys.exit(0)
+    print(f"wuzapi refused to delete the user (HTTP {exc.code})")
+    sys.exit(1)
+except Exception as exc:
+    print(f"could not reach wuzapi to delete the user: {exc}")
+    sys.exit(1)
+
+if status in (200, 201, 202, 204):
+    print("removed")
+    sys.exit(0)
+print(f"wuzapi returned HTTP {status} deleting the user")
+sys.exit(1)
+' "$API" "$WUZAPI_ADMIN_TOKEN" "$WUZAPI_USER" 2>&1)
+    if (( $? == 0 )); then
+      (( JSON_MODE )) || echo "wuzapi user '$WUZAPI_USER' removed ($USER_DEL_OUT)"
+      emit_json user_removed ok=true user="$WUZAPI_USER"
+    else
+      (( JSON_MODE )) || echo "wa-unlink: the wuzapi user '$WUZAPI_USER' was NOT removed: $USER_DEL_OUT. Local cleanup continues, but re-linking '$ACCOUNT_ID' will collide with it — remove it by hand first." >&2
+      emit_json user_removed ok=false user="$WUZAPI_USER" reason="$USER_DEL_OUT"
+    fi
+  fi
+
   # The commit point: from here on, wa-reply already refuses this
   # account's queue entries as unknown, and the settings screen already
   # stops listing it, even though secrets.env/ctx/queue may still have
   # residue for a moment.
-  python3 -c '
+  STEP_OUT=$(python3 -c '
 import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -279,7 +424,15 @@ data_dir, account_id = sys.argv[2], sys.argv[3]
 path = Path(data_dir) / "accounts.json"
 remaining = [a for a in accounts.load(data_dir) if a.get("id") != account_id]
 store.atomic_write(path, json.dumps(remaining, ensure_ascii=False))
-' "$ROOT" "$DATA" "$ACCOUNT_ID"
+' "$ROOT" "$DATA" "$ACCOUNT_ID" 2>&1) || {
+    # Checked, not assumed: this is the commit point, and an unwritable
+    # state directory or a full disk used to print a traceback to stderr
+    # (which the settings screen never reads) and then let the run emit
+    # account_removed, done, exit 0 over an account still fully present.
+    (( JSON_MODE )) || echo "wa-unlink: could not remove $ACCOUNT_ID from accounts.json; nothing further was changed: $STEP_OUT" >&2
+    emit_terminal error reason="could not remove $ACCOUNT_ID from accounts.json (nothing further was changed): $STEP_OUT" fatal=true
+    exit 1
+  }
   (( JSON_MODE )) || echo "accounts.json: removed $ACCOUNT_ID"
   emit_json account_removed account="$ACCOUNT_ID"
 fi
@@ -288,7 +441,7 @@ fi
 # a re-run after a crash inside any one of these just finds nothing left
 # to remove and moves to the next.
 
-python3 -c '
+STEP_OUT=$(python3 -c '
 import sys
 from pathlib import Path
 token_var, secrets_path = sys.argv[1], sys.argv[2]
@@ -306,20 +459,35 @@ if kept != lines:
     tmp.write_text(text)
     tmp.chmod(0o600)
     tmp.replace(p)
-' "$TOKEN_VAR" "$SECRETS"
+' "$TOKEN_VAR" "$SECRETS" 2>&1) || {
+  (( JSON_MODE )) || echo "wa-unlink: could not remove $TOKEN_VAR from $SECRETS: $STEP_OUT" >&2
+  emit_terminal error reason="could not remove $TOKEN_VAR from $SECRETS; the account is already out of accounts.json, so re-run wa-unlink $ACCOUNT_ID once the cause is fixed: $STEP_OUT" fatal=true
+  exit 1
+}
 (( JSON_MODE )) || echo "secrets.env: removed $TOKEN_VAR"
 emit_json token_removed account="$ACCOUNT_ID"
 
-python3 -c '
+STEP_OUT=$(python3 -c '
 import shutil, sys
 from pathlib import Path
 data_dir, account_id = sys.argv[1], sys.argv[2]
-shutil.rmtree(Path(data_dir) / "ctx" / account_id, ignore_errors=True)
-' "$DATA" "$ACCOUNT_ID"
+target = Path(data_dir) / "ctx" / account_id
+shutil.rmtree(target, ignore_errors=True)
+# ignore_errors=True swallows a permission failure as readily as a missing
+# directory, so the two are told apart here rather than reported as the
+# same success: the whole point of this pass is that a step which did not
+# happen must not be announced as if it had.
+if target.exists():
+    sys.exit(f"{target} still exists after rmtree")
+' "$DATA" "$ACCOUNT_ID" 2>&1) || {
+  (( JSON_MODE )) || echo "wa-unlink: could not remove the context ring for $ACCOUNT_ID: $STEP_OUT" >&2
+  emit_terminal error reason="could not remove the context ring for $ACCOUNT_ID; the account is already out of accounts.json, so re-run wa-unlink $ACCOUNT_ID once the cause is fixed: $STEP_OUT" fatal=true
+  exit 1
+}
 (( JSON_MODE )) || echo "ctx/$ACCOUNT_ID: removed"
 emit_json context_removed account="$ACCOUNT_ID"
 
-DISCARDED=$(python3 -c '
+DISCARD_OUT=$(python3 -c '
 import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -331,7 +499,20 @@ kept = [e for e in queue if e.get("account") != account_id]
 discarded = len(queue) - len(kept)
 store.atomic_write(Path(data_dir) / "queue.json", json.dumps(kept, ensure_ascii=False))
 print(discarded)
-' "$ROOT" "$DATA" "$ACCOUNT_ID")
+' "$ROOT" "$DATA" "$ACCOUNT_ID" 2>&1) || {
+  (( JSON_MODE )) || echo "wa-unlink: could not discard the queue entries for $ACCOUNT_ID: $DISCARD_OUT" >&2
+  emit_terminal error reason="could not discard the queue entries for $ACCOUNT_ID; the account is already out of accounts.json, so re-run wa-unlink $ACCOUNT_ID once the cause is fixed: $DISCARD_OUT" fatal=true
+  exit 1
+}
+DISCARDED="$DISCARD_OUT"
+if [[ ! "$DISCARDED" =~ ^[0-9]+$ ]]; then
+  # A zero exit but something other than a bare count on stdout (a warning
+  # printed alongside it, say) means this run cannot honestly say how many
+  # entries it discarded — and `done` carries that number to the UI.
+  (( JSON_MODE )) || echo "wa-unlink: unexpected output while discarding the queue entries for $ACCOUNT_ID: $DISCARD_OUT" >&2
+  emit_terminal error reason="unexpected output while discarding the queue entries for $ACCOUNT_ID: $DISCARD_OUT" fatal=true
+  exit 1
+fi
 (( JSON_MODE )) || echo "queue: discarded $DISCARDED entrie(s) for $ACCOUNT_ID"
 emit_json queue_discarded rows="$DISCARDED"
 

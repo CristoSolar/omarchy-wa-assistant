@@ -46,10 +46,25 @@ ColumnLayout {
   }
 
   // Called by Panel.qml whenever the gear opens this screen. Deliberately
-  // does NOT reset `mode` — a link or unlink in progress must keep showing
-  // its own progress when the person reopens settings, not snap back to
-  // the account list and lose their place.
+  // does NOT reset `mode` while something is still IN PROGRESS — a link or
+  // unlink mid-flight must keep showing its own progress when the person
+  // reopens settings, not snap back to the account list and lose their
+  // place.
+  //
+  // A FINISHED one is the opposite case: reopening the gear after a
+  // successful unlink used to re-show "Cuenta desvinculada." — a stale
+  // claim about something that happened a while ago, sitting where the
+  // current state of the accounts should be, with no hint that it is
+  // history rather than news. Once the result has been shown and the
+  // screen closed, the screen has done its job; the next open starts from
+  // the list, freshly read.
   function onShown() {
+    if (root.mode === "unlink" && root.unlinkDone)
+      root.mode = "list"
+    else if (root.mode === "link"
+             && (root.linkStage === "done" || root.linkStage === "error"
+                 || root.linkStage === "no_terminal"))
+      root.mode = "list"
     if (root.mode === "list")
       root.refreshAccounts()
   }
@@ -417,14 +432,35 @@ ColumnLayout {
         wrapMode: Text.Wrap
         Layout.fillWidth: true
       }
+      // "Cuenta vinculada y lista." is only ever shown when nothing is
+      // outstanding. With an unresolved history warning above it (seen=false
+      // — nobody knows whether WhatsApp had started sending the history, so
+      // nothing was confirmed purged — or rows left over after the purge),
+      // a bold green "y lista." right beside the red text reads as the
+      // verdict on the whole operation and softens the one warning the
+      // person has to act on. The linking claim is still true and still
+      // made, in the plainer line below, which says exactly what is
+      // settled and what is not.
       Text {
         textFormat: Text.PlainText
-        visible: root.linkStage === "done"
+        visible: root.linkStage === "done" && !root.linkPurgeWarn
         text: "Cuenta vinculada y lista."
         color: Color.accent
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
+      }
+      Text {
+        textFormat: Text.PlainText
+        visible: root.linkStage === "done" && root.linkPurgeWarn
+        text: "La cuenta quedó vinculada y puede recibir mensajes. Lo que no "
+          + "se puede dar por resuelto es el historial: leé la advertencia de "
+          + "arriba antes de darlo por borrado."
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
       }
       Text {
         textFormat: Text.PlainText
@@ -463,6 +499,10 @@ ColumnLayout {
   property var unlinkPending: null
   property bool unlinkBusy: false
   property bool unlinkDone: false
+  // A non-fatal problem worth carrying to the result screen: currently the
+  // wuzapi user that could not be removed. Empty means the unlink left
+  // nothing outstanding.
+  property string unlinkWarning: ""
   property bool unlinkTerminalSeen: false
   property string unlinkError: ""
 
@@ -488,6 +528,7 @@ ColumnLayout {
     root.unlinkBusy = false
     root.unlinkDone = false
     root.unlinkError = ""
+    root.unlinkWarning = ""
     root.fetchUnlinkCount()
   }
 
@@ -543,7 +584,19 @@ ColumnLayout {
     try { obj = JSON.parse(String(line).trim()) } catch (e) { return }
     if (!obj || !obj.event)
       return
-    if (obj.event === "done") {
+    if (obj.event === "user_removed" && obj.ok === false) {
+      // Not fatal — the local cleanup goes on, and it should: an
+      // unreachable wuzapi must never leave an account un-removable. But
+      // a wuzapi user left behind is exactly what breaks the NEXT link of
+      // this same id (wa-pair's create answers "already exists", wuzapi
+      // keeps the old token, and every later call fails), so it cannot be
+      // dropped on the floor the way an unconfirmed logout can.
+      root.unlinkWarning = "El usuario de wuzapi"
+        + (obj.user ? (" «" + obj.user + "»") : "")
+        + " no se pudo borrar: " + (obj.reason || "motivo desconocido")
+        + ". Si volvés a vincular esta misma cuenta va a chocar con él: "
+        + "borralo a mano antes de reintentar."
+    } else if (obj.event === "done") {
       root.unlinkTerminalSeen = true
       root.unlinkBusy = false
       root.unlinkDone = true
@@ -670,13 +723,36 @@ ColumnLayout {
     ColumnLayout {
       visible: root.unlinkDone
       spacing: Style.spacing.sm
+      // Same rule as the linking screen: the bold, green, unqualified
+      // "done" line is only shown when nothing is left outstanding.
       Text {
         textFormat: Text.PlainText
+        visible: root.unlinkWarning === ""
         text: "Cuenta desvinculada."
         color: Color.accent
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
+      }
+      Text {
+        textFormat: Text.PlainText
+        visible: root.unlinkWarning !== ""
+        text: "La cuenta se borró de este equipo."
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
+      }
+      Text {
+        textFormat: Text.PlainText
+        visible: root.unlinkWarning !== ""
+        text: "⚠ " + root.unlinkWarning
+        color: root.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.bodySmall
+        wrapMode: Text.Wrap
+        Layout.fillWidth: true
       }
       Button {
         text: "Volver a cuentas"
@@ -698,21 +774,55 @@ ColumnLayout {
   property string toneStatus: ""
   property bool toneStatusWarn: false
   property bool toneBusy: false
+  // True only between a successful read and leaving the editor. Guardar is
+  // gated on it, so there is no window where the button is live over text
+  // that is not this account's — see openTone().
+  property bool toneLoaded: false
+  // The text as it is on disk, as of the last successful read or save.
+  // What "unsaved edits" means, and the only thing Recargar can throw away.
+  property string toneDiskText: ""
+  property bool toneReloadArmed: false
+
+  function toneDirty() {
+    return root.toneLoaded && toneBox.text !== root.toneDiskText
+  }
 
   function openTone(accountId) {
     root.mode = "tone"
     root.toneAccountId = accountId
-    root.toneHash = ""
-    root.toneStatus = "Cargando…"
-    root.toneStatusWarn = false
+    // Clearing the box is the whole point: it used to keep the PREVIOUS
+    // account's prose on screen under the new account's heading until the
+    // fetch returned, and Guardar was live over it the whole time. Nothing
+    // could be lost (fetchTone below clears the hash, and wa-reply always
+    // refuses an empty one) but the person was reading one account's prompt
+    // believing it was another's, which is worse than a blank box.
+    toneBox.text = ""
     root.fetchTone()
   }
 
   function fetchTone() {
     if (toneGetProc.running)
       return
+    root.toneLoaded = false
+    root.toneHash = ""
+    root.toneDiskText = ""
+    root.toneReloadArmed = false
+    root.toneStatus = "Cargando…"
+    root.toneStatusWarn = false
     toneGetProc.command = [root.pluginDir + "bin/wa-reply", "tone-get", root.toneAccountId]
     toneGetProc.running = true
+  }
+
+  // Recargar throws away whatever is in the box and re-reads the file, so
+  // with unsaved edits it needs a deliberate second press rather than a
+  // single mis-click. Armed state is dropped the moment the reload happens,
+  // the editor is left, or another account is opened.
+  function requestToneReload() {
+    if (root.toneDirty() && !root.toneReloadArmed) {
+      root.toneReloadArmed = true
+      return
+    }
+    root.fetchTone()
   }
 
   function saveTone(text) {
@@ -733,10 +843,14 @@ ColumnLayout {
         try { r = JSON.parse(text) } catch (e) { r = null }
         if (r && r.ok) {
           toneBox.text = r.text
+          root.toneDiskText = r.text
           root.toneHash = r.hash
+          root.toneLoaded = true
           root.toneStatus = ""
           root.toneStatusWarn = false
         } else {
+          // A failed read leaves toneLoaded false, so Guardar stays dead:
+          // there is no hash to save against and no text worth saving.
           root.toneStatus = (r && r.error) ? r.error : "no se pudo leer el tono"
           root.toneStatusWarn = true
         }
@@ -755,6 +869,7 @@ ColumnLayout {
           // The hash the save just wrote — carried forward so the NEXT
           // save's conflict check compares against what is on disk now.
           root.toneHash = r.hash
+          root.toneDiskText = toneBox.text
           root.toneStatus = "guardado"
           root.toneStatusWarn = false
         } else {
@@ -814,16 +929,17 @@ ColumnLayout {
         foreground: root.foreground
         fontFamily: root.fontFamily
         bordered: true
-        enabled: !root.toneBusy
+        // Dead until this account's own text has actually arrived.
+        enabled: !root.toneBusy && root.toneLoaded
         onClicked: root.saveTone(toneBox.text)
       }
       Button {
-        text: "Recargar"
+        text: root.toneReloadArmed ? "¿Descartar cambios?" : "Recargar"
         foreground: root.foreground
         fontFamily: root.fontFamily
         bordered: true
         enabled: !root.toneBusy
-        onClicked: root.fetchTone()
+        onClicked: root.requestToneReload()
       }
       Button {
         text: "Volver"
@@ -831,7 +947,10 @@ ColumnLayout {
         fontFamily: root.fontFamily
         bordered: true
         enabled: !root.toneBusy
-        onClicked: root.mode = "list"
+        onClicked: {
+          root.toneReloadArmed = false
+          root.mode = "list"
+        }
       }
     }
   }

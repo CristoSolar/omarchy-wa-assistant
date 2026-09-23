@@ -37,22 +37,60 @@ class _FakeWuzapi(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # The wuzapi users this fake knows about, keyed by wuzapi-internal id.
+    # wa-unlink looks a user up by NAME (the account entry's wuzapi_user,
+    # which is "omarchy" for the migrated "personal" account) and deletes
+    # it by that id.
+    users = {}
+    deleted_ids = []
+    admin_tokens = []
+
+    def _json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_POST(self):
         if self.path != "/session/logout":
             self.send_response(404)
             self.end_headers()
             return
         type(self).seen_tokens.append(self.headers.get("token", ""))
-        body = json.dumps({"data": {}}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json(200, {"data": {}})
+
+    def do_GET(self):
+        if self.path != "/admin/users":
+            self.send_response(404)
+            self.end_headers()
+            return
+        type(self).admin_tokens.append(self.headers.get("Authorization", ""))
+        self._json(200, {"data": [{"id": uid, "name": name}
+                                  for uid, name in type(self).users.items()]})
+
+    def do_DELETE(self):
+        prefix = "/admin/users/"
+        if not self.path.startswith(prefix):
+            self.send_response(404)
+            self.end_headers()
+            return
+        uid = self.path[len(prefix):]
+        if uid not in type(self).users:
+            self.send_response(404)
+            self.end_headers()
+            return
+        type(self).users.pop(uid)
+        type(self).deleted_ids.append(uid)
+        self._json(200, {"data": {}})
 
 
-def _serve():
+def _serve(users=None):
     _FakeWuzapi.seen_tokens = []
+    _FakeWuzapi.users = dict(users or {})
+    _FakeWuzapi.deleted_ids = []
+    _FakeWuzapi.admin_tokens = []
     httpd = http.server.HTTPServer(("127.0.0.1", 0), _FakeWuzapi)
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.serve_forever, daemon=True)
@@ -335,6 +373,152 @@ def test_count_only_json_mode():
         events = {ln["event"]: ln for ln in lines}
         assert events["count"]["pending"] == 1
         assert events["count"]["account"] == "personal"
+
+
+# --- A mutation step that FAILS must stop, not report success -------------
+#
+# The four local mutations used to run with their exit status unchecked
+# under `set -uo pipefail` (no -e): a python3 that died printed a traceback
+# to stderr — which the settings screen never reads — and the script emitted
+# that step's success event anyway, then `done`, then exit 0. The UI turned
+# that into "Cuenta desvinculada." over an account still sitting in
+# accounts.json with its queue entry still pending. None of the tests here
+# exercised a failing step, which is how it survived two reviews.
+
+def _terminal_events(stdout):
+    return [json.loads(ln) for ln in stdout.splitlines() if ln.strip()]
+
+
+def test_a_failing_accounts_json_write_errors_out_and_changes_nothing_after_it():
+    if __import__("os").geteuid() == 0:
+        return  # root ignores the unwritable directory this test depends on
+    with tmpdir() as d:
+        _setup(d, [PERSONAL, TRABAJO],
+               secrets_lines=[f"{accounts.token_env_var('personal')}=tok-p",
+                              f"{accounts.token_env_var('trabajo')}=tok-t"],
+               queue=_both_accounts_queue(),
+               ctx={"personal": {"1_s.whatsapp.net": [{"from": "x", "text": "hi", "ts": "1"}]}})
+        # accounts.json is written through store.atomic_write, which creates
+        # its temp file in the same directory: a read-only directory fails
+        # that write while leaving every file in it readable, which is the
+        # shape of both conditions this guards against (a stray permission,
+        # and a full disk).
+        d.chmod(0o500)
+        try:
+            result = _run(["--json", "personal"], d, "http://127.0.0.1:1")
+        finally:
+            d.chmod(0o700)
+
+        assert result.returncode != 0, result.stdout
+        events = _terminal_events(result.stdout)
+        names = [e["event"] for e in events]
+        assert "error" in names, names
+        # The step that failed must NOT have announced itself, and nothing
+        # after it may run or be announced.
+        assert "account_removed" not in names, names
+        assert "token_removed" not in names, names
+        assert "context_removed" not in names, names
+        assert "queue_discarded" not in names, names
+        assert "done" not in names, names
+        err = [e for e in events if e["event"] == "error"][-1]
+        assert err.get("fatal") is True
+        assert "accounts.json" in err["reason"]
+
+        # And on disk: the account is untouched, not half-removed.
+        assert [a["id"] for a in accounts.load(d)] == ["personal", "trabajo"]
+        assert accounts.token_env_var("personal") in (d / "secrets.env").read_text()
+        assert (d / "ctx" / "personal").exists()
+        assert len(store.load_queue(d)) == 3
+
+
+def test_a_failing_token_removal_stops_before_the_remaining_steps():
+    if __import__("os").geteuid() == 0:
+        return
+    with tmpdir() as d:
+        holder = d / "secrets"
+        holder.mkdir()
+        secrets = holder / "secrets.env"
+        secrets.write_text(f"{accounts.token_env_var('personal')}=tok-p\n")
+        _setup(d, [PERSONAL], queue=[_entry("personal", "1@s.whatsapp.net")],
+               ctx={"personal": {"1_s.whatsapp.net": [{"from": "x", "text": "hi", "ts": "1"}]}})
+        # The token is rewritten via a temp file NEXT TO secrets.env, so an
+        # unwritable parent fails step 3 only — steps 1 and 2 (which live in
+        # the writable data dir) succeed first, which is exactly the "it
+        # already committed, then a later step died" case.
+        holder.chmod(0o500)
+        try:
+            result = _run(["--json", "personal"], d, "http://127.0.0.1:1", secrets=secrets)
+        finally:
+            holder.chmod(0o700)
+
+        assert result.returncode != 0, result.stdout
+        names = [e["event"] for e in _terminal_events(result.stdout)]
+        assert "account_removed" in names, names   # step 2 really did happen
+        assert "token_removed" not in names, names  # step 3 failed: not claimed
+        assert "context_removed" not in names, names
+        assert "queue_discarded" not in names, names
+        assert "done" not in names, names
+        assert names[-1] == "error", names
+        # The commit point stands (that is what makes a re-run converge),
+        # and nothing past the failed step ran.
+        assert accounts.load(d) == []
+        assert "tok-p" in secrets.read_text()
+        assert (d / "ctx" / "personal").exists()
+        assert len(store.load_queue(d)) == 1
+
+
+# --- The wuzapi user is removed, so a re-link of the same id works --------
+
+def test_the_wuzapi_user_is_deleted_so_a_relink_does_not_collide():
+    httpd, port = _serve(users={"uid-omarchy": "omarchy", "uid-trabajo": "trabajo"})
+    try:
+        with tmpdir() as d:
+            _setup(d, [PERSONAL, TRABAJO],
+                   secrets_lines=["WUZAPI_ADMIN_TOKEN=admin-tok",
+                                  f"{accounts.token_env_var('personal')}=tok-p",
+                                  f"{accounts.token_env_var('trabajo')}=tok-t"],
+                   queue=[])
+            result = _run(["--json", "personal"], d, f"http://127.0.0.1:{port}")
+            assert result.returncode == 0, result.stderr
+            events = {e["event"]: e for e in _terminal_events(result.stdout)}
+            assert events["user_removed"]["ok"] is True
+            # Looked up by the account entry's wuzapi_user ("omarchy"),
+            # never by the account id ("personal") — the migrated
+            # single-account install is the case that tells them apart.
+            assert events["user_removed"]["user"] == "omarchy"
+            assert _FakeWuzapi.deleted_ids == ["uid-omarchy"]
+            assert _FakeWuzapi.users == {"uid-trabajo": "trabajo"}
+            assert _FakeWuzapi.admin_tokens == ["admin-tok"]
+    finally:
+        httpd.shutdown()
+
+
+def test_a_wuzapi_user_that_cannot_be_removed_is_reported_not_swallowed():
+    with tmpdir() as d:
+        # No WUZAPI_ADMIN_TOKEN on file: the user cannot be deleted at all.
+        # The unlink still completes locally (an unreachable or unusable
+        # wuzapi must never make an account un-removable), but the leftover
+        # user is what breaks the NEXT link, so it must be said out loud.
+        _setup(d, [PERSONAL], secrets_lines=[f"{accounts.token_env_var('personal')}=tok-p"],
+               queue=[])
+        result = _run(["--json", "personal"], d, "http://127.0.0.1:1")
+        assert result.returncode == 0, result.stderr
+        events = {e["event"]: e for e in _terminal_events(result.stdout)}
+        assert events["user_removed"]["ok"] is False
+        assert "WUZAPI_ADMIN_TOKEN" in events["user_removed"]["reason"]
+        assert events["done"] is not None
+        assert accounts.load(d) == []
+
+
+def test_the_leftover_user_warning_reaches_human_mode_too():
+    with tmpdir() as d:
+        _setup(d, [PERSONAL], secrets_lines=[f"{accounts.token_env_var('personal')}=tok-p"],
+               queue=[])
+        result = _run(["personal"], d, "http://127.0.0.1:1")
+        assert result.returncode == 0, result.stderr
+        assert "WUZAPI_ADMIN_TOKEN" in result.stderr
+        assert "NOT removed" in result.stderr
+
 
 
 if __name__ == "__main__":

@@ -24,6 +24,12 @@ from tests.runner import run
 
 WA_UP = (ROOT / "bin" / "wa-up").read_text()
 WA_PAIR = (ROOT / "bin" / "wa-pair").read_text()
+WA_UNLINK = (ROOT / "bin" / "wa-unlink").read_text()
+# The --json event machinery used to be a verbatim copy inside each of
+# bin/wa-pair and bin/wa-unlink. It now lives here once, sourced by both;
+# the assertions below that used to read it out of wa-pair read it out of
+# this file instead, unchanged in what they assert.
+WA_COMMON = (ROOT / "bin" / "lib" / "wa-common.sh").read_text()
 PANEL = (ROOT / "Panel.qml").read_text()
 INSTALL = (ROOT / "install.sh").read_text()
 
@@ -226,7 +232,18 @@ def _extract_echo_literals(text):
 # at the point this task started). Task 1 must not add, remove, reorder or
 # reword a single one of these — only decide, per line, whether it still
 # prints in --json mode.
+# Two lines were added after that freeze, both of them new output for a
+# case that previously printed nothing of its own, neither a rewording of
+# anything above:
+#   * the loud failure when bin/lib/wa-common.sh cannot be sourced (before,
+#     the machinery was inline and could not fail to load);
+#   * the refusal text from `wa-reply token-var`, which used to reach the
+#     terminal by flowing through this script's own stderr and is now
+#     captured (once, instead of the two runs the --json path used to do)
+#     and re-printed verbatim.
 EXPECTED_HUMAN_ECHOES = [
+    "error: could not load $WA_COMMON — wa-pair cannot run without it.",
+    "$TOKEN_VAR_ERR",
     "error: $SECRETS does not exist yet. Run wa-up first.",
     "error: could not resolve or create accounts.json entry for $ACCOUNT_ID:",
     "  $RESOLVE_OUT",
@@ -321,10 +338,16 @@ def test_every_wa_pair_exit_statement_emits_a_terminal_event_first():
     for i, line in enumerate(lines):
         stripped = line.strip()
         if stripped in ("exit 0", "exit 1"):
-            window = "\n".join(lines[max(0, i - 4):i])
-            assert "emit_terminal" in window, (
-                f"line {i + 1} ({stripped!r}) has no emit_terminal call in "
-                f"the 4 lines before it:\n{window}")
+            window = "\n".join(lines[max(0, i - 6):i])
+            # One exit cannot use emit_terminal: the one taken when
+            # bin/lib/wa-common.sh — which DEFINES emit_terminal — could
+            # not be sourced. It prints the terminal error line itself,
+            # with a printf of a fixed literal, for the same reason the
+            # trap's fallback does.
+            assert ("emit_terminal" in window
+                    or '{"event":"error"' in window), (
+                f"line {i + 1} ({stripped!r}) has no terminal event in "
+                f"the 6 lines before it:\n{window}")
             checked += 1
     # Sanity: the script still has the exit statements this counts — a
     # rewrite that removed them all would make the loop above vacuously
@@ -339,25 +362,39 @@ def test_wa_pair_exit_trap_is_the_backstop_for_set_dash_e():
     trap is what keeps THAT silent too — it must be registered before the
     positional args are parsed, and it must emit whichever of
     done/error a JSON run left out."""
-    assert "trap on_exit EXIT" in WA_PAIR
-    idx_trap = WA_PAIR.index("trap on_exit EXIT")
+    # The trap now lives in the sourced helper; sourcing it is what
+    # registers it, so THAT is what must precede the positional args.
+    assert "trap on_exit EXIT" in WA_COMMON
+    idx_source = WA_PAIR.index('source "$WA_COMMON"')
     idx_account = WA_PAIR.index('ACCOUNT_ID="${1:?usage: wa-pair <account-id>')
-    assert idx_trap < idx_account, (
+    assert idx_source < idx_account, (
         "the EXIT trap must be registered before $1/$2 are read, so a "
         "missing-argument invocation is caught too")
-    assert "JSON_TERMINAL_EMITTED" in WA_PAIR
+    assert "JSON_TERMINAL_EMITTED" in WA_COMMON
 
 
 def test_wa_pair_validation_refusal_emits_terminal_error_and_nothing_else():
     """An invalid/refused account id is the very first thing that can go
     wrong. In --json mode it must produce exactly one terminal error line
-    and then stop — no event may follow it."""
-    idx = WA_PAIR.index('TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || {')
-    block = WA_PAIR[idx:idx + 300]
-    m = re.search(r"\|\| \{\n\s*emit_terminal error reason=.*?fatal=true\n\s*exit 1\n\}", block)
+    and then stop — no event may follow it. The refusal text itself is
+    re-printed on stderr because it is now captured (once, rather than in a
+    second run of `wa-reply token-var` made only to read stderr) instead of
+    flowing straight through."""
+    idx = WA_PAIR.index('if ! wa_token_var "$ROOT/bin/wa-reply" "$ACCOUNT_ID"; then')
+    block = WA_PAIR[idx:idx + 700]
+    m = re.search(
+        r'if ! wa_token_var [^\n]*\n'
+        r'(?:\s*#[^\n]*\n)*'
+        r'\s*if \[\[ -n "\$TOKEN_VAR_ERR" \]\]; then\n'
+        r'\s*echo "\$TOKEN_VAR_ERR" >&2\n'
+        r'\s*fi\n'
+        r'\s*emit_terminal error reason=[^\n]*fatal=true\n'
+        r'\s*exit 1\n'
+        r'fi', block)
     assert m, (
         "the token-var failure branch must be exactly "
-        "`emit_terminal error ...; exit 1`, nothing in between:\n" + block)
+        "`echo the refusal; emit_terminal error ...; exit 1`, nothing in "
+        "between:\n" + block)
 
 
 def test_wa_pair_history_purged_event_distinguishes_all_three_outcomes():
@@ -388,13 +425,13 @@ def test_wa_pair_history_purged_event_distinguishes_all_three_outcomes():
 
 
 def _extract_emit_json_python_body():
-    """Pull the python program inside wa-pair's emit_json() bash function
+    """Pull the python program inside emit_json()'s bash function
     out of the source, so it can be executed directly. This is NOT running
     bin/wa-pair — it's the small, pure, side-effect-free JSON-building
     fragment on its own, fed controlled argv, never touching the network,
     docker or any real state."""
-    m = re.search(r"emit_json\(\) \{.*?python3 -c '\n(.*?)\n'", WA_PAIR, re.S)
-    assert m, "could not find emit_json()'s python body in bin/wa-pair"
+    m = re.search(r"emit_json\(\) \{.*?python3 -c '\n(.*?)\n'", WA_COMMON, re.S)
+    assert m, "could not find emit_json()'s python body in bin/lib/wa-common.sh"
     return m.group(1)
 
 
@@ -449,9 +486,9 @@ assert Path(_BASH).exists(), "bash not found; cannot exercise the extracted JSON
 
 
 def _extract_json_machinery():
-    start = WA_PAIR.index("JSON_TERMINAL_EMITTED=0")
-    end = WA_PAIR.index("trap on_exit EXIT") + len("trap on_exit EXIT")
-    return WA_PAIR[start:end]
+    start = WA_COMMON.index("JSON_TERMINAL_EMITTED=0")
+    end = WA_COMMON.index("trap on_exit EXIT") + len("trap on_exit EXIT")
+    return WA_COMMON[start:end]
 
 
 def _run_harness(trailer, no_python3):
@@ -460,7 +497,11 @@ def _run_harness(trailer, no_python3):
     from PATH so emit_json's underlying command fails the way it would if
     python3 were missing, out of memory, or writing to a closed pipe."""
     machinery = _extract_json_machinery()
-    script = "set -euo pipefail\nJSON_MODE=1\n" + machinery + "\n" + trailer + "\n"
+    # WA_EVENT_SCRIPT is what each caller sets before sourcing the helper;
+    # it is the only thing that differed between the two copies this
+    # machinery replaced, and it is what the trap's fallback names.
+    script = ("set -euo pipefail\nJSON_MODE=1\nWA_EVENT_SCRIPT=wa-pair\n"
+              + machinery + "\n" + trailer + "\n")
     with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as f:
         f.write(script)
         path = f.name
@@ -534,6 +575,124 @@ def test_trap_fallback_is_skipped_once_a_real_terminal_event_went_out():
     assert len(lines) == 1, f"expected exactly one terminal event, got: {proc.stdout!r}"
     obj = json.loads(lines[0])
     assert obj == {"event": "error", "reason": "boom", "fatal": True}
+
+
+# --- The event machinery exists exactly once ------------------------------
+#
+# bin/wa-pair and bin/wa-unlink each carried a verbatim ~45-line copy of
+# emit_json, emit_terminal and on_exit. Two copies of the one mechanism
+# that keeps a GUI from spinning forever is one too many: a fix to one
+# (the latch ordering, for instance) silently leaves the other broken.
+
+def test_neither_script_still_defines_the_event_machinery_itself():
+    for name, text in (("bin/wa-pair", WA_PAIR), ("bin/wa-unlink", WA_UNLINK)):
+        for fn in ("emit_json() {", "emit_terminal() {", "on_exit() {"):
+            assert fn not in text, (
+                f"{name} still defines {fn.split('(')[0]}() itself; it must "
+                "come from bin/lib/wa-common.sh")
+        assert "trap on_exit EXIT" not in text, (
+            f"{name} must not register the trap itself — sourcing "
+            "bin/lib/wa-common.sh does that")
+
+
+def test_both_scripts_source_the_one_helper_and_name_themselves():
+    for name, text, script in (("bin/wa-pair", WA_PAIR, "wa-pair"),
+                               ("bin/wa-unlink", WA_UNLINK, "wa-unlink")):
+        assert f"WA_EVENT_SCRIPT={script}" in text, name
+        assert 'lib/wa-common.sh"' in text, name
+        assert 'source "$WA_COMMON"' in text, name
+        # Set before the source, because the trap the helper registers
+        # uses it.
+        assert text.index(f"WA_EVENT_SCRIPT={script}") < text.index('source "$WA_COMMON"'), name
+
+
+def test_a_missing_helper_is_loud_and_fatal_never_a_silent_downgrade():
+    """A helper that fails to load must stop the script with a terminal
+    JSON line of its own — not run the whole unlink (or pairing) with the
+    event stream quietly switched off, which is precisely the
+    spinner-forever failure the helper exists to prevent."""
+    for name, text, script in (("bin/wa-pair", WA_PAIR, "wa-pair"),
+                               ("bin/wa-unlink", WA_UNLINK, "wa-unlink")):
+        m = re.search(r'if ! source "\$WA_COMMON"; then\n(.*?)\nfi', text, re.S)
+        assert m, f"{name} must guard the source and abort on failure"
+        block = m.group(1)
+        assert ">&2" in block, f"{name}: the failure must reach stderr"
+        assert '"event":"error"' in block and '"fatal":true' in block, (
+            f"{name}: the failure must also be a terminal JSON error line")
+        assert "printf" in block, (
+            f"{name}: the fallback line must be a printf of a literal — the "
+            "helper that would format it is exactly what is missing")
+        assert "exit 1" in block, f"{name}: the failure must stop the script"
+
+
+# --- wa-unlink checks every mutation it performs --------------------------
+
+def test_every_wa_unlink_mutation_checks_its_own_exit_status():
+    """`set -e` is deliberately off in wa-unlink (the best-effort wuzapi
+    steps and the `(( ... ))` mode branches legitimately return non-zero),
+    so each local mutation has to check itself. With neither, a python3
+    that died printed a traceback to stderr — which the settings screen
+    never reads — and the script emitted that step's SUCCESS event anyway,
+    then `done`, then exit 0."""
+    for event in ("account_removed", "token_removed", "context_removed",
+                  "queue_discarded"):
+        idx = WA_UNLINK.index(f"emit_json {event}")
+        before = WA_UNLINK[:idx]
+        # The mutation immediately preceding each success event ends with a
+        # checked command substitution: `...) || { ... exit 1 }`.
+        assert re.search(r"\) \|\| \{(?:(?!\n\s*\}).)*?emit_terminal error"
+                         r"(?:(?!\n\s*\}).)*?exit 1\n\s*\}",
+                         before[-3000:], re.S), (
+            f"the mutation before emit_json {event} is not exit-status checked")
+    assert "set -uo pipefail" in WA_UNLINK
+    assert "Why `set -e` is deliberately OFF here" in WA_UNLINK, (
+        "the choice not to use set -e must be stated where it is made")
+
+
+def test_wa_unlink_removes_the_wuzapi_user_before_the_commit_point():
+    """A logout alone leaves the wuzapi user behind, and re-linking the
+    same id then collides with it ("already exists"), keeps the OLD token
+    and fails every later call. Removing the user has to happen before
+    accounts.json is rewritten, because that file is the only record of
+    which wuzapi user the account owns."""
+    idx_user = WA_UNLINK.index("emit_json user_removed")
+    idx_commit = WA_UNLINK.index("emit_json account_removed")
+    assert idx_user < idx_commit, (
+        "the wuzapi user must be removed while accounts.json still says "
+        "which user this account owns")
+    assert "/admin/users" in WA_UNLINK
+    # Never silent: every branch of the removal reports an outcome.
+    assert WA_UNLINK.count("emit_json user_removed ok=false") >= 3
+    assert "emit_json user_removed ok=true" in WA_UNLINK
+
+
+# --- The settings screen must not dress a warning up as success -----------
+
+SETTINGS = (ROOT / "SettingsView.qml").read_text()
+
+
+def test_the_linked_and_ready_line_is_withheld_while_a_purge_warning_stands():
+    assert 'visible: root.linkStage === "done" && !root.linkPurgeWarn' in SETTINGS, (
+        '"Cuenta vinculada y lista." must not show beside an unresolved '
+        "history warning")
+
+
+def test_the_tone_editor_clears_the_box_and_gates_saving_on_a_real_read():
+    assert re.search(r"function openTone\(accountId\) \{.*?toneBox\.text = \"\"",
+                     SETTINGS, re.S), (
+        "openTone must clear the box, or the previous account's prose "
+        "stays on screen under the new account's heading")
+    assert "enabled: !root.toneBusy && root.toneLoaded" in SETTINGS, (
+        "Guardar must be dead until this account's own text has arrived")
+
+
+def test_reopening_settings_after_a_finished_unlink_starts_from_the_list():
+    m = re.search(r"function onShown\(\) \{(.*?)\n  \}", SETTINGS, re.S)
+    assert m, "onShown() not found"
+    body = m.group(1)
+    assert "root.unlinkDone" in body and 'root.mode = "list"' in body, (
+        "a finished unlink must not be re-shown as news the next time the "
+        "gear is opened")
 
 
 if __name__ == "__main__":

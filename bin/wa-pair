@@ -23,92 +23,30 @@ set -- "${ARGS[@]}"
 
 # --- --json event emission --------------------------------------------------
 #
-# Every path that can end this script must emit a terminal ("done" or
-# "error") event in --json mode — a run that stops without one leaves a GUI
-# showing a spinner forever. Registered BEFORE the positional args are even
-# parsed, so a missing-argument usage error (an `exit` bash takes on its
-# own from `${1:?...}` under `set -u`) is still caught by the EXIT trap
-# below, not just the exit paths this script explicitly annotates.
+# emit_json(), emit_terminal() and the EXIT trap live in one place —
+# bin/lib/wa-common.sh — sourced by both this script and bin/wa-unlink.
+# They used to be a verbatim copy in each. Sourced here, BEFORE the
+# positional args are even parsed, so a missing-argument usage error (an
+# `exit` bash takes on its own from `${1:?...}` under `set -u`) is still
+# caught by the trap the helper installs. See that file for what the event
+# machinery guarantees and what it deliberately does not.
 #
-# Each known exit point further down emits its OWN specific terminal event
-# (with a real reason) via emit_terminal() before exiting; emit_terminal()
-# latches JSON_TERMINAL_EMITTED, but ONLY once the emission actually
-# succeeded, so the trap knows one really went out (see emit_terminal()
-# below for why this order matters). The trap is the backstop for
-# everything NOT anticipated explicitly — chiefly what "set -euo pipefail"
-# itself takes: an unchecked curl or python failure anywhere below aborts
-# the script immediately, and without the trap that abort would be silent
-# on stdout in --json mode.
-#
-# The real guarantee this gives: every exit bash itself can observe —
-# a normal `exit`, or the ones set -e/set -u take on their own — ends the
-# stream with a terminal event. A hard kill (SIGKILL) cannot run an EXIT
-# trap; no userspace code can change that. A GUI reading this stream must
-# still treat "the process ended with no terminal event" as a real, if
-# rare, outcome — not something this script can promise away.
-JSON_TERMINAL_EMITTED=0
-
-emit_json() {
-  # $1 = event name; remaining args are "key=value" pairs. A value of
-  # "true"/"false" becomes a JSON bool, an integer-looking value becomes a
-  # JSON number, anything else is a JSON string. Each call is its own
-  # python3 process that prints one line and exits, so the line is already
-  # flushed by the time this function returns — nothing here buffers
-  # across events. A no-op in human mode. Returns non-zero if python3
-  # could not run or the write failed (e.g. python3 missing, OOM, disk
-  # full, or the reader's end of the pipe is already gone) — callers that
-  # need to know whether the line actually reached stdout must check this.
-  (( JSON_MODE )) || return 0
-  python3 -c '
-import json, sys
-obj = {"event": sys.argv[1]}
-for kv in sys.argv[2:]:
-    k, v = kv.split("=", 1)
-    if v in ("true", "false"):
-        obj[k] = (v == "true")
-    else:
-        try:
-            obj[k] = int(v)
-        except ValueError:
-            obj[k] = v
-print(json.dumps(obj), flush=True)
-' "$@"
-}
-
-emit_terminal() {
-  # The latch must only ever claim a terminal event that actually reached
-  # stdout. Setting it unconditionally BEFORE calling emit_json (as an
-  # earlier version of this function did) would let a failed emission —
-  # python3 missing or broken, OOM, disk full, a reader that already hung
-  # up — set the latch anyway; under `set -e` that failure then aborts the
-  # script, the EXIT trap fires, sees the latch already set, and skips its
-  # own fallback believing an event went out that never did. That is
-  # exactly the silent-stream failure this whole mechanism exists to rule
-  # out, so the latch is set ONLY after emit_json reports success.
-  if emit_json "$@"; then
-    JSON_TERMINAL_EMITTED=1
+# A failure to source it is FATAL and loud, never a silent downgrade to a
+# run with no event stream: the GUI reading --json would otherwise sit on
+# a spinner for the whole of a pairing and then learn nothing. The JSON
+# error line here is a printf of a fixed literal for the same reason the
+# trap's fallback is — the helper that would have formatted it is exactly
+# what is missing.
+WA_EVENT_SCRIPT=wa-pair
+WA_COMMON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/wa-common.sh"
+# shellcheck source=lib/wa-common.sh
+if ! source "$WA_COMMON"; then
+  echo "error: could not load $WA_COMMON — wa-pair cannot run without it." >&2
+  if (( JSON_MODE )); then
+    printf '%s\n' '{"event":"error","reason":"wa-pair could not load bin/lib/wa-common.sh; the install is incomplete","fatal":true}'
   fi
-}
-
-on_exit() {
-  local code=$?
-  if (( JSON_MODE )) && (( ! JSON_TERMINAL_EMITTED )); then
-    # Deliberately NOT emit_json/emit_terminal here: if python3 itself is
-    # what is broken (missing, OOM, whatever aborted the script in the
-    # first place), a fallback that also shells out to python3 would fail
-    # the exact same way and leave stdout just as silent. This fallback
-    # carries no user-controlled data — it is one of two fixed strings —
-    # so a plain `printf` of a literal JSON line has no escaping to get
-    # wrong and no dependency on the thing that may have just died.
-    if (( code == 0 )); then
-      printf '%s\n' '{"event":"done"}'
-    else
-      printf '{"event":"error","reason":"wa-pair exited unexpectedly (exit code %d)","fatal":true}\n' "$code"
-    fi
-  fi
-  exit "$code"
-}
-trap on_exit EXIT
+  exit 1
+fi
 
 ACCOUNT_ID="${1:?usage: wa-pair <account-id> <number, international, no +>}"
 NUMBER="${2:?usage: wa-pair <account-id> <number, international, no +>}"
@@ -129,13 +67,16 @@ emit_json validating account="$ACCOUNT_ID"
 # nothing on stdout and exits non-zero for an invalid id, and it has
 # already printed a clear reason on stderr, so there is nothing to add
 # here beyond stopping.
-if (( JSON_MODE )); then
-  TOKEN_VAR_ERR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID" 2>&1 >/dev/null) || true
-fi
-TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || {
+if ! wa_token_var "$ROOT/bin/wa-reply" "$ACCOUNT_ID"; then
+  # Not `[[ ... ]] && echo`: under `set -e` (bin/wa-pair) a false test as a
+  # bare command aborts the script right here, and the EXIT trap would then
+  # replace the specific refusal below with its generic fallback.
+  if [[ -n "$TOKEN_VAR_ERR" ]]; then
+    echo "$TOKEN_VAR_ERR" >&2
+  fi
   emit_terminal error reason="${TOKEN_VAR_ERR:-invalid account id: $ACCOUNT_ID}" fatal=true
   exit 1
-}
+fi
 
 if [[ ! -f "$SECRETS" ]]; then
   echo "error: $SECRETS does not exist yet. Run wa-up first." >&2

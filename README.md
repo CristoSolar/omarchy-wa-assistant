@@ -509,6 +509,28 @@ That is deliberate: it holds no credential, it is prose you wrote and
 edited by hand, and re-linking the same account id later gets it back
 instead of making you write it again.
 
+**Unlinking does remove the account's wuzapi user**, not just its session.
+That is what makes unlink-then-relink of the same account id work: a
+logged-out user left behind in wuzapi would still own the old token, so
+the next `wa-pair` for that id would create a fresh token, be told the
+user "already exists", and then fail every call with a token wuzapi does
+not recognise. If the user cannot be removed — wuzapi unreachable, or no
+`WUZAPI_ADMIN_TOKEN` on file — the local cleanup still finishes (a
+container that is down must never leave an account un-removable here), but
+the screen says so explicitly instead of reporting a clean unlink, because
+that leftover user is exactly what would break your next attempt at
+linking that id.
+
+**If a step fails, the unlink stops there and says which one.** Every local
+step — `accounts.json`, the token, the context ring, the queue entries —
+is checked, and a failure (an unwritable state directory, a full disk)
+ends the run with an error naming that step rather than announcing
+"desvinculada" over an account that is still on disk. Removing the account
+from `accounts.json` is the commit point: a failure before it changes
+nothing, and a failure after it leaves an account that `wa-reply` already
+refuses as unknown, so re-running `./bin/wa-unlink <account-id>` once the
+cause is fixed finishes the job.
+
 The equivalent terminal command:
 
 ```sh
@@ -534,7 +556,14 @@ not a replacement for editing them directly.
 when opened, and send that hash back with the save. If the file changed on
 disk since it was read, the save is refused outright and nothing is
 written — never merged, never silently overwritten. Use "Recargar" to pick
-up the current content, then reapply your edit.
+up the current content, then reapply your edit. "Recargar" throws away
+whatever is in the box, so with unsaved edits it asks first: the button
+turns into "¿Descartar cambios?" and only the second press reloads.
+
+The tone editor starts empty and its "Guardar" button stays disabled until
+that account's own text has actually been read. Opening Tono for one
+account, going back, and opening it for another shows nothing in between
+rather than the first account's prose under the second's heading.
 
 The quick-replies guard is coarser than the tone guard: it hashes the
 *whole* `accounts.json` file, not just the one account's `quick_replies`
@@ -801,10 +830,14 @@ To remove **one** account and leave the rest of the install running, use:
 
 or the settings screen's "Desvincular" button (see "Settings screen"
 above for the confirmation flow, what it discards, and why). This logs the
-account out of wuzapi, removes it from `accounts.json`, removes its token
-from `secrets.env`, removes its context ring, and discards its pending
-queue entries — but deliberately leaves `agents/<account-id>.md` (its tone
-file) in place. It does **not** by itself remove the device from
+account out of wuzapi, removes that account's wuzapi user (so re-linking
+the same id later works instead of colliding with the old one), removes it
+from `accounts.json`, removes its token from `secrets.env`, removes its
+context ring, and discards its pending queue entries — but deliberately
+leaves `agents/<account-id>.md` (its tone file) in place. The two wuzapi
+steps are best-effort, because an unreachable container must not make a
+local account un-removable; either one failing is reported, never
+swallowed. It does **not** by itself remove the device from
 WhatsApp's own "Linked devices" list; do that on the phone too if you want
 WhatsApp to consider the number unlinked, not just this install.
 
