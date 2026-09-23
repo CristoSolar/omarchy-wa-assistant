@@ -470,6 +470,16 @@ ColumnLayout {
     return root.unlinkTyped.trim() === root.unlinkAccountId && root.unlinkAccountId !== ""
   }
 
+  // A real, known, non-negative count — never null (still loading) and
+  // never -1 (could not be fetched). The whole point of asking at
+  // confirmation time is that the number is what makes the confirmation
+  // meaningful; a failed fetch must block the button exactly as hard as
+  // a still-loading one, not let the unlink run with nobody knowing how
+  // many conversations it is about to discard.
+  function unlinkCountKnown() {
+    return root.unlinkPending !== null && root.unlinkPending >= 0
+  }
+
   function openUnlink(accountId) {
     root.mode = "unlink"
     root.unlinkAccountId = accountId
@@ -519,7 +529,7 @@ ColumnLayout {
   }
 
   function doUnlink() {
-    if (unlinkProc.running || !root.unlinkConfirmed() || root.unlinkPending === null)
+    if (unlinkProc.running || !root.unlinkConfirmed() || !root.unlinkCountKnown())
       return
     root.unlinkBusy = true
     root.unlinkError = ""
@@ -618,8 +628,23 @@ ColumnLayout {
           foreground: root.foreground
           fontFamily: root.fontFamily
           bordered: true
-          enabled: root.unlinkConfirmed() && !root.unlinkBusy && root.unlinkPending !== null
+          // Refuses to run without a known, non-negative count: a failed
+          // or still-loading fetch must block this exactly as hard as
+          // each other, never let the unlink go through with nobody
+          // knowing how many conversations it is about to discard.
+          enabled: root.unlinkConfirmed() && !root.unlinkBusy && root.unlinkCountKnown()
           onClicked: root.doUnlink()
+        }
+        Button {
+          // The only way out of a failed count fetch: retry it. Without
+          // this the button above would just stay dead with no
+          // explanation of what to do next.
+          text: "Reintentar cálculo"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          bordered: true
+          visible: root.unlinkPending !== null && root.unlinkPending < 0 && !root.unlinkBusy
+          onClicked: root.fetchUnlinkCount()
         }
         Button {
           text: "Cancelar"
@@ -859,10 +884,18 @@ ColumnLayout {
     root.quickList = list
   }
 
+  // Mutates the array IN PLACE rather than reassigning root.quickList:
+  // reassigning would reset the ListView's model on every keystroke
+  // (dropping focus mid-edit), and saveQuick() reads root.quickList
+  // directly at save time regardless — it never needs a change
+  // notification to fire. This also means the field's every keystroke
+  // reaches the model immediately, not just on focus loss: relying on
+  // onEditingFinished to flush before a same-tick Guardar click would
+  // silently drop the last edit if focus never actually left the field
+  // (Button here does not steal focus on click).
   function quickUpdate(index, text) {
-    var list = root.quickList.slice()
-    list[index] = text
-    root.quickList = list
+    if (index >= 0 && index < root.quickList.length)
+      root.quickList[index] = text
   }
 
   function saveQuick() {
@@ -962,7 +995,7 @@ ColumnLayout {
             Layout.fillWidth: true
             foreground: root.foreground
             text: qRow.modelData
-            onEditingFinished: root.quickUpdate(qRow.index, text)
+            onTextChanged: root.quickUpdate(qRow.index, text)
           }
           Button {
             id: qDel
