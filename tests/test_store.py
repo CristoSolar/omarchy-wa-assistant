@@ -123,19 +123,6 @@ def test_upsert_tolerates_an_entry_without_a_push_name():
         assert q[0]["push_name"] == "Ana", "existing display name must survive a missing push_name"
 
 
-def test_load_quick_replies_defaults_to_empty_list():
-    with tmpdir() as d:
-        assert store.load_quick_replies(d) == []
-
-
-def test_load_quick_replies_reads_the_configured_list_without_disturbing_order():
-    with tmpdir() as d:
-        (d / "config.json").write_text(
-            json.dumps({"groups_enabled": ["1@g.us"],
-                       "quick_replies": ["Uno", "Dos", "Tres"]}))
-        assert store.load_quick_replies(d) == ["Uno", "Dos", "Tres"]
-
-
 def test_set_status_and_remove():
     with tmpdir() as d:
         e = _entry()

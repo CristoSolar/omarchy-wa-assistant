@@ -46,7 +46,11 @@ def wuzapi_user_id(db_path, name):
     the random id wuzapi generates itself (`GenerateRandomID()`) when a
     user is created via `POST /admin/users`, and it is what wuzapi stamps
     into message_history.user_id on every row. wa-pair sets a wuzapi
-    user's `name` to the account id, so looking it up here by that same
+    user's `name` to the account's `wuzapi_user` from accounts.json —
+    NOT to the account id: the account migrated from a single-account
+    install is `personal` but its wuzapi user is `omarchy`, the name that
+    install already had. The code reads `wuzapi_user` back correctly; only
+    this comment had drifted. Looking it up here by that same
     name is how a caller scopes count_history/wait_until_stable to one
     account. Returns None if the database, the `users` table, or a
     matching row does not exist yet — callers must treat that as "cannot
