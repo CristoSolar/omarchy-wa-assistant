@@ -55,6 +55,70 @@ def test_upsert_keeps_separate_chats_apart():
         assert len(q) == 2
 
 
+# --- Fix round 1: attachment must track the latest message, not merge ---
+
+_IMAGE_ATTACHMENT = {"type": "image", "downloadable": True, "URL": "https://x",
+                     "mimetype": "image/jpeg", "mediaKey": "a", "fileSHA256": "b",
+                     "fileEncSHA256": "c", "fileLength": 1, "directPath": "/d"}
+
+
+def test_image_then_text_leaves_no_attachment_on_the_merged_entry():
+    with tmpdir() as d:
+        image_entry = _entry(text="[imagen]")
+        image_entry["attachment"] = dict(_IMAGE_ATTACHMENT)
+        store.upsert_queue(d, image_entry)
+        q = store.upsert_queue(d, _entry(text="hola"))
+        assert len(q) == 1
+        assert q[0]["text"] == "hola"
+        assert "attachment" not in q[0], \
+            "a text follow-up must not keep the previous image's attachment"
+
+
+def test_text_then_image_leaves_the_images_attachment_complete():
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry(text="hola"))
+        image_entry = _entry(text="[imagen]")
+        image_entry["attachment"] = dict(_IMAGE_ATTACHMENT)
+        q = store.upsert_queue(d, image_entry)
+        assert len(q) == 1
+        assert q[0]["text"] == "[imagen]"
+        assert q[0]["attachment"] == _IMAGE_ATTACHMENT
+
+
+def test_two_images_in_a_row_keep_only_the_seconds_fields():
+    with tmpdir() as d:
+        first = _entry(text="[imagen]")
+        first["attachment"] = dict(_IMAGE_ATTACHMENT)
+        store.upsert_queue(d, first)
+
+        second = _entry(text="[imagen]")
+        second["attachment"] = dict(_IMAGE_ATTACHMENT)
+        second["attachment"]["mediaKey"] = "second-key"
+        q = store.upsert_queue(d, second)
+
+        assert len(q) == 1
+        assert q[0]["attachment"]["mediaKey"] == "second-key"
+
+
+def test_upsert_status_guard_survives_alongside_attachment_handling():
+    # Re-verifies the existing merge guarantees (latest text, incremented
+    # count, "unknown"/"sending" preserved) still hold with the attachment
+    # branch added — this must not regress while fixing the attachment bug.
+    with tmpdir() as d:
+        store.upsert_queue(d, _entry(text="hola"))
+        store.set_status(d, _entry()["id"], "unknown")
+        q = store.upsert_queue(d, _entry(text="de nuevo"))
+        assert q[0]["status"] == "unknown"
+        assert q[0]["text"] == "de nuevo"
+        assert q[0]["count"] == 2
+
+        store.set_status(d, _entry()["id"], "sending")
+        q = store.upsert_queue(d, _entry(text="otra vez"))
+        assert q[0]["status"] == "sending"
+        assert q[0]["text"] == "otra vez"
+        assert q[0]["count"] == 3
+
+
 def test_missing_queue_file_reads_as_empty():
     with tmpdir() as d:
         assert store.load_queue(d) == []

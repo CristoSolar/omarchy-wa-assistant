@@ -132,6 +132,16 @@ def upsert_queue(d, entry) -> list:
             existing["text"] = entry["text"]
             existing["ts"] = entry["ts"]
             existing["push_name"] = entry.get("push_name") or existing.get("push_name")
+            # The attachment must always reflect the latest message, never
+            # a prior one: a text follow-up to an earlier photo must drop
+            # the photo's fields (the row now reads as text, so nothing
+            # about it should still offer to fetch the old image), and a
+            # photo following text must overwrite whatever was there
+            # before, not merge with it.
+            if "attachment" in entry:
+                existing["attachment"] = entry["attachment"]
+            else:
+                existing.pop("attachment", None)
             # A new inbound message does not resolve an unconfirmed send:
             # the reply we may already have delivered is still unconfirmed,
             # and clearing the status here would silently unlock the resend
