@@ -113,6 +113,9 @@ ColumnLayout {
       Layout.fillWidth: true; Layout.fillHeight: true
       model: root.accounts
       spacing: Style.spacing.sm
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
       delegate: Rectangle {
         id: accRow
         required property var modelData
@@ -364,9 +367,22 @@ ColumnLayout {
       }
     }
 
-    ColumnLayout {
+    // The code, the stage text and the purge warning can all be visible at
+    // once by the time linking reaches "done" (the code stays shown, the
+    // purge message appears, and the closing line stacks under it), and
+    // any one of the free-text pieces (the purge message, the error) comes
+    // from wa-pair rather than from a short fixed string — length is not
+    // guaranteed. Wrapped in ScrollView, same idiom as the composer.
+    ScrollView {
+      id: linkProgressScroll
       visible: root.linkStage !== "form"
-      Layout.fillWidth: true
+      Layout.fillWidth: true; Layout.fillHeight: true
+      clip: true
+      ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+      ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+    ColumnLayout {
+      width: linkProgressScroll.availableWidth
       spacing: Style.spacing.md
 
       Text {
@@ -484,6 +500,7 @@ ColumnLayout {
           root.refreshAccounts()
         }
       }
+    }
     }
   }
 
@@ -622,9 +639,20 @@ ColumnLayout {
     }
   }
 
-  ColumnLayout {
+  // Wrapped for the same reason as the link-progress view: unlinkWarning
+  // carries wa-unlink's own free-text reason (e.g. why the wuzapi user
+  // couldn't be removed), which is not bounded, and it can appear stacked
+  // under the discard count and the confirmation form.
+  ScrollView {
+    id: unlinkScroll
     visible: root.mode === "unlink"
     Layout.fillWidth: true; Layout.fillHeight: true
+    clip: true
+    ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+    ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+  ColumnLayout {
+    width: unlinkScroll.availableWidth
     spacing: Style.spacing.lg
 
     Text {
@@ -763,6 +791,7 @@ ColumnLayout {
       }
     }
   }
+  }
 
   // -------------------------------------------------------------------
   // Tone editing — a hash round-trip so a hand edit to the file since it
@@ -898,16 +927,27 @@ ColumnLayout {
       font.bold: true
     }
 
-    TextArea {
-      id: toneBox
+    // The tone box holds a whole prompt file — it will certainly overflow
+    // a fixed-height panel. Same ScrollView-around-TextArea idiom as the
+    // composer in Panel.qml: `toneBox` stays the TextArea's own id, so
+    // every toneBox.text reference (toneDirty(), saveTone(), the fetch
+    // handlers) and its own enabled/selectByMouse keep working unchanged.
+    ScrollView {
       Layout.fillWidth: true; Layout.fillHeight: true
-      wrapMode: TextEdit.Wrap
-      color: root.foreground
-      selectByMouse: true
-      enabled: !root.toneBusy
-      background: Rectangle {
-        color: Style.normalFillFor(root.foreground, Color.accent)
-        radius: Style.cornerRadius
+      clip: true
+      ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+      ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+      TextArea {
+        id: toneBox
+        wrapMode: TextEdit.Wrap
+        color: root.foreground
+        selectByMouse: true
+        enabled: !root.toneBusy
+        background: Rectangle {
+          color: Style.normalFillFor(root.foreground, Color.accent)
+          radius: Style.cornerRadius
+        }
       }
     }
 
@@ -1099,6 +1139,9 @@ ColumnLayout {
       Layout.fillWidth: true; Layout.fillHeight: true
       model: root.quickList
       spacing: Style.spacing.xs
+      clip: true
+      boundsBehavior: Flickable.StopAtBounds
+      ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
       delegate: Rectangle {
         id: qRow
         required property int index

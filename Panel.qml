@@ -508,6 +508,15 @@ Panel {
           Layout.fillWidth: true; Layout.fillHeight: true
           model: root.entries
           spacing: Style.spacing.sm
+          // The queue grows without bound as messages arrive. ListView is
+          // already a Flickable, but without `clip` its rows simply drew
+          // past the panel's fixed bounds instead of being cut off and
+          // scrolled — this plus the attached ScrollBar (shown only while
+          // there is more than fits, per the AsNeeded policy used
+          // elsewhere in the shell) is what makes it actually scroll.
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+          ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
           delegate: Rectangle {
             id: row
             required property var modelData
@@ -612,13 +621,30 @@ Panel {
             wrapMode: Text.Wrap; Layout.fillWidth: true
           }
 
-          Text {
-            textFormat: Text.PlainText
-            text: root.current ? root.current.text : ""
-            color: Color.muted
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-            wrapMode: Text.Wrap; Layout.fillWidth: true
+          // Capped and scrollable: a long incoming WhatsApp message has
+          // exactly the same problem as a long draft below — it can run
+          // past the visible area on its own, and it must not be allowed
+          // to eat the room the composer needs. The cap only kicks in once
+          // the text is actually taller than it; short messages get no
+          // scrollbar at all (ScrollBar.AsNeeded).
+          ScrollView {
+            id: incomingScroll
+            Layout.fillWidth: true
+            Layout.preferredHeight: Math.min(incomingText.implicitHeight, Style.space(140))
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            Text {
+              id: incomingText
+              width: incomingScroll.availableWidth
+              textFormat: Text.PlainText
+              text: root.current ? root.current.text : ""
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              wrapMode: Text.Wrap
+            }
           }
 
           // The durable "unknown" warning, with the deliberate
@@ -772,38 +798,58 @@ Panel {
           // playing, its own text is what requestDraft() reads from or
           // Enviar sends — there is no separate field a raw idea could
           // hide in.
-          TextArea {
-            id: composer
+          // The reported bug: `claude -p` can easily draft a reply longer
+          // than this box's visible area, and with a plain TextArea the
+          // rest was simply unreachable — the text existed, nobody could
+          // scroll to it. ScrollView is the documented way to add
+          // scrolling to a TextArea (it treats the TextArea as its own
+          // flickable content and adds a scrollbar around it) and changes
+          // nothing else: `composer` is still the TextArea's own id, so
+          // every `composer.forceActiveFocus()` / `.selectAll()` /
+          // `.text` reference elsewhere (select(), redraftAgain(),
+          // requestDraft(), doSend(), the Enviar guard) keeps working
+          // unchanged. No wheel is stolen from the queue ListView either:
+          // this whole detail view and the list are mutually exclusive via
+          // `visible`, so they are never on screen — or under the mouse —
+          // at the same time.
+          ScrollView {
             Layout.fillWidth: true; Layout.fillHeight: true
-            placeholderText: "Qué querés responder…"
-            color: root.contentForeground
-            wrapMode: TextEdit.Wrap
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.body
-            selectByMouse: true
-            enabled: !root.drafting && !root.inFlight
-            Keys.onEscapePressed: root.select(null)
-            // Enter drafts the idea currently in the box, exactly like the
-            // Redactar button — but only while the box is still holding an
-            // idea (no draft yet). Once a draft exists this is an ordinary
-            // multi-line editable message, and Enter has to behave like an
-            // ordinary newline instead of silently re-drafting whatever the
-            // user is mid-edit typing.
-            Keys.onReturnPressed: (event) => {
-              if (root.draft !== "" || root.drafting || root.inFlight)
-                return
-              event.accepted = true
-              root.requestDraft(composer)
-            }
-            Keys.onEnterPressed: (event) => {
-              if (root.draft !== "" || root.drafting || root.inFlight)
-                return
-              event.accepted = true
-              root.requestDraft(composer)
-            }
-            background: Rectangle {
-              color: Style.normalFillFor(root.contentForeground, Color.accent)
-              radius: Style.cornerRadius
+            clip: true
+            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+            ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+            TextArea {
+              id: composer
+              placeholderText: "Qué querés responder…"
+              color: root.contentForeground
+              wrapMode: TextEdit.Wrap
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.body
+              selectByMouse: true
+              enabled: !root.drafting && !root.inFlight
+              Keys.onEscapePressed: root.select(null)
+              // Enter drafts the idea currently in the box, exactly like the
+              // Redactar button — but only while the box is still holding an
+              // idea (no draft yet). Once a draft exists this is an ordinary
+              // multi-line editable message, and Enter has to behave like an
+              // ordinary newline instead of silently re-drafting whatever the
+              // user is mid-edit typing.
+              Keys.onReturnPressed: (event) => {
+                if (root.draft !== "" || root.drafting || root.inFlight)
+                  return
+                event.accepted = true
+                root.requestDraft(composer)
+              }
+              Keys.onEnterPressed: (event) => {
+                if (root.draft !== "" || root.drafting || root.inFlight)
+                  return
+                event.accepted = true
+                root.requestDraft(composer)
+              }
+              background: Rectangle {
+                color: Style.normalFillFor(root.contentForeground, Color.accent)
+                radius: Style.cornerRadius
+              }
             }
           }
 
