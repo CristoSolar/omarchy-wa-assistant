@@ -77,6 +77,13 @@ Panel {
   // but a rapid double-click on Enviar still has to be refused.
   property bool inFlight: false
 
+  // Toggled by the gear. SettingsView.qml is a plain child (not a Loader),
+  // never destroyed, so a link or unlink it has mid-flight keeps running
+  // and keeps its state while this is false — see its own onShown().
+  // SettingsView has no path to sendProc, doSend() or root.run(): it
+  // cannot send a message by construction, not just by discipline.
+  property bool settingsOpen: false
+
   // One-click quick replies (config.json's quick_replies, via
   // `wa-reply quick`). Loaded through its own Process so fetching it can
   // never race the list/draft Process or the send Process.
@@ -421,8 +428,10 @@ Panel {
       // The detail view's own fields own input while it is open — the same
       // reasoning the network panel's inline passphrase prompt uses. Letting
       // the catcher's j/k/arrow bindings run underneath a TextField would
-      // steal the keys the field needs.
-      blocked: root.current !== null
+      // steal the keys the field needs. Settings has its own text fields
+      // too (account id, number, tone, quick replies, the typed unlink
+      // confirmation), so it blocks the catcher the same way.
+      blocked: root.current !== null || root.settingsOpen
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
@@ -431,17 +440,50 @@ Panel {
         anchors.margins: Style.spacing.panelPadding
         spacing: Style.spacing.lg
 
-        Text {
-          textFormat: Text.PlainText
-          text: root.current ? root.current.push_name : "Pendientes"
-          color: root.contentForeground
-          font.family: root.contentFontFamily
-          font.pixelSize: Style.font.subtitle
-          font.bold: true
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.spacing.md
+          Text {
+            textFormat: Text.PlainText
+            Layout.fillWidth: true
+            text: root.settingsOpen ? "Configuración"
+                  : (root.current ? root.current.push_name : "Pendientes")
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.subtitle
+            font.bold: true
+          }
+          // The gear: toggles between the queue and settings. Hidden while
+          // a chat is open in the queue view — leaving via "Volver" first
+          // keeps there being exactly one way back to the list from there.
+          Button {
+            text: root.settingsOpen ? "Volver" : "⚙"
+            foreground: root.contentForeground
+            fontFamily: root.contentFontFamily
+            bordered: true
+            visible: root.current === null
+            onClicked: {
+              root.settingsOpen = !root.settingsOpen
+              if (root.settingsOpen && settingsView.onShown)
+                settingsView.onShown()
+              else if (!root.settingsOpen)
+                root.refresh()
+            }
+          }
+        }
+
+        SettingsView {
+          id: settingsView
+          visible: root.settingsOpen
+          Layout.fillWidth: true; Layout.fillHeight: true
+          pluginDir: root.pluginDir
+          foreground: root.contentForeground
+          fontFamily: root.contentFontFamily
+          urgent: root.contentUrgent
         }
 
         Rectangle {
-          visible: root.storeError !== "" && !root.current
+          visible: !root.settingsOpen && root.storeError !== "" && !root.current
           Layout.fillWidth: true
           implicitHeight: storeErrorText.implicitHeight + Style.spacing.xxl
           color: Style.normalFillFor(root.contentUrgent, root.contentUrgent)
@@ -462,7 +504,7 @@ Panel {
         }
 
         ListView {
-          visible: !root.current
+          visible: !root.settingsOpen && !root.current
           Layout.fillWidth: true; Layout.fillHeight: true
           model: root.entries
           spacing: Style.spacing.sm
@@ -550,7 +592,7 @@ Panel {
         }
 
         ColumnLayout {
-          visible: root.current !== null
+          visible: !root.settingsOpen && root.current !== null
           Layout.fillWidth: true; Layout.fillHeight: true
           spacing: Style.spacing.lg
 
