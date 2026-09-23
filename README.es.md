@@ -141,6 +141,23 @@ tenga que notar que el stack se veía bien pero no lo estaba y correr
 contenedores, así que un `wa-up` recién corrido te sigue dando una
 respuesta inmediata.
 
+`wa-up` no llama a `wa-heal` apenas la API de wuzapi contesta: las
+credenciales de una sesión ya emparejada sobreviven a recrear los
+contenedores, pero wuzapi igual tiene que reconectarse a los servidores de
+WhatsApp, y `/session/status` contesta mucho antes de que esa reconexión
+termine. Sanar demasiado temprano vería `loggedIn: false` y decidiría
+(correctamente) que no hay nada que hacer — saltándose el único reasserto
+que importa. Por eso `wa-up` espera (hasta 30s) a que la sesión vuelva a
+loguearse antes de pasarle la posta a `wa-heal`, y te dice cuál de dos
+cosas distintas pasó:
+
+- **Nunca se emparejó nada** — `wa-up` lo dice con calma y te apunta a
+  `wa-pair <número>`. No es un problema.
+- **Una sesión emparejada no volvió a loguearse en 30s** — `wa-up` dice
+  que el webhook no se pudo reafirmar, que los mensajes entrantes se van a
+  perder hasta que se reafirme, y que el timer de `wa-heal` va a reintentar
+  dentro de cinco minutos, o que podés correr `bin/wa-heal` vos mismo ya.
+
 **Verificar que está funcionando:**
 
 ```sh

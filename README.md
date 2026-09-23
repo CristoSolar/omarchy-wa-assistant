@@ -133,6 +133,22 @@ still calls the same `wa-heal` script (not a second copy of the logic)
 right after bringing the containers up, so a fresh `wa-up` still gives you
 an immediate answer.
 
+`wa-up` doesn't call `wa-heal` the instant wuzapi's API answers, though: a
+previously-paired session's credentials survive the container recreate,
+but wuzapi still has to reconnect to WhatsApp's servers, and answering
+`/session/status` happens well before that reconnect finishes. Healing too
+early would see `loggedIn: false` and correctly decide there's nothing to
+do — skipping the one re-assert that matters. So `wa-up` waits (up to 30s)
+for the session to actually log back in before handing off to `wa-heal`,
+and tells you which of two different things happened:
+
+- **Nothing was ever paired** — `wa-up` says so calmly and points you at
+  `wa-pair <number>`. Not a problem.
+- **A paired session didn't log back in within 30s** — `wa-up` says the
+  webhook could not be re-asserted, that incoming messages will be
+  dropped until it is, and that the `wa-heal` timer will retry within five
+  minutes, or you can run `bin/wa-heal` yourself right away.
+
 **Check it's working:**
 
 ```sh
