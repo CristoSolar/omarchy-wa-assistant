@@ -98,13 +98,23 @@ cd omarchy-wa-assistant
    running `docker build` on it — only if an image with that name doesn't
    already exist.
 
-This is a deliberate one-time cost paid by `install.sh`, not by every-day
-use. `bin/wa-up` (the command you run to bring the bridge up) does **not**
-build the wuzapi image itself: if it's missing, `wa-up` prints the two
-commands above and exits 1. Auto-cloning and building a third-party image
-from the internet on a routine `wa-up` would be a slow, surprising side
-effect to have on a command you run often; building it once, during
-install, is not.
+Cloning and building wuzapi is a deliberate one-time cost paid by
+`install.sh`, not by every-day use. `bin/wa-up` (the command you run to
+bring the bridge up) does **not** build the wuzapi image itself: if it's
+missing, `wa-up` prints the two commands above and exits 1. Auto-cloning
+and building a third-party image from the internet on a routine `wa-up`
+would be a slow, surprising side effect to have on a command you run
+often; building it once, during install, is not.
+
+The sink image is different: **`wa-up` rebuilds `omarchy-wa-sink` from
+this repo on every run**, unconditionally. It's built from local source,
+so Docker's layer cache makes a no-change rebuild take a couple of
+seconds. That cost buys one guarantee that matters more: the sink that is
+running can never be older than the code in this repo. It used to be
+built only when the image was absent, which meant an install could keep
+running a sink from before a change — and, in the multi-account upgrade,
+`wa-up` would migrate your state to the new layout and then start a sink
+that had never heard of it.
 
 `install.sh` also puts the plugin's widget on the bar (via `omarchy-bar put`,
 which is safe to run again — it leaves the widget where it is if it's
@@ -361,9 +371,21 @@ arrived on (see "What it does" above).
 ### Migrating from a single-account install
 
 If you're upgrading an install that predates multi-account, you don't need
-to do anything by hand: the next time you run `./bin/wa-up`, it migrates
-your existing setup to the `accounts.json` layout automatically, before
-starting any containers. You'll see one of these two lines:
+to do anything by hand — just run `./bin/wa-up`. In that order, it:
+
+1. rebuilds the `omarchy-wa-sink` image from this repo (always, see
+   "What gets built" above), so the sink about to run is the new one;
+2. **stops both containers** (`docker rm -f`), so nothing is writing to
+   your state while it changes shape. This is why the migration is safe:
+   a message arriving mid-migration would otherwise be written by the
+   still-running old sink *after* the queue had been rewritten, and would
+   stay in the old shape forever, since the migration only ever runs once;
+3. migrates your existing setup to the `accounts.json` layout;
+4. starts both containers again, the sink now on the new image.
+
+Your bridge is down for the length of steps 2–4 (seconds), and messages
+that arrive in that window are delivered by WhatsApp when it comes back
+up, the same as after any restart. You'll see one of these two lines:
 
 ```
 migrated to accounts.json

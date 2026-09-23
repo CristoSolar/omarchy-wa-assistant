@@ -105,13 +105,25 @@ cd omarchy-wa-assistant
    corriendo `docker build` sobre eso — solo si no existe ya una imagen
    con ese nombre.
 
-Este es un costo único, deliberadamente puesto en `install.sh` y no en el
-uso diario. `bin/wa-up` (el comando que corrés para levantar el puente) **no**
-construye la imagen de wuzapi: si falta, `wa-up` imprime los dos comandos
-de arriba y sale con error. Clonar y construir de forma automática una
-imagen de terceros bajada de internet en un `wa-up` de rutina sería un
-efecto secundario lento y sorpresivo para un comando que corrés seguido;
-construirla una sola vez, durante la instalación, no lo es.
+Clonar y construir wuzapi es un costo único, deliberadamente puesto en
+`install.sh` y no en el uso diario. `bin/wa-up` (el comando que corrés
+para levantar el puente) **no** construye la imagen de wuzapi: si falta,
+`wa-up` imprime los dos comandos de arriba y sale con error. Clonar y
+construir de forma automática una imagen de terceros bajada de internet
+en un `wa-up` de rutina sería un efecto secundario lento y sorpresivo
+para un comando que corrés seguido; construirla una sola vez, durante la
+instalación, no lo es.
+
+Con la imagen del sink es distinto: **`wa-up` reconstruye
+`omarchy-wa-sink` desde este repo en cada corrida**, siempre. Se
+construye desde código local, así que con la caché de capas de Docker una
+reconstrucción sin cambios tarda un par de segundos. Ese costo compra una
+garantía que vale más: el sink que está corriendo nunca puede ser más
+viejo que el código de este repo. Antes se construía solo si la imagen no
+existía, lo que permitía que una instalación siguiera corriendo un sink
+anterior a un cambio — y, en la actualización a multi-cuenta, `wa-up`
+habría migrado tu estado al formato nuevo para después levantar un sink
+que nunca supo de él.
 
 `install.sh` también pone el widget del plugin en la barra (con
 `omarchy-bar put`, que es seguro correr de nuevo — deja el widget donde
@@ -386,9 +398,24 @@ resumen" más arriba).
 ### Migrar desde una instalación de una sola cuenta
 
 Si estás actualizando una instalación de antes de multi-cuenta, no tenés
-que hacer nada a mano: la próxima vez que corras `./bin/wa-up`, migra tu
-instalación existente al formato `accounts.json` automáticamente, antes de
-levantar ningún contenedor. Vas a ver una de estas dos líneas:
+que hacer nada a mano: corré `./bin/wa-up`. En ese orden, hace:
+
+1. reconstruye la imagen `omarchy-wa-sink` desde este repo (siempre, ver
+   "Qué se construye" más arriba), así el sink que va a arrancar es el
+   nuevo;
+2. **baja los dos contenedores** (`docker rm -f`), para que nada esté
+   escribiendo tu estado mientras cambia de forma. Por eso la migración
+   es segura: un mensaje que llegara en el medio lo escribiría el sink
+   viejo todavía vivo *después* de que la cola fue reescrita, y quedaría
+   con el formato viejo para siempre, porque la migración corre una sola
+   vez;
+3. migra tu instalación existente al formato `accounts.json`;
+4. vuelve a levantar los dos contenedores, el sink ya con la imagen nueva.
+
+El puente queda abajo lo que duran los pasos 2 a 4 (segundos), y los
+mensajes que lleguen en esa ventana los entrega WhatsApp cuando vuelve a
+subir, igual que después de cualquier reinicio. Vas a ver una de estas
+dos líneas:
 
 ```
 migrated to accounts.json

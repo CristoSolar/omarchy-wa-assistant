@@ -86,16 +86,64 @@ fi
 # shellcheck disable=SC1090
 source "$SECRETS"
 
-# Migrate a pre-multi-account install to accounts.json before starting
-# anything: the sink and every account-aware script (wa-reply, wa-status,
-# wa-heal) assume accounts.json exists, so it must be there before the
-# containers that would otherwise see a half-migrated or missing file come
-# up. Idempotent (store.migrate_single_account's own gate: a no-op once
-# accounts.json exists), and safe to run on a brand-new install too — it
-# then seeds the "personal" account other scripts already expect. Runs
-# AFTER secrets.env exists so its own WA_TOKEN -> WA_TOKEN_PERSONAL copy
-# (spec step 2) has a source token to copy on a fresh install, not just a
-# real migration.
+docker network create omarchy-wa >/dev/null 2>&1 || true
+
+# Rebuild the sink image on EVERY run, unconditionally. This used to be
+# guarded by `docker image inspect`, which meant an install whose image
+# predated a code change kept running that old image forever: `wa-up`
+# would migrate the state to the new layout and then start a sink that
+# knew nothing about it — writing bare `<jid>` ids with no `account`
+# field (which `wa-reply` then refuses) into a queue the migration had
+# just rewritten, and flat `ctx/<jid>.json` files nothing reads. Both
+# READMEs promise that upgrading needs nothing by hand beyond `wa-up`,
+# so `wa-up` is what has to make that true.
+#
+# Chosen over a staleness check (image-vs-source timestamps, a content
+# hash baked in as a label, probing the image for `sink/accounts.py`)
+# deliberately: a staleness check is only as correct as its idea of what
+# "new enough" means, and every way it can be wrong ends with the stale
+# sink running against migrated state — corrupting a real person's queue
+# silently. An unconditional build cannot be wrong; it costs a few
+# seconds, and near-zero when nothing changed, since Docker's layer cache
+# does the work. Correctness here is worth strictly more than the
+# seconds. It also means the running sink can never be older than the
+# code, which is the invariant, not merely "usually up to date".
+docker build -t omarchy-wa-sink -f "$ROOT/docker/sink.Dockerfile" "$ROOT"
+
+if ! docker image inspect omarchy-wuzapi >/dev/null 2>&1; then
+  echo "Missing image omarchy-wuzapi. Build it from asternic/wuzapi:" >&2
+  echo "  git clone --depth 1 https://github.com/asternic/wuzapi /tmp/wuzapi" >&2
+  echo "  docker build -t omarchy-wuzapi /tmp/wuzapi" >&2
+  exit 1
+fi
+
+# ORDERING, LOAD-BEARING — do not move the migration below this line, and
+# do not move this `docker rm -f` below the migration.
+#
+# The sink must be STOPPED before the state is migrated. While the old
+# sink is alive it is still receiving real messages and writing them in
+# the OLD shape. An event that lands after migrate_single_account() has
+# rewritten queue.json and ctx/ is then permanently unmigrated: the
+# migration is gated on accounts.json, which now exists, so it never
+# runs again and that message keeps a bare `<jid>` id with no `account`
+# field for good — a conversation `wa-reply` refuses to answer. The
+# window is only a few seconds wide, but the box is receiving a real
+# person's mail, so a few seconds is enough.
+#
+# Both images are built ABOVE this line on purpose too: a build failure
+# must leave the existing stack running rather than take it down first
+# and then discover it cannot bring it back.
+docker rm -f omarchy-wuzapi omarchy-wa-sink >/dev/null 2>&1 || true
+
+# Migrate a pre-multi-account install to accounts.json. Runs with nothing
+# running (see the ordering note above) and before anything is started:
+# the sink and every account-aware script (wa-reply, wa-status, wa-heal)
+# assume accounts.json exists. Idempotent (store.migrate_single_account's
+# own gate: a no-op once accounts.json exists), and safe to run on a
+# brand-new install too — it then seeds the "personal" account other
+# scripts already expect. Runs AFTER secrets.env exists so its own
+# WA_TOKEN -> WA_TOKEN_PERSONAL copy (spec step 2) has a source token to
+# copy on a fresh install, not just a real migration.
 MIGRATE_MSG=$(python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
@@ -111,21 +159,6 @@ echo "$MIGRATE_MSG"
 # re-source so it is in this shell's environment too.
 # shellcheck disable=SC1090
 source "$SECRETS"
-
-docker network create omarchy-wa >/dev/null 2>&1 || true
-
-if ! docker image inspect omarchy-wa-sink >/dev/null 2>&1; then
-  docker build -t omarchy-wa-sink -f "$ROOT/docker/sink.Dockerfile" "$ROOT"
-fi
-
-if ! docker image inspect omarchy-wuzapi >/dev/null 2>&1; then
-  echo "Missing image omarchy-wuzapi. Build it from asternic/wuzapi:" >&2
-  echo "  git clone --depth 1 https://github.com/asternic/wuzapi /tmp/wuzapi" >&2
-  echo "  docker build -t omarchy-wuzapi /tmp/wuzapi" >&2
-  exit 1
-fi
-
-docker rm -f omarchy-wuzapi omarchy-wa-sink >/dev/null 2>&1 || true
 
 # --restart unless-stopped: bring both containers back after a crash or a
 # host reboot without needing wa-up run by hand. Not `always` — this stack

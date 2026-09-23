@@ -42,5 +42,5 @@ fi
 
 echo "Installed. Next:"
 echo "  ./bin/wa-up"
-echo "  ./bin/wa-pair <your number>"
+echo "  ./bin/wa-pair personal <your number>"
 echo "  omarchy-restart-shell"
