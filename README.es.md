@@ -54,7 +54,10 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 - **El widget de barra y el panel** (`BarWidget.qml`, `Panel.qml`) muestran
   los chats pendientes, te dejan escribir la idea, llaman a `claude -p`
   para redactar una respuesta según las instrucciones del agente
-  (`agents/respuesta.md`) y la envían.
+  (`agents/respuesta.md`) y la envían. Hay una sola caja de texto: escribís
+  la idea y apretás **Redactar** (o Enter) para redactarla; esa misma caja
+  pasa a tener el mensaje redactado — editable, con la idea de la que salió
+  mostrada arriba — y recién ahí se habilita **Enviar**.
 
 ## Requisitos
 

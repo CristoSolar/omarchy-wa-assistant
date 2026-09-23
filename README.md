@@ -50,6 +50,10 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
 - **The bar widget and panel** (`BarWidget.qml`, `Panel.qml`) show pending
   chats, let you type the idea, call `claude -p` to draft a reply against
   the chat's own agent instructions (`agents/respuesta.md`), and send it.
+  There is one text box: type the idea and press **Redactar** (or Enter)
+  to draft it, then the same box switches to holding the drafted message
+  — editable, with the idea it came from shown above it — and only then
+  does **Enviar** turn on.
 
 ## Requirements
 

@@ -42,6 +42,15 @@ Panel {
   // as a quiet empty panel, not as this banner.
   property string storeError: ""
   property string draft: ""
+  // The idea that produced the current draft, kept only for the "Idea: …"
+  // recap line above the composer once a draft exists. Cleared whenever
+  // the composer goes back to idea-entry mode.
+  property string idea: ""
+  // True for the ~7s round trip while `claude -p` is drafting. Distinct
+  // from inFlight (which is send-only): drafting never touches the send
+  // Process, but it still has to visibly disable the composer so the
+  // user isn't left wondering whether Enter/Redactar did anything.
+  property bool drafting: false
   property string status: ""
   // The status line turns to the theme's attention color for any outcome
   // that is neither a clean success nor a clean failure.
@@ -123,11 +132,70 @@ Panel {
     root.current = entry
     root.currentId = entry ? entry.id : ""
     root.draft = ""
+    root.idea = ""
+    root.drafting = false
     root.status = ""
     root.statusWarn = false
     root.acknowledged = false
     root.sendBlocked = false
-    if (entry) Qt.callLater(function() { idea.forceActiveFocus() })
+    if (entry) Qt.callLater(function() { composer.forceActiveFocus() })
+  }
+
+  // The single composer box's one action: take whatever is currently
+  // typed as the idea, ask `claude -p` (via `wa-reply draft`) to turn it
+  // into a message, and — on success — replace the box's own content with
+  // the drafted message. Used identically for the first draft and for a
+  // redraft after "Redactar de nuevo" cleared the box back to idea mode,
+  // so there is exactly one code path that can ever populate root.draft.
+  function requestDraft(box) {
+    if (root.drafting || root.inFlight)
+      return
+    var text = box.text.trim()
+    if (text === "")
+      return
+    // Captured so a stray late response can't overwrite the composer if
+    // the user has since switched to a different queued chat.
+    var requestId = root.currentId
+    root.status = ""
+    root.statusWarn = false
+    var started = root.run(["draft", requestId, "--idea", text], function (out) {
+      root.drafting = false
+      if (root.currentId !== requestId)
+        return
+      try {
+        const d = JSON.parse(out)
+        if (d.error) {
+          root.status = "error: " + d.error
+          root.statusWarn = true
+        } else {
+          root.idea = text
+          root.draft = d.draft
+          box.text = d.draft
+          root.status = ""
+          root.statusWarn = false
+        }
+      } catch (e) {
+        root.status = "no se pudo redactar"
+        root.statusWarn = true
+      }
+    })
+    if (started)
+      root.drafting = true
+  }
+
+  // "Redactar de nuevo": drop the current draft and hand the box back for
+  // idea-entry, prefilled with the idea that produced it so it's a quick
+  // edit rather than starting from a blank box. The guard against sending
+  // a raw idea lives in the Enviar button (disabled while root.draft is
+  // empty), which this restores by clearing root.draft.
+  function redraftAgain(box) {
+    if (root.drafting || root.inFlight)
+      return
+    box.text = root.idea
+    root.draft = ""
+    root.status = ""
+    root.statusWarn = false
+    Qt.callLater(function () { box.forceActiveFocus(); box.selectAll() })
   }
 
   function refresh() {
@@ -353,41 +421,79 @@ Panel {
             }
           }
 
-          TextField {
-            id: idea
+          // Once a draft exists, the composer below no longer holds the
+          // user's raw idea — it holds the message that Enviar will
+          // actually send. This heading plus the muted recap line are the
+          // only cue for that switch, so they have to say it plainly.
+          ColumnLayout {
+            visible: root.draft !== ""
             Layout.fillWidth: true
-            placeholderText: "Qué querés responder…"
-            foreground: root.contentForeground
-            font.family: root.contentFontFamily
-            enabled: !root.inFlight
-            Keys.onEscapePressed: root.select(null)
-            onAccepted: {
-              if (root.inFlight)
-                return
-              root.status = "redactando…"
-              root.statusWarn = false
-              root.run(["draft", root.currentId, "--idea", idea.text],
-                        function (out) {
-                try {
-                  const d = JSON.parse(out)
-                  root.draft = d.draft
-                  root.status = d.error ? ("error: " + d.error) : ""
-                  root.statusWarn = d.error ? true : false
-                } catch (e) { root.status = "no se pudo redactar" }
-              })
+            spacing: Style.spacing.xxs
+            Text {
+              textFormat: Text.PlainText
+              text: "Mensaje a enviar"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+            RowLayout {
+              Layout.fillWidth: true
+              spacing: Style.spacing.md
+              Text {
+                textFormat: Text.PlainText
+                text: "Idea: " + root.idea
+                color: Color.muted
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+                Layout.fillWidth: true
+              }
+              Button {
+                text: "Redactar de nuevo"
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                enabled: !root.drafting && !root.inFlight
+                onClicked: root.redraftAgain(composer)
+              }
             }
           }
 
+          // The single composer box: idea-entry before a draft exists,
+          // then the editable drafted message. Whichever role it is
+          // playing, its own text is what requestDraft() reads from or
+          // Enviar sends — there is no separate field a raw idea could
+          // hide in.
           TextArea {
-            id: draftBox
+            id: composer
             Layout.fillWidth: true; Layout.fillHeight: true
-            text: root.draft
+            placeholderText: "Qué querés responder…"
             color: root.contentForeground
             wrapMode: TextEdit.Wrap
             font.family: root.contentFontFamily
             font.pixelSize: Style.font.body
             selectByMouse: true
+            enabled: !root.drafting && !root.inFlight
             Keys.onEscapePressed: root.select(null)
+            // Enter drafts the idea currently in the box, exactly like the
+            // Redactar button — but only while the box is still holding an
+            // idea (no draft yet). Once a draft exists this is an ordinary
+            // multi-line editable message, and Enter has to behave like an
+            // ordinary newline instead of silently re-drafting whatever the
+            // user is mid-edit typing.
+            Keys.onReturnPressed: (event) => {
+              if (root.draft !== "" || root.drafting || root.inFlight)
+                return
+              event.accepted = true
+              root.requestDraft(composer)
+            }
+            Keys.onEnterPressed: (event) => {
+              if (root.draft !== "" || root.drafting || root.inFlight)
+                return
+              event.accepted = true
+              root.requestDraft(composer)
+            }
             background: Rectangle {
               color: Style.normalFillFor(root.contentForeground, Color.accent)
               radius: Style.cornerRadius
@@ -406,13 +512,32 @@ Panel {
 
           RowLayout {
             spacing: Style.spacing.lg
+            // Visible only while the composer is still holding a raw
+            // idea (no draft yet). Enter is the shortcut for the exact
+            // same action, so neither is the only way to trigger it.
+            Button {
+              text: root.drafting ? "Redactando…" : "Redactar"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              visible: root.draft === ""
+              enabled: !root.drafting && !root.inFlight
+                       && composer.text.trim().length > 0
+              onClicked: root.requestDraft(composer)
+            }
             Button {
               text: "Enviar"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
               bordered: true
-              enabled: draftBox.text.trim().length > 0
+              // Disabled until a draft exists: with a single composer
+              // box, the user's raw idea sits in this same field before
+              // drafting, so this guard is what stops "decile que estoy
+              // ocupado" from ever going out verbatim.
+              enabled: root.draft !== ""
+                       && composer.text.trim().length > 0
                        && !root.sendBlocked
+                       && !root.drafting
                        && !root.inFlight
                        && (!root.needsAck || root.acknowledged)
               onClicked: {
@@ -421,7 +546,7 @@ Panel {
                 root.status = "enviando…"
                 root.statusWarn = false
                 root.inFlight = true
-                var args = ["send", root.currentId, "--text", draftBox.text]
+                var args = ["send", root.currentId, "--text", composer.text]
                 if (root.needsAck && root.acknowledged)
                   args.push("--acknowledged")
                 sendProc.command = [root.pluginDir + "bin/wa-reply"].concat(args)
@@ -494,7 +619,7 @@ Panel {
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
               bordered: true
-              enabled: !root.inFlight
+              enabled: !root.inFlight && !root.drafting
               onClicked: root.select(null)
             }
           }
