@@ -9,42 +9,53 @@ import sys
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from sink import accounts as accounts_module
 from sink import store
 from sink.events import describe_skipped_group, extract
 from sink.purge import purge_history
 
 PORT = 8099
 
-# TEMPORARY bridge until Task 2 resolves the real account from the event's
-# instanceName via sink.accounts.by_instance (built in Task 1). Until then
-# this sink only ever serves the single migrated account, and context must
-# land in the same per-account location migration moved it to
-# (ctx/personal/<jid>.json) — store.append_context/load_context now
-# require an explicit account precisely so a call site can never silently
-# fall back to the pre-migration flat layout that nothing reads any more.
-_SINGLE_ACCOUNT_ID = "personal"
-
 # JIDs of not-yet-enabled groups already logged, so a busy group chat
 # doesn't flood the log with the same JID on every message. Process-lifetime
 # only — it does not need to survive a restart.
 _logged_group_jids = set()
 
+# instanceNames that matched no configured account, already logged, so a
+# misconfigured or not-yet-paired wuzapi user doesn't flood the log with
+# the same name on every message. Process-lifetime only, same as
+# _logged_group_jids.
+_logged_unknown_instances = set()
+
 
 def _decode(raw: bytes, content_type: str):
+    """Return (event, instance_name), or (None, None) if the body is unusable.
+
+    Both webhook formats carry the account's wuzapi_user as `instanceName`
+    alongside the event payload: form-urlencoded as a sibling field next to
+    `jsonData`, JSON as a sibling key next to `event`. Reading it from the
+    same envelope in both cases keeps `events.extract` (which only ever
+    looks at the `event` key) unaware that accounts exist at all.
+    """
     text = raw.decode("utf-8", "replace")
     if "form-urlencoded" in (content_type or ""):
         fields = urllib.parse.parse_qs(text)
-        payload = fields.get("jsonData", [""])[0]
-    else:
-        payload = text
+        payload_text = fields.get("jsonData", [""])[0]
+        instance_name = fields.get("instanceName", [""])[0]
+        try:
+            return json.loads(payload_text), instance_name
+        except ValueError:
+            return None, None
     try:
-        return json.loads(payload)
+        event = json.loads(text)
     except ValueError:
-        return None
+        return None, None
+    instance_name = event.get("instanceName") if isinstance(event, dict) else None
+    return event, instance_name
 
 
 def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
-    event = _decode(raw, content_type)
+    event, instance_name = _decode(raw, content_type)
     if event is None:
         return False
     config = store.load_config(data_dir)
@@ -58,11 +69,35 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
                  f"jid={skipped['jid']!r} sender={skipped['sender']!r}",
                  file=sys.stderr, flush=True)
         return False
+
+    # accounts.load raises StoreReadError for a broken accounts.json (exists
+    # but unreadable or unparsable). We deliberately do NOT catch it here:
+    # this sits on the path that decides whose context a message lands in,
+    # and a broken accounts file must never be treated as "no accounts
+    # configured" (which would fall through to "unknown instanceName" below
+    # and drop the message with a misleading log line) nor guessed past
+    # (which would risk filing a message under the wrong account). Letting
+    # it propagate means Handler.do_POST's existing catch-all logs the real
+    # reason loudly and the sink stays up — the event is still dropped, but
+    # with an honest error instead of a fabricated "unknown account".
+    accounts = accounts_module.load(data_dir)
+    account = accounts_module.by_instance(accounts, instance_name)
+    if account is None:
+        if instance_name not in _logged_unknown_instances:
+            _logged_unknown_instances.add(instance_name)
+            print(f"skipping message from unrecognised instanceName "
+                 f"(not in accounts.json): instance={instance_name!r} "
+                 f"jid={entry['jid']!r} sender={entry['push_name']!r}",
+                 file=sys.stderr, flush=True)
+        return False
+
+    account_id = account["id"]
     store.append_context(data_dir, entry["jid"],
                          {"from": entry["push_name"], "text": entry["text"],
-                          "ts": entry["ts"]}, _SINGLE_ACCOUNT_ID)
+                          "ts": entry["ts"]}, account_id)
     store.upsert_queue(data_dir, {
-        "id": entry["jid"], "jid": entry["jid"],
+        "id": store.entry_id(account_id, entry["jid"]), "jid": entry["jid"],
+        "account": account_id,
         "push_name": entry["push_name"], "text": entry["text"],
         "count": 1, "ts": entry["ts"], "status": "pending",
     })
