@@ -95,12 +95,15 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     store.append_context(data_dir, entry["jid"],
                          {"from": entry["push_name"], "text": entry["text"],
                           "ts": entry["ts"]}, account_id)
-    store.upsert_queue(data_dir, {
+    queue_entry = {
         "id": store.entry_id(account_id, entry["jid"]), "jid": entry["jid"],
         "account": account_id,
         "push_name": entry["push_name"], "text": entry["text"],
         "count": 1, "ts": entry["ts"], "status": "pending",
-    })
+    }
+    if "attachment" in entry:
+        queue_entry["attachment"] = entry["attachment"]
+    store.upsert_queue(data_dir, queue_entry)
     return True
 
 

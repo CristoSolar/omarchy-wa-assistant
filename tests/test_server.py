@@ -208,6 +208,44 @@ def test_successful_queue_answers_200():
         assert len(store.load_queue(d)) == 1
 
 
+# --- Task 1: attachment fields reach the queue entry --------------------
+
+
+def test_image_attachment_fields_land_on_the_queue_entry():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event()
+        ev["event"]["Message"] = {"imageMessage": {
+            "URL": "https://mmg.whatsapp.net/x", "mimetype": "image/jpeg",
+            "mediaKey": "bWVkaWFrZXk=", "fileSHA256": "c2hh",
+            "fileEncSHA256": "ZW5jc2hh", "fileLength": 1234,
+            "directPath": "/v/t62/abc"}}
+        assert handle_payload(json.dumps(ev).encode(), "application/json", d) is True
+        q = store.load_queue(d)
+        assert q[0]["text"] == "[imagen]"
+        assert q[0]["attachment"]["type"] == "image"
+        assert q[0]["attachment"]["downloadable"] is True
+        assert q[0]["attachment"]["mediaKey"] == "bWVkaWFrZXk="
+
+
+def test_plain_text_message_queue_entry_has_no_attachment_field():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        assert handle_payload(json.dumps(EV).encode(), "application/json", d) is True
+        q = store.load_queue(d)
+        assert "attachment" not in q[0]
+
+
+def test_incomplete_attachment_queues_marked_not_downloadable():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event()
+        ev["event"]["Message"] = {"imageMessage": {"mimetype": "image/jpeg"}}
+        assert handle_payload(json.dumps(ev).encode(), "application/json", d) is True
+        q = store.load_queue(d)
+        assert q[0]["attachment"] == {"type": "image", "downloadable": False}
+
+
 def test_unexpected_exception_in_the_queueing_path_answers_500_not_crash():
     with tmpdir() as d:
         _write_accounts(d, [PERSONAL])

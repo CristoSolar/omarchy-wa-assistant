@@ -15,6 +15,33 @@ PLACEHOLDERS = {
     "contactMessage": "[contacto]",
 }
 
+# Message keys wuzapi can actually fetch, mapped to the short type name
+# stored on the queue entry. Checked against wuzapi's own source
+# (routes.go / handlers.go): /chat/downloadimage, /chat/downloadaudio,
+# /chat/downloadvideo, /chat/downloaddocument and /chat/downloadsticker
+# each exist and decode a JSON body into a struct with these exact fields
+# (Url, DirectPath, MediaKey, Mimetype, FileEncSHA256, FileSHA256,
+# FileLength). There is no such endpoint for locationMessage or
+# contactMessage — those can never be downloadable, endpoint or no.
+DOWNLOADABLE_TYPES = {
+    "audioMessage": "audio",
+    "imageMessage": "image",
+    "videoMessage": "video",
+    "stickerMessage": "sticker",
+    "documentMessage": "document",
+}
+
+# The exact keys wuzapi's download endpoints require, spelled the way
+# whatsmeow's own proto JSON emits them on the incoming event (verified
+# against waE2E's generated struct tags, e.g. ImageMessage.URL has
+# `json:"URL,omitempty"`, not "url"). Go's json.Decoder matches struct
+# field names case-insensitively, so handing these keys back untouched is
+# exactly what the endpoint's downloadImageStruct/downloadAudioStruct/...
+# expect — no renaming needed, and no risk of guessing a shape that
+# doesn't match what wuzapi actually reads.
+DOWNLOAD_FIELDS = ("URL", "mimetype", "mediaKey", "fileSHA256",
+                   "fileEncSHA256", "fileLength", "directPath")
+
 
 def _text_of(message: dict) -> str:
     if not isinstance(message, dict):
@@ -32,6 +59,36 @@ def _text_of(message: dict) -> str:
     return "[mensaje no soportado]"
 
 
+def _attachment_of(message: dict) -> dict | None:
+    """What `wa-media` will need to fetch this message's attachment, if any.
+
+    Returns None for a plain text message (no attachment key present at
+    all — a text message must not gain any of these fields). For a
+    recognised attachment type, returns a dict with "type" and
+    "downloadable"; when downloadable it also carries the exact fields
+    wuzapi's matching /chat/download* endpoint requires, copied verbatim
+    from the event. A type wuzapi has no download endpoint for
+    (locationMessage, contactMessage) is always marked not downloadable.
+    A downloadable type missing one or more required fields (a malformed
+    event) is also marked not downloadable, with none of the partial
+    fields kept — a caller must not be able to fetch with half a key.
+    """
+    if not isinstance(message, dict):
+        return None
+    for key, label in DOWNLOADABLE_TYPES.items():
+        if key in message:
+            payload = message[key] if isinstance(message[key], dict) else {}
+            fields = {f: payload[f] for f in DOWNLOAD_FIELDS
+                     if f in payload and payload[f] is not None}
+            if len(fields) == len(DOWNLOAD_FIELDS):
+                return {"type": label, "downloadable": True, **fields}
+            return {"type": label, "downloadable": False}
+    for key in PLACEHOLDERS:
+        if key in message and key not in DOWNLOADABLE_TYPES:
+            return {"type": PLACEHOLDERS[key].strip("[]"), "downloadable": False}
+    return None
+
+
 def extract(event: dict, groups_enabled) -> dict | None:
     info = (event or {}).get("event", {}).get("Info", {})
     if not info:
@@ -47,12 +104,16 @@ def extract(event: dict, groups_enabled) -> dict | None:
         return None
 
     message = (event or {}).get("event", {}).get("Message", {})
-    return {
+    entry = {
         "jid": jid,
         "push_name": info.get("PushName") or jid,
         "text": _text_of(message),
         "ts": info.get("Timestamp", ""),
     }
+    attachment = _attachment_of(message)
+    if attachment is not None:
+        entry["attachment"] = attachment
+    return entry
 
 
 def describe_skipped_group(event: dict, groups_enabled) -> dict | None:

@@ -109,5 +109,107 @@ def test_an_empty_conversation_still_falls_through_to_a_placeholder():
     assert e["text"] == "[audio]"
 
 
+# --- Task 1: attachment fields for a later download ---------------------
+
+FULL_MEDIA_FIELDS = {
+    "URL": "https://mmg.whatsapp.net/x", "mimetype": "image/jpeg",
+    "mediaKey": "bWVkaWFrZXk=", "fileSHA256": "c2hh",
+    "fileEncSHA256": "ZW5jc2hh", "fileLength": 1234,
+    "directPath": "/v/t62/abc",
+}
+
+
+def test_text_message_gains_no_attachment_field():
+    out = extract(_ev(), [])
+    assert "attachment" not in out
+
+
+def test_image_message_stores_the_fields_the_download_endpoint_requires():
+    ev = _ev()
+    ev["event"]["Message"] = {"imageMessage": dict(FULL_MEDIA_FIELDS)}
+    out = extract(ev, [])
+    assert out["text"] == "[imagen]"
+    att = out["attachment"]
+    assert att["type"] == "image"
+    assert att["downloadable"] is True
+    for field, value in FULL_MEDIA_FIELDS.items():
+        assert att[field] == value
+
+
+def test_audio_message_stores_the_fields_the_download_endpoint_requires():
+    ev = _ev()
+    ev["event"]["Message"] = {"audioMessage": dict(FULL_MEDIA_FIELDS)}
+    out = extract(ev, [])
+    att = out["attachment"]
+    assert att["type"] == "audio" and att["downloadable"] is True
+    for field, value in FULL_MEDIA_FIELDS.items():
+        assert att[field] == value
+
+
+def test_video_message_stores_the_fields_the_download_endpoint_requires():
+    ev = _ev()
+    ev["event"]["Message"] = {"videoMessage": dict(FULL_MEDIA_FIELDS)}
+    out = extract(ev, [])
+    att = out["attachment"]
+    assert att["type"] == "video" and att["downloadable"] is True
+    for field, value in FULL_MEDIA_FIELDS.items():
+        assert att[field] == value
+
+
+def test_sticker_message_stores_the_fields_the_download_endpoint_requires():
+    ev = _ev()
+    ev["event"]["Message"] = {"stickerMessage": dict(FULL_MEDIA_FIELDS)}
+    out = extract(ev, [])
+    att = out["attachment"]
+    assert att["type"] == "sticker" and att["downloadable"] is True
+    for field, value in FULL_MEDIA_FIELDS.items():
+        assert att[field] == value
+
+
+def test_document_message_stores_the_fields_the_download_endpoint_requires():
+    ev = _ev()
+    ev["event"]["Message"] = {"documentMessage": dict(FULL_MEDIA_FIELDS)}
+    out = extract(ev, [])
+    att = out["attachment"]
+    assert att["type"] == "document" and att["downloadable"] is True
+    for field, value in FULL_MEDIA_FIELDS.items():
+        assert att[field] == value
+
+
+def test_image_message_missing_a_required_field_is_not_downloadable():
+    fields = dict(FULL_MEDIA_FIELDS)
+    del fields["mediaKey"]
+    ev = _ev()
+    ev["event"]["Message"] = {"imageMessage": fields}
+    out = extract(ev, [])
+    assert out["text"] == "[imagen]", "the placeholder must be unchanged"
+    att = out["attachment"]
+    assert att == {"type": "image", "downloadable": False}, \
+        "a partial field set must not leak any of the fields it did have"
+
+
+def test_image_message_with_no_fields_at_all_is_not_downloadable():
+    ev = _ev()
+    ev["event"]["Message"] = {"imageMessage": {}}
+    out = extract(ev, [])
+    assert out["attachment"] == {"type": "image", "downloadable": False}
+
+
+def test_location_message_is_never_downloadable():
+    ev = _ev()
+    ev["event"]["Message"] = {"locationMessage": {"degreesLatitude": 1.0}}
+    out = extract(ev, [])
+    assert out["text"] == "[ubicación]"
+    assert out["attachment"]["downloadable"] is False
+
+
+def test_contact_message_is_never_downloadable():
+    ev = _ev()
+    ev["event"]["Message"] = {"contactMessage": {"displayName": "x"}}
+    out = extract(ev, [])
+    assert out["text"] == "[contacto]"
+    assert out["attachment"]["downloadable"] is False
+
+
 if __name__ == "__main__":
     run(dict(globals()))
