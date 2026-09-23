@@ -1079,9 +1079,14 @@ Panel {
 
           RowLayout {
             spacing: Style.spacing.lg
-            // Visible only while the composer is still holding a raw
-            // idea (no draft yet). Enter is the shortcut for the exact
-            // same action, so neither is the only way to trigger it.
+            // Before a draft exists, the box could hold either a raw idea
+            // for Claude or the person's own finished message — the code
+            // cannot tell those apart, so the two actions are offered
+            // side by side and the person states which one this is.
+            // "Redactar" (unchanged): sends the typed text to `claude -p`
+            // and replaces the box with the draft. Enter is the shortcut
+            // for this same action, so neither is the only way to
+            // trigger it.
             Button {
               text: root.drafting ? "Redactando…" : "Redactar"
               foreground: root.contentForeground
@@ -1092,17 +1097,39 @@ Panel {
                        && composer.text.trim().length > 0
               onClicked: root.requestDraft(composer)
             }
+            // "Enviar tal cual": the direct path this task adds. Sends
+            // exactly what is typed, with no drafting step in between —
+            // for the case where what the person typed already is the
+            // message. Goes through the exact same doSend()/sendProc as
+            // every other send in this file, and carries every guard
+            // "Enviar" itself carries below (needsAck/acknowledged,
+            // sendBlocked, drafting, inFlight, non-blank text): this is a
+            // second door onto the one send path, not a second send path.
+            Button {
+              text: "Enviar tal cual"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              visible: root.draft === ""
+              enabled: composer.text.trim().length > 0
+                       && !root.sendBlocked
+                       && !root.drafting
+                       && !root.inFlight
+                       && (!root.needsAck || root.acknowledged)
+              onClicked: root.doSend(composer.text)
+            }
+            // Once a draft exists the distinction above collapses — the
+            // box holds a real message either way — so this is simply
+            // "Enviar", the same button/guards as always, just no longer
+            // needing the word "tal cual" to disambiguate it from a
+            // drafting action that isn't offered here anymore.
             Button {
               text: "Enviar"
               foreground: root.contentForeground
               fontFamily: root.contentFontFamily
               bordered: true
-              // Disabled until a draft exists: with a single composer
-              // box, the user's raw idea sits in this same field before
-              // drafting, so this guard is what stops "decile que estoy
-              // ocupado" from ever going out verbatim.
-              enabled: root.draft !== ""
-                       && composer.text.trim().length > 0
+              visible: root.draft !== ""
+              enabled: composer.text.trim().length > 0
                        && !root.sendBlocked
                        && !root.drafting
                        && !root.inFlight
