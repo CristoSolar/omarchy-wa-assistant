@@ -92,9 +92,13 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
         return False
 
     account_id = account["id"]
+    # "direction": "in" is an explicit mark, not something a reader is meant
+    # to infer from "from" — a contact can share the user's own display name,
+    # and the user's own second number writes to them too. bin/wa-reply
+    # writes the "out" half of the same ring after a confirmed send.
     store.append_context(data_dir, entry["jid"],
-                         {"from": entry["push_name"], "text": entry["text"],
-                          "ts": entry["ts"]}, account_id)
+                         {"direction": "in", "from": entry["push_name"],
+                          "text": entry["text"], "ts": entry["ts"]}, account_id)
     queue_entry = {
         "id": store.entry_id(account_id, entry["jid"]), "jid": entry["jid"],
         "account": account_id,

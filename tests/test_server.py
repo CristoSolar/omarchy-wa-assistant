@@ -56,6 +56,17 @@ def test_queued_message_also_lands_in_the_context_ring():
         assert len(ring) == 1 and ring[0]["text"] == "hola"
 
 
+def test_inbound_ring_entry_is_marked_with_an_explicit_direction():
+    # Task 1: every ring entry gets an explicit "in"/"out" mark rather than
+    # leaving direction to be guessed from "from" — a contact's display
+    # name is not a safe signal (it can equal the user's own name).
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(EV).encode(), "application/json", d)
+        ring = store.load_context(d, "56911111111@s.whatsapp.net", "personal")
+        assert ring[0]["direction"] == "in"
+
+
 def test_discarded_event_touches_nothing():
     with tmpdir() as d:
         _write_accounts(d, [PERSONAL])

@@ -18,6 +18,7 @@ construction, the same way the full-JID check closes writing to the wrong
 person.
 """
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -307,7 +308,22 @@ def clean_draft(raw: str) -> str:
 
 
 def build_prompt(agent_text, context, idea, push_name) -> str:
-    lines = [f"{c.get('from', '?')}: {c.get('text', '')}" for c in context]
+    """Render the stored ring for drafting, both sides distinguishable.
+
+    The speaker label comes from each entry's own "direction" mark ("in" vs
+    "out"), never from a name comparison — a contact can share the user's
+    own display name, so "does this look like the user" is not a safe test.
+    An entry with no "direction" at all (pre-extract history, or a ring
+    entry hand-crafted before this field existed) defaults to "in": the old
+    behaviour, which only ever saw inbound messages.
+    """
+    lines = []
+    for c in context:
+        if c.get("direction") == "out":
+            speaker = "Yo"
+        else:
+            speaker = c.get("from") or push_name or "?"
+        lines.append(f"{speaker}: {c.get('text', '')}")
     return (
         f"{agent_text}\n\n"
         f"Estás redactando una respuesta de WhatsApp para {push_name}.\n\n"
@@ -730,6 +746,19 @@ def cmd_send(args):
             print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
         elif _is_confirmed_sent(result):
             confirmed_sent = True
+            # The ring gains the outgoing half only now, after wuzapi has
+            # proven the message actually reached the recipient — never
+            # for a dry run (nothing was sent) and never for an "unknown"
+            # outcome (the except branch below; nobody knows if it
+            # arrived). The text recorded is exactly what send() sent
+            # (stripped the same way), not args.text verbatim, and the
+            # account/jid come from the resolved entry, the same single
+            # source every other identity decision in this script uses.
+            store.append_context(
+                d, entry["jid"],
+                {"direction": "out", "text": (args.text or "").strip(),
+                 "ts": datetime.datetime.now().isoformat()},
+                account["id"])
             fresh = _entry(d, entry["id"])
             if fresh is not None and fresh.get("ts") != ts_at_start:
                 store.set_status(d, entry["id"], "pending")

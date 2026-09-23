@@ -1351,5 +1351,114 @@ def test_tone_and_quick_settings_output_never_leaks_a_token_or_another_account()
                 "a request scoped to 'personal' must not mention the other account"
 
 
+# --- Task 1: the ring gains the outgoing half, marked by direction -----
+
+
+def test_a_confirmed_send_appends_the_outgoing_text_to_the_ring():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        original, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
+        try:
+            out = _run_cmd_send(d, entry["id"], text="dale, nos vemos")
+        finally:
+            wa.send = original
+        assert out == {"ok": True, "dry_run": False}
+        ring = store.load_context(d, entry["jid"], entry["account"])
+        assert len(ring) == 1
+        assert ring[0]["direction"] == "out"
+        assert ring[0]["text"] == "dale, nos vemos"
+
+
+def test_a_dry_run_writes_nothing_to_the_ring():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        original, wa.send = wa.send, lambda jid, text, token: {"dry_run": True,
+                                                               "jid": jid,
+                                                               "text": text}
+        try:
+            _run_cmd_send(d, entry["id"], text="no debería quedar")
+        finally:
+            wa.send = original
+        assert store.load_context(d, entry["jid"], entry["account"]) == [], \
+            "a dry run never touched the network, so the ring must stay empty"
+
+
+def test_an_unknown_outcome_writes_nothing_to_the_ring():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+
+        def _timeout(jid, text, token):
+            raise wa.SendOutcomeUnknown("timed out waiting for wuzapi")
+
+        original, wa.send = wa.send, _timeout
+        try:
+            _run_cmd_send(d, entry["id"], text="no se sabe si llegó")
+        finally:
+            wa.send = original
+        assert store.load_context(d, entry["jid"], entry["account"]) == [], \
+            "an unconfirmed outcome must never be recorded as a sent message"
+
+
+def test_the_ring_cap_of_ten_holds_counting_both_directions():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        original, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
+        try:
+            for i in range(12):
+                # A fresh inbound message keeps the entry present for the
+                # next send (a confirmed send removes it otherwise).
+                store.upsert_queue(d, {**entry, "text": f"in{i}",
+                                       "ts": f"2026-09-22T10:{i:02d}:00"})
+                store.append_context(d, entry["jid"], {"direction": "in",
+                                     "from": "Ana", "text": f"in{i}"}, entry["account"])
+                _run_cmd_send(d, entry["id"], text=f"out{i}")
+        finally:
+            wa.send = original
+        ring = store.load_context(d, entry["jid"], entry["account"])
+        assert len(ring) == 10, "the cap must hold across both directions combined"
+
+
+def test_build_prompt_speaker_comes_from_the_direction_mark_not_the_name():
+    # The near-miss this whole task exists to close: a contact called
+    # exactly the same as the user (or the user's own second number
+    # writing in) must never be read as "the user" from free text.
+    context = [
+        {"direction": "in", "from": "Cristo Solar", "text": "hola, soy yo"},
+        {"direction": "out", "text": "hola! todo bien"},
+    ]
+    p = wa.build_prompt("tono", context, "idea", "Cristo Solar")
+    assert "Cristo Solar: hola, soy yo" in p
+    assert "Yo: hola! todo bien" in p
+    assert "Cristo Solar: hola! todo bien" not in p, \
+        "an outgoing message must never be labelled with the contact's name"
+
+
+def test_build_prompt_renders_both_sides_distinguishably():
+    context = [
+        {"direction": "in", "from": "Ana", "text": "podes el martes?"},
+        {"direction": "out", "text": "dale, nos vemos el martes"},
+        {"direction": "in", "from": "Ana", "text": "genial, gracias"},
+    ]
+    p = wa.build_prompt("tono", context, "decile que confirme", "Ana")
+    lines = p.splitlines()
+    speakers = [l.split(":", 1)[0] for l in lines
+                if l.startswith("Ana:") or l.startswith("Yo:")]
+    assert speakers == ["Ana", "Yo", "Ana"], \
+        "the three messages must render in order, each labelled by its own side"
+
+
+def test_build_prompt_defaults_a_directionless_entry_to_inbound():
+    # Pre-extract history (or a hand-built ring) may carry no "direction"
+    # field at all; it must still render, on the inbound side, rather than
+    # crash or silently disappear.
+    context = [{"from": "Ana", "text": "podes el martes?"}]
+    p = wa.build_prompt("tono", context, "idea", "Ana")
+    assert "Ana: podes el martes?" in p
+
+
 if __name__ == "__main__":
     run(dict(globals()))
