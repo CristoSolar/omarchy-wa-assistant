@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# bin/wa-unlink <account-id> — remove an account completely.
+#
+# Logs the session out of wuzapi, removes the account's entry from
+# accounts.json, its token from secrets.env, its context ring under
+# ctx/<id>/, and discards its queue entries. Other accounts are untouched.
+#
+# Queue entries are DISCARDED, not preserved: bin/wa-reply refuses any
+# entry whose `account` is not in accounts.json (see UnknownAccount there),
+# so once this account is gone those entries could never be answered and
+# could never be cleared — visible, permanent, useless. Discarding them is
+# the honest outcome. The caller is expected to show the count first (see
+# --count-only below) and ask for a typed confirmation before running this
+# for real.
+#
+# --json is additive, exactly like bin/wa-pair's --json: one JSON object
+# per line, human mode unchanged and still the default. See
+# docs/superpowers/specs/2026-09-23-settings-ui-design.md.
+#
+# --count-only is a second, additive mode: it reports how many queue
+# entries THIS invocation would discard, and changes nothing at all. The
+# settings screen needs this number at the moment it asks for the typed
+# confirmation, not one cached from when the screen opened (an entry can
+# arrive at any time), so it must be askable on its own, separately from
+# actually unlinking.
+#
+# --- Ordering: the hard part -----------------------------------------------
+#
+# This project has already lost data once to a migration step that ran
+# twice and destroyed what an earlier partial run had created
+# (sink/store.py's migrate_single_account carries the fix and the lesson).
+# The order below is chosen so a crash between ANY two steps leaves a state
+# a re-run converges from, never one it worsens:
+#
+#   1. Log out of wuzapi, using the account's token while it still exists.
+#      This is the one step that is not local and not reversible by
+#      re-running: once the token is gone, nothing can identify the
+#      session to log it out later. It must run FIRST, while the
+#      credential that authenticates it is still there. It is also the one
+#      step this script cannot make idempotent by itself — wuzapi is
+#      expected to treat logging out an already-logged-out session as a
+#      no-op the way it treats other repeat calls, and a wuzapi that
+#      cannot be reached must not block the rest: leaving a local account
+#      permanently un-removable because a container is down is worse than
+#      a session that stays logged in on a wuzapi we cannot currently
+#      reach. Attempted best-effort; the outcome is reported, never
+#      assumed.
+#   2. Remove the accounts.json entry. This is the COMMIT POINT: once it
+#      is gone, bin/wa-reply already treats every queue entry for this id
+#      as UnknownAccount, and the settings screen already stops listing
+#      it. Doing this right after logout — before the token is touched —
+#      is what rules out the specific bad state called out in the task:
+#      a token gone but the account still listed, which makes wa-reply
+#      report the wrong, misleading error (MissingToken, "re-pair this")
+#      instead of the right one (UnknownAccount, "this account is gone").
+#   3. Remove the token from secrets.env.
+#   4. Remove the context ring (ctx/<id>/).
+#   5. Discard the queue entries for this account.
+#
+# Steps 3-5 are pure local file operations, each independently idempotent
+# (removing something already gone is a no-op), and their order among
+# themselves does not matter for correctness — only that they all happen
+# after step 2, so a crash before step 2 finishes never lets any of them
+# run while wa-reply might still treat the account as configured.
+#
+# What a crash between each pair of steps leaves, and why a re-run
+# converges rather than worsens it:
+#
+#   before 1: nothing has happened. A re-run starts over. Safe.
+#   between 1 and 2: wuzapi may be logged out already; accounts.json,
+#     secrets.env, ctx/ and the queue are untouched. A re-run repeats step
+#     1 (a harmless repeat of a logout) and proceeds. No data lost.
+#   between 2 and 3: the account is gone from accounts.json (queue entries
+#     for it are already honestly refused as UnknownAccount, and the
+#     settings screen already stops listing it), but the token, ctx ring
+#     and queue entries are still on disk. A re-run finds no accounts.json
+#     entry, infers the account was already removed (never re-attempts
+#     logout — it cannot, the entry that named the wuzapi user is gone,
+#     and step 2 only ever runs after step 1 was attempted), and resumes
+#     at step 3. No data lost, nothing double-removed.
+#   between 3 and 4: token gone (harmless: the account is already gone
+#     from accounts.json too, so this never presents as the misleading
+#     "missing token" case). A re-run finds no token line to remove
+#     (no-op) and resumes at step 4.
+#   between 4 and 5: ctx ring gone. A re-run finds no ctx dir (no-op) and
+#     resumes at step 5.
+#   after 5: fully unlinked. A re-run finds no trace of the account at all
+#     and refuses cleanly, exactly like an account that never existed —
+#     which, at that point, is what it is. This is the same check used to
+#     refuse a genuinely-never-configured id: "no trace anywhere" is what
+#     "does not exist" means, and it is indistinguishable from, and
+#     correctly treated the same as, "already fully unlinked".
+#
+# The last account can be unlinked the same way: accounts.json becomes
+# `[]`, which sink.accounts.load() and bin/wa-status already treat as a
+# valid, empty, configured state.
+set -uo pipefail
+
+JSON_MODE=0
+COUNT_ONLY=0
+ARGS=()
+for _arg in "$@"; do
+  case "$_arg" in
+    --json) JSON_MODE=1 ;;
+    --count-only) COUNT_ONLY=1 ;;
+    *) ARGS+=("$_arg") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
+# --- --json event emission, same mechanism as bin/wa-pair -------------------
+JSON_TERMINAL_EMITTED=0
+
+emit_json() {
+  (( JSON_MODE )) || return 0
+  python3 -c '
+import json, sys
+obj = {"event": sys.argv[1]}
+for kv in sys.argv[2:]:
+    k, v = kv.split("=", 1)
+    if v in ("true", "false"):
+        obj[k] = (v == "true")
+    else:
+        try:
+            obj[k] = int(v)
+        except ValueError:
+            obj[k] = v
+print(json.dumps(obj), flush=True)
+' "$@"
+}
+
+emit_terminal() {
+  # Only latch once the emission actually reached stdout — see wa-pair's
+  # emit_terminal for why a latch set before a possibly-failed emit_json
+  # would let the EXIT trap wrongly believe a terminal event went out.
+  if emit_json "$@"; then
+    JSON_TERMINAL_EMITTED=1
+  fi
+}
+
+on_exit() {
+  local code=$?
+  if (( JSON_MODE )) && (( ! JSON_TERMINAL_EMITTED )); then
+    if (( code == 0 )); then
+      printf '%s\n' '{"event":"done"}'
+    else
+      printf '{"event":"error","reason":"wa-unlink exited unexpectedly (exit code %d)","fatal":true}\n' "$code"
+    fi
+  fi
+  exit "$code"
+}
+trap on_exit EXIT
+
+ACCOUNT_ID="${1:?usage: wa-unlink [--json] [--count-only] <account-id>}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
+SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
+DATA="${WA_DATA_DIR:-$STATE/state}"
+API="${WA_API:-http://127.0.0.1:8080}"
+
+# The account id is validated in exactly one place — accounts.validate_id
+# — reached the same way bin/wa-pair reaches it: through
+# `wa-reply token-var`, never re-derived here.
+if (( JSON_MODE )); then
+  TOKEN_VAR_ERR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID" 2>&1 >/dev/null) || true
+fi
+TOKEN_VAR=$("$ROOT/bin/wa-reply" token-var "$ACCOUNT_ID") || {
+  emit_terminal error reason="${TOKEN_VAR_ERR:-invalid account id: $ACCOUNT_ID}" fatal=true
+  exit 1
+}
+
+emit_json validating account="$ACCOUNT_ID"
+
+# One inspection pass, read-only: what exists right now for this account.
+# Printed as a single line so bash can read it back without a second
+# process per field. Never mutates anything — --count-only stops right
+# after this, and the real unlink path uses it only to decide what still
+# needs doing (see the ordering notes above for why "not in accounts.json"
+# does not by itself mean "nothing to do").
+INSPECT_OUT=$(python3 -c '
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sink import accounts, store
+
+data_dir, secrets_path, account_id, token_var = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+
+accts = accounts.load(data_dir)
+found = accounts.by_id(accts, account_id) is not None
+
+token_present = False
+try:
+    for line in Path(secrets_path).read_text().splitlines():
+        s = line.strip()
+        if s.startswith(f"{token_var}=") and "=" in s:
+            token_present = True
+except FileNotFoundError:
+    pass
+
+ctx_present = (Path(data_dir) / "ctx" / account_id).is_dir()
+
+queue = store.load_queue(data_dir)
+queue_count = sum(1 for e in queue if e.get("account") == account_id)
+
+print(int(found), int(token_present), int(ctx_present), queue_count)
+' "$ROOT" "$DATA" "$SECRETS" "$ACCOUNT_ID" "$TOKEN_VAR") || {
+  emit_terminal error reason="could not inspect state for $ACCOUNT_ID: $INSPECT_OUT" fatal=true
+  exit 1
+}
+read -r FOUND TOKEN_PRESENT CTX_PRESENT QUEUE_COUNT <<<"$INSPECT_OUT"
+
+if (( COUNT_ONLY )); then
+  emit_terminal count account="$ACCOUNT_ID" pending="$QUEUE_COUNT"
+  (( JSON_MODE )) || echo "$QUEUE_COUNT"
+  exit 0
+fi
+
+if (( ! FOUND )) && (( ! TOKEN_PRESENT )) && (( ! CTX_PRESENT )) && (( QUEUE_COUNT == 0 )); then
+  # No trace anywhere: either this id was never configured, or it was
+  # already fully unlinked by an earlier, completed run. Either way there
+  # is nothing to do, and nothing has been changed by getting here.
+  MSG="account '$ACCOUNT_ID' is not configured and has no trace to remove; nothing was changed"
+  (( JSON_MODE )) || echo "wa-unlink: $MSG" >&2
+  emit_terminal error reason="$MSG" fatal=true
+  exit 1
+fi
+
+if (( FOUND )); then
+  if (( TOKEN_PRESENT )); then
+    # shellcheck disable=SC1090
+    source "$SECRETS"
+    TOKEN_VALUE="${!TOKEN_VAR:-}"
+  else
+    TOKEN_VALUE=""
+  fi
+
+  if [[ -n "$TOKEN_VALUE" ]]; then
+    # Best-effort: see the ordering comment above for why an unreachable
+    # wuzapi must not block the rest of this script. The outcome is
+    # reported, never assumed — a caller that cares can check `ok`.
+    LOGOUT_HTTP=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      -X POST "$API/session/logout" -H "token: $TOKEN_VALUE" 2>/dev/null || echo "000")
+    if [[ "$LOGOUT_HTTP" == "200" || "$LOGOUT_HTTP" == "201" ]]; then
+      (( JSON_MODE )) || echo "wuzapi session logged out for $ACCOUNT_ID"
+      emit_json logged_out ok=true
+    else
+      (( JSON_MODE )) || echo "wa-unlink: could not confirm wuzapi logout for $ACCOUNT_ID (HTTP $LOGOUT_HTTP); continuing with local cleanup anyway" >&2
+      emit_json logged_out ok=false http="$LOGOUT_HTTP"
+    fi
+  else
+    (( JSON_MODE )) || echo "wa-unlink: no token on file for $ACCOUNT_ID; nothing to log out, continuing" >&2
+    emit_json logged_out ok=false reason="no token on file"
+  fi
+
+  # The commit point: from here on, wa-reply already refuses this
+  # account's queue entries as unknown, and the settings screen already
+  # stops listing it, even though secrets.env/ctx/queue may still have
+  # residue for a moment.
+  python3 -c '
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sink import accounts, store
+
+data_dir, account_id = sys.argv[2], sys.argv[3]
+path = Path(data_dir) / "accounts.json"
+remaining = [a for a in accounts.load(data_dir) if a.get("id") != account_id]
+store.atomic_write(path, json.dumps(remaining, ensure_ascii=False))
+' "$ROOT" "$DATA" "$ACCOUNT_ID"
+  (( JSON_MODE )) || echo "accounts.json: removed $ACCOUNT_ID"
+  emit_json account_removed account="$ACCOUNT_ID"
+fi
+
+# From here on, every step is a pure local removal, idempotent on its own:
+# a re-run after a crash inside any one of these just finds nothing left
+# to remove and moves to the next.
+
+python3 -c '
+import sys
+from pathlib import Path
+token_var, secrets_path = sys.argv[1], sys.argv[2]
+p = Path(secrets_path)
+try:
+    lines = p.read_text().splitlines()
+except FileNotFoundError:
+    sys.exit(0)
+kept = [ln for ln in lines if not ln.strip().startswith(f"{token_var}=")]
+if kept != lines:
+    text = "\n".join(kept)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    tmp = p.with_suffix(p.suffix + ".tmp-wa-unlink")
+    tmp.write_text(text)
+    tmp.chmod(0o600)
+    tmp.replace(p)
+' "$TOKEN_VAR" "$SECRETS"
+(( JSON_MODE )) || echo "secrets.env: removed $TOKEN_VAR"
+emit_json token_removed account="$ACCOUNT_ID"
+
+python3 -c '
+import shutil, sys
+from pathlib import Path
+data_dir, account_id = sys.argv[1], sys.argv[2]
+shutil.rmtree(Path(data_dir) / "ctx" / account_id, ignore_errors=True)
+' "$DATA" "$ACCOUNT_ID"
+(( JSON_MODE )) || echo "ctx/$ACCOUNT_ID: removed"
+emit_json context_removed account="$ACCOUNT_ID"
+
+DISCARDED=$(python3 -c '
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from sink import store
+
+data_dir, account_id = sys.argv[2], sys.argv[3]
+queue = store.load_queue(data_dir)
+kept = [e for e in queue if e.get("account") != account_id]
+discarded = len(queue) - len(kept)
+store.atomic_write(Path(data_dir) / "queue.json", json.dumps(kept, ensure_ascii=False))
+print(discarded)
+' "$ROOT" "$DATA" "$ACCOUNT_ID")
+(( JSON_MODE )) || echo "queue: discarded $DISCARDED entrie(s) for $ACCOUNT_ID"
+emit_json queue_discarded rows="$DISCARDED"
+
+(( JSON_MODE )) || echo "wa-unlink: $ACCOUNT_ID fully unlinked; $DISCARDED queue entrie(s) discarded"
+emit_terminal done discarded="$DISCARDED"
+exit 0
