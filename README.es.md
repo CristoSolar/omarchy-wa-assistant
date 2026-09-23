@@ -353,6 +353,23 @@ punto de haberlas separado: `WA_STATE_ROOT` (la raíz de arriba),
 Si venías de una versión anterior, `wa-up` mueve `queue.json`,
 `config.json` y `ctx/` adentro de `state/` en la próxima corrida.
 
+El sink corre como **tu** usuario (`--user "$(id -u):$(id -g)"`), no como
+root, así que todo lo que escribe en `state/` queda legible para vos.
+Versiones anteriores corrían el sink como root, lo que dejaba `queue.json`
+y demás archivos con dueño root e ilegibles para vos — la cola tenía
+mensajes reales pero `wa-reply list`, `wa-status` y el panel reportaban
+todo vacío, porque un error de permisos y una cola vacía se veían
+idénticos. `wa-up` ahora detecta archivos de estado que no puede leer como
+tu usuario y repara el dueño automáticamente antes de (re)iniciar nada; si
+no puede (por ejemplo, si Docker no responde), imprime el comando exacto
+para correr a mano y se niega a arrancar en vez de dejar una instalación
+rota corriendo. Si esto vuelve a pasar, un estado ilegible o corrupto
+ahora lo dice a los gritos en vez de reportar cero en silencio: `wa-reply
+list` imprime `{"error": "..."}` (nunca un `[]` a secas) y sale con código
+distinto de cero, `wa-status` reporta `ok: false` (que el widget de la
+barra muestra como `WA ✕`), y el panel muestra un aviso rojo en vez de una
+lista vacía.
+
 Para borrar todo y empezar de cero:
 
 ```sh

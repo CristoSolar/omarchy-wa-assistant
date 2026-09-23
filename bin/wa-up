@@ -19,6 +19,35 @@ DATA="${WA_DATA_DIR:-$STATE/state}"
 mkdir -p "$DATA/ctx" "$STATE/wuzdata"
 chmod 700 "$STATE" "$DATA"
 
+# The sink used to run as root (uid 0) inside the container. Its bind
+# mounts are the invoking user's directories, so everything it wrote —
+# queue.json, ctx/*.json, config.json — landed root-owned. `tempfile.
+# mkstemp` also makes new files mode 0600, so the invoking user (uid 1000)
+# could not even read them: `wa-reply list` printed `[]`, `wa-status` said
+# `pending: 0`, and the widget stayed hidden, all while the sink was
+# working correctly. The sink now runs as the invoking user (see the
+# `docker run --user` below), but an existing install may still have
+# root-owned files left over from before this fix. Detect and repair those
+# now, before anything is (re)started, instead of silently leaving a
+# broken install running.
+mapfile -t UNREADABLE < <(find "$DATA" "$STATE/wuzdata" -type f \
+  \( ! -readable -o ! -writable \) 2>/dev/null)
+if [[ ${#UNREADABLE[@]} -gt 0 ]]; then
+  echo "found ${#UNREADABLE[@]} state file(s) not readable/writable by " \
+       "$(id -u):$(id -g) — likely root-owned from a sink that ran as root " \
+       "before this fix. Repairing..." >&2
+  if docker run --rm -v "$DATA:/state" -v "$STATE/wuzdata:/wuzdata" \
+       python:3.12-alpine chown -R "$(id -u):$(id -g)" /state /wuzdata \
+       >/dev/null 2>&1; then
+    echo "repaired ownership of $DATA and $STATE/wuzdata" >&2
+  else
+    echo "could not repair automatically. Run this yourself, then re-run wa-up:" >&2
+    echo "  docker run --rm -v \"$DATA:/state\" -v \"$STATE/wuzdata:/wuzdata\" \\" >&2
+    echo "    python:3.12-alpine chown -R \$(id -u):\$(id -g) /state /wuzdata" >&2
+    exit 1
+  fi
+fi
+
 # Migrate the pre-split layout, where the sink-visible files sat next to
 # secrets.env at the state root.
 for f in queue.json config.json; do
@@ -72,7 +101,17 @@ docker run -d --name omarchy-wuzapi --network omarchy-wa \
   -v "$STATE/wuzdata:/app/dbdata" \
   omarchy-wuzapi >/dev/null
 
+# Run as the invoking user, not root: /state and /wuzdata are bind mounts
+# of the host directories created above (owned by the invoking user), and
+# a root sink writing into them is what produced files the host user could
+# not read in the first place. python:3.12-alpine has no /etc/passwd entry
+# for an arbitrary uid, so it has no home directory ($HOME comes back as
+# "/" and Path.home() does not raise — sink/store.py never reaches it
+# anyway, since WA_DATA_DIR and WA_SECRETS_FILE are always set below) and
+# no username (`id` shows the uid, `whoami` fails) — neither is used by
+# anything under sink/.
 docker run -d --name omarchy-wa-sink --network omarchy-wa \
+  --user "$(id -u):$(id -g)" \
   -e WA_DATA_DIR=/state \
   -e WA_WUZAPI_DB=/wuzdata/users.db \
   -v "$DATA:/state" \

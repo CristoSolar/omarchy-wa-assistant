@@ -50,6 +50,27 @@ def secrets_path() -> Path:
     return Path(os.environ.get("WA_SECRETS_FILE", state_root() / "secrets.env"))
 
 
+class StoreReadError(Exception):
+    """A state file exists but could not be read as JSON.
+
+    Deliberately distinct from "the file is missing": a missing file is a
+    legitimate empty state (first run, nothing queued yet) and must stay
+    silent. This is the opposite case — the file is there and something is
+    wrong with it (permissions, corruption) — and the caller must not treat
+    it as "no state". This is the failure this project shipped once
+    already: `wa-reply list` printed a confident `[]`, `wa-status` said
+    `pending: 0`, and nothing told the user their queue was unreadable.
+    Every read_json caller either lets this propagate somewhere the user
+    will see it, or turns it into an explicit loud signal — none of them
+    may swallow it back into a default.
+    """
+
+    def __init__(self, path, reason: str):
+        self.path = Path(path)
+        self.reason = reason
+        super().__init__(f"cannot read {self.path}: {reason}")
+
+
 def atomic_write(path, text: str) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,12 +87,26 @@ def atomic_write(path, text: str) -> None:
 
 
 def read_json(path, default):
-    # A missing or corrupt file is not fatal: the queue is best-effort and
-    # ZapZap still holds the real messages.
+    # A MISSING file is not fatal and must stay silent: the queue is
+    # best-effort, ZapZap still holds the real messages, and a first run
+    # with no state at all yet is a legitimate empty state.
+    #
+    # A file that EXISTS but cannot be read (permissions, most notably a
+    # root-owned state file the invoking user cannot open) or that exists
+    # and is not valid JSON (corruption) is a broken install, not an empty
+    # one — raise StoreReadError so it can never be mistaken for the
+    # former.
+    path = Path(path)
     try:
-        return json.loads(Path(path).read_text())
-    except (OSError, ValueError):
+        text = path.read_text()
+    except FileNotFoundError:
         return default
+    except OSError as exc:
+        raise StoreReadError(path, str(exc)) from exc
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        raise StoreReadError(path, f"invalid JSON: {exc}") from exc
 
 
 def load_config(d) -> dict:

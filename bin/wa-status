@@ -1,16 +1,36 @@
 #!/usr/bin/env bash
 # bin/wa-status — one JSON line for the bar widget.
 set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STATE="${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}"
 SECRETS="${WA_SECRETS_FILE:-$STATE/secrets.env}"
 DATA="${WA_DATA_DIR:-$STATE/state}"
-# The path goes in as an argument, not interpolated into the source: a
-# state directory containing a quote would otherwise break the program.
-PENDING=$(python3 -c '
+# Go through sink.store (not a hand-rolled json.load) so a queue.json that
+# EXISTS but cannot be read (permissions — the root-owned-state bug — or
+# corruption) is told apart from "no queue yet". A missing file must stay
+# silent (pending: 0, queue_ok: true); an unreadable/corrupt one must not,
+# because the widget uses `ok` to decide whether to show the healthy state,
+# and "pending: 0" on a broken install is exactly the lie that made the
+# whole product look dead while it was working.
+STATUS_JSON=$(python3 - "$ROOT" "$DATA" <<'PY'
 import json, sys
-try: print(len(json.load(open(sys.argv[1]))))
-except Exception: print(0)
-' "$DATA/queue.json")
+sys.path.insert(0, sys.argv[1])
+from sink import store
+
+d = sys.argv[2]
+try:
+    queue = store.load_queue(d)
+    print(json.dumps({"pending": len(queue), "queue_ok": True}))
+except store.StoreReadError as exc:
+    print(f"wa-status: {exc}", file=sys.stderr)
+    print(f"wa-status: fix with: docker exec omarchy-wa-sink chown -R "
+          f"$(id -u):$(id -g) /state   (or re-run wa-up, which now detects "
+          f"and repairs this)", file=sys.stderr)
+    print(json.dumps({"pending": 0, "queue_ok": False, "queue_error": str(exc)}))
+PY
+)
+PENDING=$(echo "$STATUS_JSON" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending'])")
+QUEUE_OK=$(echo "$STATUS_JSON" | python3 -c "import json,sys; print('true' if json.load(sys.stdin)['queue_ok'] else 'false')")
 # shellcheck disable=SC1090
 if [[ -f "$SECRETS" ]]; then source "$SECRETS"; fi
 ST=$(curl -s --max-time 3 http://127.0.0.1:8080/session/status -H "token: ${WA_TOKEN:-}" || echo '{}')
@@ -19,5 +39,10 @@ import json,sys
 try: print('true' if json.load(sys.stdin)['data']['loggedIn'] else 'false')
 except Exception: print('false')
 ")
-OK=$([[ "$ST" == "{}" || -z "$ST" ]] && echo false || echo true)
+BRIDGE_OK=$([[ "$ST" == "{}" || -z "$ST" ]] && echo false || echo true)
+if [[ "$QUEUE_OK" == "false" ]]; then
+  OK=false
+else
+  OK=$BRIDGE_OK
+fi
 echo "{\"ok\": $OK, \"logged_in\": $LOGGED, \"pending\": $PENDING}"

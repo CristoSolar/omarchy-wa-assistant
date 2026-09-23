@@ -336,6 +336,21 @@ is never derived from `WA_DATA_DIR`.
 If you installed an earlier version, `wa-up` moves `queue.json`,
 `config.json` and `ctx/` down into `state/` for you on the next run.
 
+The sink runs as **your** user (`--user "$(id -u):$(id -g)"`), not root, so
+whatever it writes under `state/` is readable by you. Earlier versions ran
+the sink as root, which left `queue.json` and friends root-owned and
+unreadable by you — the queue was full but `wa-reply list`, `wa-status`
+and the panel all reported it as empty, because a permission error and an
+empty queue looked identical. `wa-up` now detects state files it can't
+read as your user and repairs their ownership automatically before
+(re)starting anything; if it can't (e.g. Docker itself isn't reachable),
+it prints the exact command to run by hand and refuses to start rather
+than leave a broken install running. If you ever see this again, unreadable
+or corrupt state now says so loudly instead of quietly reporting zero:
+`wa-reply list` prints `{"error": "..."}` (never a bare `[]`) and exits
+non-zero, `wa-status` reports `ok: false` (which the bar widget shows as
+`WA ✕`), and the panel shows a red banner instead of an empty list.
+
 To wipe everything and start clean:
 
 ```sh

@@ -275,7 +275,24 @@ def main():
                         "unconfirmed ('unknown') send; required to retry one")
     p.set_defaults(fn=cmd_send)
     args = ap.parse_args()
-    args.fn(args)
+    try:
+        args.fn(args)
+    except store.StoreReadError as exc:
+        # A state file exists but could not be read (permissions, usually a
+        # root-owned queue.json from before the sink ran as the invoking
+        # user) or is not valid JSON. This is a broken install, not an
+        # empty queue, and must never look like one: `list` must not print
+        # a bare `[]` (Panel.qml would render that as an empty queue) and
+        # `draft`/`send` must not look like a normal empty result either.
+        # Say so on stderr, where a human running this by hand will see
+        # it, and print a JSON object (never an array, never blank) so
+        # nothing downstream can mistake this for "nothing queued".
+        print(f"wa-reply: {exc}", file=sys.stderr)
+        print(f"wa-reply: fix with: docker exec omarchy-wa-sink chown -R "
+              f"$(id -u):$(id -g) /state   (or re-run wa-up, which now "
+              f"detects and repairs this)", file=sys.stderr)
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        sys.exit(1)
 
 
 if __name__ == "__main__":

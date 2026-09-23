@@ -31,10 +31,40 @@ def test_missing_queue_file_reads_as_empty():
         assert store.load_queue(d) == []
 
 
-def test_corrupt_queue_file_reads_as_empty():
+def test_corrupt_queue_file_raises_instead_of_reading_as_empty():
+    # A file that EXISTS but is not valid JSON is a broken install, not an
+    # empty queue — this is defect 2: read_json used to swallow this into
+    # the same default as "no queue yet", so `wa-reply list` printed a
+    # confident `[]` for a corrupt file. It must raise instead.
     with tmpdir() as d:
         (d / "queue.json").write_text("{not json")
-        assert store.load_queue(d) == []
+        try:
+            store.load_queue(d)
+            assert False, "expected StoreReadError for invalid JSON"
+        except store.StoreReadError as exc:
+            assert "queue.json" in str(exc)
+
+
+def test_unreadable_queue_file_raises_instead_of_reading_as_empty():
+    # A file that EXISTS but cannot be opened (permissions — the root-owned
+    # state file from defect 1) must be told apart from "no queue yet" too.
+    import os
+    with tmpdir() as d:
+        p = d / "queue.json"
+        p.write_text("[]")
+        os.chmod(p, 0o000)
+        try:
+            if os.access(p, os.R_OK):
+                # Running as root (or some other setup where permission bits
+                # don't apply): nothing to test here.
+                return
+            try:
+                store.load_queue(d)
+                assert False, "expected StoreReadError for an unreadable file"
+            except store.StoreReadError as exc:
+                assert "queue.json" in str(exc)
+        finally:
+            os.chmod(p, 0o600)
 
 
 def test_context_ring_stops_at_ten():

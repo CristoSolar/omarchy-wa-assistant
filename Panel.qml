@@ -21,6 +21,11 @@ PopupWindow {
     // from a snapshot taken when it was clicked.
     property var current: null
     property string currentId: ""
+    // Set when `wa-reply list` reports it could not read the queue (a
+    // broken install — permissions, corruption — never "nothing queued").
+    // Kept apart from a genuinely empty `entries: []`, which must render
+    // as a quiet empty panel, not as this banner.
+    property string storeError: ""
     property string draft: ""
     property string status: ""
     // The status line turns to a warning color for any outcome that is
@@ -116,7 +121,22 @@ PopupWindow {
     function refresh() {
         run(["list"], function (out) {
             var list = []
-            try { list = JSON.parse(out) } catch (e) { list = [] }
+            var parsed = null
+            try { parsed = JSON.parse(out) } catch (e) { parsed = null }
+            if (Array.isArray(parsed)) {
+                list = parsed
+                panel.storeError = ""
+            } else if (parsed && parsed.error) {
+                // Broken install: `wa-reply list` refused to guess. Do not
+                // fall back to an empty list silently — that is exactly
+                // the bug this replaces (a permission error on queue.json
+                // used to look identical to "no messages").
+                list = []
+                panel.storeError = parsed.error
+            } else {
+                list = []
+                panel.storeError = "wa-reply list dio una respuesta inesperada"
+            }
             panel.entries = list
             // Re-resolve the open entry against what is now on disk, so the
             // detail view reflects the stored status (and any newer message
@@ -141,6 +161,22 @@ PopupWindow {
         Text {
             text: panel.current ? panel.current.push_name : "Pendientes"
             color: "#e6e6e6"; font.pixelSize: 15; font.bold: true
+        }
+
+        Rectangle {
+            visible: panel.storeError !== "" && !panel.current
+            Layout.fillWidth: true
+            implicitHeight: storeErrorText.implicitHeight + 12
+            color: "#3a2a2c"; radius: 4
+            border.color: "#e06c75"; border.width: 1
+            Text {
+                id: storeErrorText
+                anchors.left: parent.left; anchors.right: parent.right
+                anchors.top: parent.top; anchors.margins: 6
+                text: "⚠ No se pudo leer la cola: " + panel.storeError
+                color: "#e6e6e6"; font.pixelSize: 11
+                wrapMode: Text.Wrap
+            }
         }
 
         ListView {
