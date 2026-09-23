@@ -117,7 +117,14 @@ fi
 
 docker rm -f omarchy-wuzapi omarchy-wa-sink >/dev/null 2>&1 || true
 
+# --restart unless-stopped: bring both containers back after a crash or a
+# host reboot without needing wa-up run by hand. Not `always` — this stack
+# holds a live link to the person's personal WhatsApp session, so a
+# deliberate `docker stop` must stay stopped, not resurrect itself on the
+# next boot. This alone does not bring the stack back after a reboot
+# unless the Docker daemon itself is enabled at boot (see the README).
 docker run -d --name omarchy-wuzapi --network omarchy-wa \
+  --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -e WUZAPI_ADMIN_TOKEN="$WUZAPI_ADMIN_TOKEN" \
   -e WUZAPI_GLOBAL_ENCRYPTION_KEY="$WUZAPI_GLOBAL_ENCRYPTION_KEY" \
@@ -137,6 +144,7 @@ docker run -d --name omarchy-wuzapi --network omarchy-wa \
 # no username (`id` shows the uid, `whoami` fails) — neither is used by
 # anything under sink/.
 docker run -d --name omarchy-wa-sink --network omarchy-wa \
+  --restart unless-stopped \
   --user "$(id -u):$(id -g)" \
   -e WA_DATA_DIR=/state \
   -e WA_WUZAPI_DB=/wuzdata/users.db \

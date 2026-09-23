@@ -99,6 +99,43 @@ starts both containers (`omarchy-wuzapi` and `omarchy-wa-sink`) on a private
 Docker network called `omarchy-wa`. Only `omarchy-wuzapi`'s port is
 published, and only to `127.0.0.1`.
 
+## Surviving restarts
+
+Both containers are started with `--restart unless-stopped`, so a crash
+brings them back on their own, and Docker's restart handling and the
+`omarchy-wa` network's own name resolution converge regardless of which
+container comes back first — `omarchy-wuzapi` and `omarchy-wa-sink` don't
+need to start in any particular order to find each other by name.
+
+That covers the containers coming back up. It does **not** cover a
+`docker`-level restart of `omarchy-wuzapi` staying able to *deliver*
+messages: wuzapi keeps its webhook registration in memory, and a restart
+(crash, OOM, reboot) drops it even though `GET /webhook` still shows it
+set in the database. The only thing that re-asserts it is `wa-up`'s own
+self-heal step, which runs when you (or something) executes `wa-up` — not
+automatically when Docker restarts the container on its own. If wuzapi
+gets restarted outside of `wa-up` (a crash, a reboot with Docker enabled
+at boot — see below), run `./bin/wa-up` again once to reassert the
+webhook and confirm delivery is really working, rather than assuming
+`unless-stopped` alone put you back in a working state.
+
+`--restart unless-stopped` (not `always`) is deliberate: this stack holds
+a live link to your personal WhatsApp session, so a `docker stop` you did
+on purpose must stay stopped, not resurrect itself on the next boot.
+
+**`--restart unless-stopped` alone will not bring the stack back after a
+reboot** unless the Docker daemon itself is set to start at boot. That is
+a system-level change, made with `sudo`, outside this repo:
+
+```sh
+sudo systemctl enable docker
+```
+
+Be aware that enabling the Docker service this way starts **every**
+container on the machine that carries a restart policy, not just this
+plugin's two — that's a consequence of enabling the daemon itself, not
+something this plugin does.
+
 ## Pairing
 
 ```sh

@@ -104,6 +104,47 @@ y levanta los dos contenedores (`omarchy-wuzapi` y `omarchy-wa-sink`) en
 una red Docker privada llamada `omarchy-wa`. Solo se publica el puerto de
 `omarchy-wuzapi`, y solo hacia `127.0.0.1`.
 
+## Sobrevivir a reinicios
+
+Los dos contenedores se levantan con `--restart unless-stopped`, así que
+un cuelgue los trae de vuelta solos, y el manejo de reinicio de Docker
+más la resolución de nombres propia de la red `omarchy-wa` convergen sin
+importar cuál contenedor arranque primero — `omarchy-wuzapi` y
+`omarchy-wa-sink` no necesitan arrancar en un orden particular para
+encontrarse por nombre.
+
+Eso cubre que los contenedores vuelvan a estar arriba. **No** cubre que un
+reinicio de `omarchy-wuzapi` a nivel Docker siga pudiendo *entregar*
+mensajes: wuzapi guarda su registro de webhook en memoria, y un reinicio
+(cuelgue, OOM, reboot) lo pierde aunque `GET /webhook` siga mostrándolo
+seteado en la base de datos. Lo único que lo reafirma es el paso de
+autosanación (self-heal) de `wa-up`, que corre cuando vos (o algo)
+ejecuta `wa-up` — no automáticamente cuando Docker reinicia el contenedor
+por su cuenta. Si `omarchy-wuzapi` se reinicia fuera de `wa-up` (un
+cuelgue, un reboot con Docker habilitado al arranque — ver abajo), corré
+`./bin/wa-up` de nuevo una vez para reafirmar el webhook y confirmar que
+la entrega realmente funciona, en lugar de asumir que `unless-stopped`
+solo ya te dejó en un estado funcional.
+
+`--restart unless-stopped` (no `always`) es deliberado: este stack tiene
+un vínculo vivo con tu sesión personal de WhatsApp, así que un
+`docker stop` hecho a propósito debe quedarse detenido, no resucitar
+solo en el próximo arranque.
+
+**`--restart unless-stopped` por sí solo no hace que el stack vuelva
+después de un reboot** a menos que el propio demonio de Docker esté
+configurado para arrancar al boot. Eso es un cambio a nivel de sistema,
+hecho con `sudo`, fuera de este repo:
+
+```sh
+sudo systemctl enable docker
+```
+
+Tené en cuenta que habilitar el servicio de Docker así arranca **todos**
+los contenedores de la máquina que tengan una política de reinicio, no
+solo los dos de este plugin — eso es consecuencia de habilitar el demonio
+en sí, no algo que haga este plugin.
+
 ## Emparejar
 
 ```sh
