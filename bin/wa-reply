@@ -551,6 +551,44 @@ def cmd_quick(args):
     print(json.dumps(quick if isinstance(quick, list) else [], ensure_ascii=False))
 
 
+def cmd_thread(args):
+    """The stored context ring of the entry's chat, oldest first.
+
+    Read-only, for the thread-preview screen (Panel.qml, Task 2 of the
+    2026-09-23 extract plan). Takes the same entry id `draft`/`send`/`quick`
+    take, not a jid/account pair, for the same reason `quick` does: the
+    panel already knows which queued entry it is showing, and letting a
+    caller name a jid/account directly would be a second way to point at
+    someone else's chat.
+
+    Prints a fresh allowlist dict per ring entry — `direction` and `text`
+    only — never the raw stored dict, so a field added to the ring later
+    (a "from" name, a future id) does not leak here just because nobody
+    thought to filter it. A ring entry with no "direction" at all defaults
+    to "in", the same default build_prompt uses, so pre-extract history
+    (or a hand-crafted entry) renders as inbound rather than crashing or
+    showing a blank side.
+
+    Always an ARRAY on stdout, in every outcome, exactly like `quick`: the
+    panel binds this straight to the extract list, and an empty ring (a
+    conversation the plugin has seen nothing of yet) is not an error — the
+    UI itself is what has to say why it's empty. A vanished entry is the
+    same normal race `quick` handles: array on stdout, message and exit 1.
+    """
+    d = store.data_dir()
+    entry = _entry(d, args.id)
+    if entry is None:
+        print("[]")
+        print(f"wa-reply: no queue entry with id {args.id}", file=sys.stderr)
+        sys.exit(1)
+    account = resolve_account(d, entry)
+    ring = store.load_context(d, entry["jid"], account["id"])
+    print(json.dumps(
+        [{"direction": c.get("direction") or "in", "text": c.get("text", "")}
+         for c in ring if isinstance(c, dict)],
+        ensure_ascii=False))
+
+
 def cmd_tone_get(args):
     """The tone file text of one account, plus a hash to hand back on write.
 
@@ -819,6 +857,8 @@ def main():
     sub.add_parser("accounts").set_defaults(fn=cmd_accounts)
     p = sub.add_parser("quick"); p.add_argument("id")
     p.set_defaults(fn=cmd_quick)
+    p = sub.add_parser("thread"); p.add_argument("id")
+    p.set_defaults(fn=cmd_thread)
     p = sub.add_parser("tone-get"); p.add_argument("account_id")
     p.set_defaults(fn=cmd_tone_get)
     p = sub.add_parser("tone-set"); p.add_argument("account_id")

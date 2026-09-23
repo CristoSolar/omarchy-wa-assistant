@@ -1460,5 +1460,86 @@ def test_build_prompt_defaults_a_directionless_entry_to_inbound():
     assert "Ana: podes el martes?" in p
 
 
+# --- Task 2: `thread`, the read-only extract for the preview screen ----
+
+
+def _run_cmd_thread(d, entry_id):
+    buf = io.StringIO()
+    with _reply_env(d):
+        with redirect_stdout(buf):
+            wa.cmd_thread(SimpleNamespace(id=entry_id))
+    return json.loads(buf.getvalue())
+
+
+def test_thread_prints_an_empty_array_for_a_ring_the_plugin_never_saw():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        assert _run_cmd_thread(d, entry["id"]) == [], \
+            "a chat older than the ring must extract as empty, not an error"
+
+
+def test_thread_prints_both_directions_in_order():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        store.append_context(d, entry["jid"], {"direction": "in", "from": "Ana",
+                             "text": "podes el martes?"}, entry["account"])
+        store.append_context(d, entry["jid"], {"direction": "out",
+                             "text": "dale"}, entry["account"])
+        assert _run_cmd_thread(d, entry["id"]) == [
+            {"direction": "in", "text": "podes el martes?"},
+            {"direction": "out", "text": "dale"},
+        ]
+
+
+def test_thread_defaults_a_directionless_entry_to_inbound():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        store.append_context(d, entry["jid"], {"from": "Ana", "text": "hola"},
+                             entry["account"])
+        assert _run_cmd_thread(d, entry["id"]) == [
+            {"direction": "in", "text": "hola"}]
+
+
+def test_thread_never_leaks_a_field_beyond_direction_and_text():
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        store.append_context(d, entry["jid"], {"direction": "in", "from": "Ana",
+                             "text": "hola", "ts": "2026-09-22T10:00:00",
+                             "secret": "no debería salir"}, entry["account"])
+        out = _run_cmd_thread(d, entry["id"])
+        assert out == [{"direction": "in", "text": "hola"}]
+        assert set(out[0].keys()) == {"direction", "text"}
+
+
+def test_thread_on_a_vanished_entry_still_prints_an_array():
+    with tmpdir() as d:
+        _prepare(d)
+        buf = io.StringIO()
+        with _reply_env(d):
+            with redirect_stdout(buf):
+                try:
+                    wa.cmd_thread(SimpleNamespace(id="ghost"))
+                    assert False, "should have exited non-zero"
+                except SystemExit as exc:
+                    assert exc.code == 1
+        assert json.loads(buf.getvalue()) == []
+
+
+def test_thread_refuses_an_entry_whose_account_is_unknown():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))
+        entry = _queue_entry(account="fantasma")
+        _enqueue(d, entry)
+        try:
+            _run_cmd_thread(d, entry["id"])
+            assert False, "should have raised"
+        except wa.ReplyRefused:
+            pass
+
+
 if __name__ == "__main__":
     run(dict(globals()))

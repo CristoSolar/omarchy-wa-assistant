@@ -77,6 +77,15 @@ Panel {
   // but a rapid double-click on Enviar still has to be refused.
   property bool inFlight: false
 
+  // Which of the two screens a selected chat shows: false is the extract
+  // (read the recent thread, pick "Responder"), true is the composer
+  // (write and send). Both live under `root.current !== null`, so the
+  // gear stays hidden and there is still exactly one way back to the
+  // list — through the extract's own Volver, never a second path. Reset
+  // to false by select(), so reopening a chat always starts at reading,
+  // never lands back inside the composer from a previous visit.
+  property bool composing: false
+
   // Toggled by the gear. SettingsView.qml is a plain child (not a Loader),
   // never destroyed, so a link or unlink it has mid-flight keeps running
   // and keeps its state while this is false — see its own onShown().
@@ -88,6 +97,17 @@ Panel {
   // `wa-reply quick`). Loaded through its own Process so fetching it can
   // never race the list/draft Process or the send Process.
   property var quickReplies: []
+
+  // The extract: the current entry's stored context ring, oldest first,
+  // via `wa-reply thread` (read-only — Task 2). Its own Process, for the
+  // same reason quick replies get one: fetching it must never race
+  // list/draft/send. `threadError` is kept apart from a genuinely empty
+  // `threadEntries: []` the same way `storeError` is kept apart from an
+  // empty queue — an empty ring for an old conversation is the NORMAL
+  // case (see the explanatory text on the extract screen) and must never
+  // look like this.
+  property var threadEntries: []
+  property string threadError: ""
 
   // account id -> label, via `wa-reply accounts`. The queue entry carries
   // only the account ID, never a label: a label lives exclusively in
@@ -185,6 +205,41 @@ Panel {
     }
     quickProc.command = [root.pluginDir + "bin/wa-reply", "quick", entryId]
     quickProc.running = true
+  }
+
+  // Its own Process too, for the same reason quick replies and account
+  // labels get one: fetching the extract must never race list/draft/send.
+  Process {
+    id: threadProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var parsed = null
+        try { parsed = JSON.parse(text) } catch (e) { parsed = null }
+        if (Array.isArray(parsed)) {
+          root.threadEntries = parsed
+          root.threadError = ""
+        } else {
+          // wa-reply always prints an array on this subcommand, even on
+          // a vanished entry — this branch is an unexpected shape, not
+          // the normal empty-ring case, so it gets the error banner
+          // rather than silently rendering as "nothing happened yet".
+          root.threadEntries = []
+          root.threadError = "wa-reply thread dio una respuesta inesperada"
+        }
+      }
+    }
+  }
+
+  function loadThread(entryId) {
+    if (threadProc.running)
+      return
+    if (!entryId) {
+      root.threadEntries = []
+      root.threadError = ""
+      return
+    }
+    threadProc.command = [root.pluginDir + "bin/wa-reply", "thread", entryId]
+    threadProc.running = true
   }
 
   // Its own Process too, loaded once and re-read on every refresh() —
@@ -308,10 +363,36 @@ Panel {
     root.statusWarn = false
     root.acknowledged = false
     root.sendBlocked = false
+    // Every chat opens on the extract, never straight into the composer
+    // — reading and writing are deliberately separate steps.
+    root.composing = false
     // Quick replies are this entry's account's own list — reload for
     // whatever is now selected (or clear, for "back to the list").
     root.loadQuickReplies(root.currentId)
-    if (entry) Qt.callLater(function() { composer.forceActiveFocus() })
+    root.loadThread(root.currentId)
+  }
+
+  // The extract's "Responder" button: the only path into the composer.
+  // Guarded here too, not just by the button's own `enabled`, the same
+  // belt-and-suspenders style `run()`/doSend() already use elsewhere in
+  // this file — an entry left "unknown"/"sending" must not be reachable
+  // by any route without the deliberate acknowledgement, and this is the
+  // one new door this task adds to the composer.
+  function openComposer() {
+    if (root.needsAck && !root.acknowledged)
+      return
+    root.composing = true
+    Qt.callLater(function() { composer.forceActiveFocus() })
+  }
+
+  // Steps back to the extract without dropping the selection — unlike
+  // the extract's own Volver (root.select(null)), which goes all the way
+  // back to the list. Used by the composer's Volver and by Escape there,
+  // so leaving mid-draft never silently discards which chat was open.
+  function backToExtract() {
+    root.composing = false
+    root.status = ""
+    root.statusWarn = false
   }
 
   // The single composer box's one action: take whatever is currently
@@ -378,6 +459,7 @@ Panel {
     // rename or an account swap on the open entry must not leave a stale
     // list showing.
     root.loadQuickReplies(root.currentId)
+    root.loadThread(root.currentId)
     run(["list"], function (out) {
       var list = []
       var parsed = null
@@ -600,55 +682,43 @@ Panel {
           }
         }
 
-        ColumnLayout {
+        // States plainly which number the reply will leave by. Not a
+        // choice — a reply always leaves by the number that received it,
+        // there is no selector anywhere in this panel, and this line
+        // exists so that fact is never left implicit. Shared by both the
+        // extract and the composer (rather than living in just one of
+        // them) so it survives regardless of which of the two screens is
+        // showing.
+        Text {
+          textFormat: Text.PlainText
           visible: !root.settingsOpen && root.current !== null
+          text: "La respuesta va a salir desde: "
+                + root.accountLabel(root.current ? root.current.account : "")
+          color: root.contentForeground
+          font.family: root.contentFontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+          wrapMode: Text.Wrap; Layout.fillWidth: true
+        }
+
+        // Screen 1 of 2 for an open chat: the extract. Reading and writing
+        // are deliberately separate steps (the owner's own request) — this
+        // is as far as picking a chat goes on its own; only "Responder"
+        // moves on to the composer below.
+        ColumnLayout {
+          visible: !root.settingsOpen && root.current !== null && !root.composing
           Layout.fillWidth: true; Layout.fillHeight: true
           spacing: Style.spacing.lg
 
-          // States plainly which number the reply will leave by. Not a
-          // choice — a reply always leaves by the number that received
-          // it, there is no selector anywhere in this panel, and this
-          // line exists so that fact is never left implicit.
-          Text {
-            textFormat: Text.PlainText
-            visible: root.current !== null
-            text: "La respuesta va a salir desde: "
-                  + root.accountLabel(root.current ? root.current.account : "")
-            color: root.contentForeground
-            font.family: root.contentFontFamily
-            font.pixelSize: Style.font.bodySmall
-            font.bold: true
-            wrapMode: Text.Wrap; Layout.fillWidth: true
-          }
-
-          // Capped and scrollable: a long incoming WhatsApp message has
-          // exactly the same problem as a long draft below — it can run
-          // past the visible area on its own, and it must not be allowed
-          // to eat the room the composer needs. The cap only kicks in once
-          // the text is actually taller than it; short messages get no
-          // scrollbar at all (ScrollBar.AsNeeded).
-          ScrollView {
-            id: incomingScroll
-            Layout.fillWidth: true
-            Layout.preferredHeight: Math.min(incomingText.implicitHeight, Style.space(140))
-            clip: true
-            ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
-            ScrollBar.vertical.policy: ScrollBar.AsNeeded
-
-            Text {
-              id: incomingText
-              width: incomingScroll.availableWidth
-              textFormat: Text.PlainText
-              text: root.current ? root.current.text : ""
-              color: Color.muted
-              font.family: root.contentFontFamily
-              font.pixelSize: Style.font.body
-              wrapMode: Text.Wrap
-            }
-          }
-
           // The durable "unknown" warning, with the deliberate
-          // acknowledgement that re-arms the send button.
+          // acknowledgement that re-arms the send button. Lives here, on
+          // the extract, rather than on the composer: this is the one new
+          // door this task adds (there used to be only one screen after
+          // picking a chat), and "Responder" below refuses to open that
+          // door until this is acknowledged — see openComposer(). The
+          // composer's own Enviar/quick-reply guards still check
+          // needsAck/acknowledged too, unchanged, as a second, independent
+          // check the same way every other guard in this file is doubled.
           Rectangle {
             visible: root.needsAck
             Layout.fillWidth: true
@@ -696,6 +766,147 @@ Panel {
               }
             }
           }
+
+          Text {
+            textFormat: Text.PlainText
+            text: "Extracto de la conversación"
+            color: root.contentForeground
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+
+          // The ring only holds what arrived since the plugin started
+          // running, so an older conversation extracts thin or empty.
+          // That is the NORMAL case, not a bug, and it has to say so —
+          // a blank panel with no explanation reads as broken.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.threadEntries.length === 0 && root.threadError === ""
+            text: "Todavía no hay nada guardado de este chat (o casi nada). "
+                  + "El extracto solo muestra lo que llegó desde que el "
+                  + "asistente empezó a correr — para una conversación más "
+                  + "vieja esto es lo esperable, no una falla."
+            color: Color.muted
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.Wrap; Layout.fillWidth: true
+          }
+
+          // An unexpected response shape from `wa-reply thread` — kept
+          // apart from the empty-ring case above the same way storeError
+          // is kept apart from a genuinely empty queue.
+          Rectangle {
+            visible: root.threadError !== ""
+            Layout.fillWidth: true
+            implicitHeight: threadErrorText.implicitHeight + Style.spacing.xxl
+            color: Style.normalFillFor(root.contentUrgent, root.contentUrgent)
+            radius: Style.cornerRadius
+            border.width: Style.spacing.hairline
+            border.color: root.contentUrgent
+            Text {
+              id: threadErrorText
+              textFormat: Text.PlainText
+              anchors.left: parent.left; anchors.right: parent.right
+              anchors.top: parent.top; anchors.margins: Style.spacing.md
+              text: "⚠ No se pudo leer el extracto: " + root.threadError
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap
+            }
+          }
+
+          // The extract itself: the stored ring, oldest first, each side
+          // distinguishable by its own "direction" mark (never guessed
+          // from the name — see build_prompt's own reasoning in
+          // bin/wa-reply) via alignment and fill color. Scrollable like
+          // everything else in this panel — the queue list and the
+          // composer both already are.
+          ListView {
+            visible: root.threadEntries.length > 0
+            Layout.fillWidth: true; Layout.fillHeight: true
+            model: root.threadEntries
+            spacing: Style.spacing.sm
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+            delegate: Item {
+              id: bubbleRow
+              required property var modelData
+              readonly property bool outgoing: bubbleRow.modelData.direction === "out"
+              width: ListView.view.width
+              implicitHeight: bubble.implicitHeight
+
+              Rectangle {
+                id: bubble
+                width: bubbleRow.width * 0.78
+                anchors.right: bubbleRow.outgoing ? parent.right : undefined
+                anchors.left: bubbleRow.outgoing ? undefined : parent.left
+                implicitHeight: bubbleCol.implicitHeight + Style.spacing.lg
+                radius: Style.cornerRadius
+                color: bubbleRow.outgoing
+                       ? Style.normalFillFor(root.contentForeground, Color.accent)
+                       : Style.hoverFillFor(root.contentForeground, Color.accent)
+
+                ColumnLayout {
+                  id: bubbleCol
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.top: parent.top; anchors.margins: Style.spacing.md
+                  spacing: Style.spacing.xxs
+                  Text {
+                    textFormat: Text.PlainText
+                    text: bubbleRow.outgoing ? "Vos"
+                          : (root.current ? root.current.push_name : "")
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    font.bold: true
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: bubbleRow.modelData.text
+                    color: root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                  }
+                }
+              }
+            }
+          }
+
+          RowLayout {
+            spacing: Style.spacing.lg
+            Button {
+              text: "Volver"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              onClicked: root.select(null)
+            }
+            Button {
+              text: "Responder"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+              bordered: true
+              // Same condition openComposer() itself enforces — the
+              // button being disabled is the visible half of the guard,
+              // the function's own early return is the half nothing can
+              // route around.
+              enabled: !root.needsAck || root.acknowledged
+              onClicked: root.openComposer()
+            }
+          }
+        }
+
+        // Screen 2 of 2: the composer. Reached only through "Responder"
+        // above.
+        ColumnLayout {
+          visible: !root.settingsOpen && root.current !== null && root.composing
+          Layout.fillWidth: true; Layout.fillHeight: true
+          spacing: Style.spacing.lg
 
           // One-click quick replies. Visually separated from the composer
           // (its own heading, its own divider) because clicking one of
@@ -827,7 +1038,10 @@ Panel {
               font.pixelSize: Style.font.body
               selectByMouse: true
               enabled: !root.drafting && !root.inFlight
-              Keys.onEscapePressed: root.select(null)
+              // Steps back to the extract, not all the way to the list —
+              // see backToExtract(). The selection (and any draft in
+              // progress) survives; only the list's Volver drops it.
+              Keys.onEscapePressed: root.backToExtract()
               // Enter drafts the idea currently in the box, exactly like the
               // Redactar button — but only while the box is still holding an
               // idea (no draft yet). Once a draft exists this is an ordinary
@@ -901,7 +1115,7 @@ Panel {
               fontFamily: root.contentFontFamily
               bordered: true
               enabled: !root.inFlight && !root.drafting
-              onClicked: root.select(null)
+              onClicked: root.backToExtract()
             }
           }
         }
