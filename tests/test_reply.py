@@ -209,6 +209,66 @@ def test_a_successful_send_removes_the_queue_entry_and_reports_ok():
         assert store.load_queue(d) == [], "a confirmed send must clear the queue entry"
 
 
+def test_a_bookkeeping_failure_after_a_confirmed_send_never_leaves_it_resendable():
+    """I2: remove_queue raising AFTER the message went out.
+
+    The message reached the recipient. The only thing that failed is the
+    queue write. "failed" has no acknowledgement requirement, so it would
+    re-enable both send paths in the panel for a message already
+    delivered — one click and a real person gets it twice. The entry must
+    be left in a status that a second send refuses without --acknowledged.
+    """
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+
+        def _boom(dd, eid):
+            raise OSError("read-only file system")
+
+        orig_send, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
+        orig_remove, store.remove_queue = store.remove_queue, _boom
+        try:
+            out = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = orig_send
+            store.remove_queue = orig_remove
+
+        assert out["ok"] is False
+        q = store.load_queue(d)
+        assert len(q) == 1, "the failed removal must leave the entry where it was"
+        assert q[0]["status"] != "failed", (
+            "a delivered message must never be left in a resendable status")
+        assert q[0]["status"] in wa.UNCONFIRMED_STATUSES, (
+            "the status must be one a second send refuses without an ack")
+
+
+def test_a_bookkeeping_failure_after_a_confirmed_send_refuses_a_plain_resend():
+    """The end-to-end consequence of the status above: the retry is refused."""
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+
+        def _boom(dd, eid):
+            raise OSError("read-only file system")
+
+        orig_send, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
+        orig_remove, store.remove_queue = store.remove_queue, _boom
+        try:
+            _run_cmd_send(d, entry["id"])
+        finally:
+            store.remove_queue = orig_remove
+
+        sent = []
+        wa.send = lambda jid, text, token: (sent.append(text)
+                                            or {"data": {"Details": "Sent"}})
+        try:
+            retry = _run_cmd_send(d, entry["id"])
+        finally:
+            wa.send = orig_send
+        assert retry["ok"] is False and retry.get("needs_ack") is True
+        assert sent == [], "nothing may reach the network on an unacknowledged retry"
+
+
 def test_a_raised_send_leaves_the_entry_recoverable_as_failed():
     with tmpdir() as d:
         entry = _queue_entry()

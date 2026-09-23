@@ -457,6 +457,11 @@ def cmd_send(args):
     token = account_token(account)
 
     store.set_status(d, entry["id"], "sending")
+    # Flipped the instant the response proves the message reached the
+    # recipient. Everything after that point is bookkeeping, and no
+    # bookkeeping failure may leave the entry in a status a second send
+    # can consume without an acknowledgement. See the generic handler.
+    confirmed_sent = False
     try:
         result = send(entry["jid"], args.text, token)
         if _is_dry_run(result):
@@ -468,6 +473,7 @@ def cmd_send(args):
             store.set_status(d, entry["id"], status_at_start)
             print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
         elif _is_confirmed_sent(result):
+            confirmed_sent = True
             fresh = _entry(d, entry["id"])
             if fresh is not None and fresh.get("ts") != ts_at_start:
                 store.set_status(d, entry["id"], "pending")
@@ -491,6 +497,32 @@ def cmd_send(args):
         print(json.dumps({"ok": False, "unknown": True, "error": str(exc)},
                          ensure_ascii=False))
     except Exception as exc:
+        if confirmed_sent:
+            # The message DID reach the recipient; only the bookkeeping
+            # after it failed (remove_queue hitting a read-only state dir,
+            # a corrupted queue.json, a disk full). "failed" carries no
+            # acknowledgement requirement, so it would light both send
+            # paths back up — panel says "falló", one click sends the same
+            # message to a real person a second time. "unknown" is the
+            # weakest statement that is still true here: it went out, and
+            # what is on disk about it cannot be trusted. It is in
+            # UNCONFIRMED_STATUSES, so the next cmd_send refuses without
+            # --acknowledged and the panel keeps its guard.
+            try:
+                store.set_status(d, entry["id"], "unknown")
+            except Exception:
+                # Writing the status is the very thing that just failed;
+                # do not let a second failure hide the outcome from the
+                # caller. The panel treats an unparseable response as
+                # equally unsendable (sendBlocked), so the guard holds
+                # either way.
+                pass
+            print(json.dumps({
+                "ok": False, "unknown": True,
+                "error": f"el mensaje SE ENVIÓ, pero no se pudo actualizar la "
+                         f"cola después: {exc}",
+            }, ensure_ascii=False))
+            return
         store.set_status(d, entry["id"], "failed")
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
 

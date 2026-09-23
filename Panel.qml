@@ -636,10 +636,19 @@ Panel {
           // that plainly so nobody expecting "fill the composer" gets
           // "message delivered" instead. Disabled while a send or a
           // draft is running (inFlight/drafting) so a double click can't
-          // race the composer's own send, and while needsAck applies and
-          // is not yet acknowledged — the same guard the "Enviar" button
-          // enforces, and one wa-reply send re-enforces server-side
+          // race the composer's own send, while needsAck applies and is
+          // not yet acknowledged, and while sendBlocked is set — the same
+          // four conditions the "Enviar" button checks, and the first
+          // three of which one `wa-reply send` re-enforces server-side
           // regardless of this button's enabled state.
+          //
+          // sendBlocked is the one that is NOT re-enforced server-side:
+          // it exists precisely because a send's response could not be
+          // parsed, so nothing on disk can be trusted about whether the
+          // message arrived, and wa-reply has no stored status to refuse
+          // on. These buttons send immediately, with no confirmation
+          // step, so omitting it here was a one-click double send to a
+          // real person. Keep this list and Enviar's `enabled` in step.
           ColumnLayout {
             visible: root.quickReplies.length > 0
             Layout.fillWidth: true
@@ -663,7 +672,8 @@ Panel {
                   foreground: root.contentForeground
                   fontFamily: root.contentFontFamily
                   bordered: true
-                  enabled: !root.inFlight && !root.drafting
+                  enabled: !root.sendBlocked
+                           && !root.inFlight && !root.drafting
                            && (!root.needsAck || root.acknowledged)
                   onClicked: root.doSend(modelData)
                 }
