@@ -109,6 +109,37 @@ Panel {
   property var threadEntries: []
   property string threadError: ""
 
+  // The current entry's attachment descriptor (Task 1/2 of the media plan),
+  // or null for a plain text entry. Read straight off root.current — the
+  // extract's own thread ring never carries this (bin/wa-reply's `thread`
+  // strips every field but direction/text), and it must not, because the
+  // ring holds older messages this task never asked for a viewer on. Only
+  // the entry actually pending a reply gets one.
+  readonly property var currentAttachment: root.current ? (root.current.attachment || null) : null
+  readonly property bool hasAttachment: root.currentAttachment !== null && root.currentAttachment !== undefined
+  readonly property bool attachmentDownloadable: root.hasAttachment && root.currentAttachment.downloadable === true
+  // Images and stickers are the only types this panel ever displays
+  // inline (both cache to a raster file wa-media can hand back — see its
+  // EXTENSIONS map). Everything else downloadable (audio, video,
+  // document) opens with the system viewer instead — inline playback and
+  // video preview are explicitly out of scope for this task.
+  readonly property bool attachmentIsImage: root.hasAttachment
+      && (root.currentAttachment.type === "image" || root.currentAttachment.type === "sticker")
+
+  // Media download state (Task 3 of the 2026-09-23 media-viewing plan).
+  // Kept apart from `status`/`statusWarn` (the send/draft status line)
+  // because a media fetch and a send/draft can be relevant at once — the
+  // extract screen where the attachment lives never overlaps the composer
+  // where `status` is shown, but keeping them separate properties means
+  // neither path has to guess whether the other cleared it.
+  property string mediaPath: ""
+  property string mediaError: ""
+  property bool mediaLoading: false
+  // Guards a stale response the same way requestDraft()'s `requestId`
+  // does: if the user reselects a different chat while a download is in
+  // flight, the late answer must not paint over the newly selected entry.
+  property string mediaRequestId: ""
+
   // account id -> label, via `wa-reply accounts`. The queue entry carries
   // only the account ID, never a label: a label lives exclusively in
   // accounts.json, so a rename there can never leave a stale copy
@@ -117,6 +148,18 @@ Panel {
   // own Process for the same reason quick replies get one — it must
   // never race list/draft/send.
   property var accountLabels: ({})
+
+  // A plain-language label for an attachment type, for the "no se puede
+  // ver esto" message — never the raw type string on its own, which reads
+  // as a code, not an explanation.
+  function attachmentTypeLabel(atype) {
+    var labels = {
+      "image": "una imagen", "sticker": "un sticker", "audio": "un audio",
+      "video": "un video", "document": "un documento",
+      "ubicación": "una ubicación", "contacto": "un contacto",
+    }
+    return labels[atype] || ("un adjunto de tipo " + atype)
+  }
 
   // The label for one account id, or the id itself when accounts.json
   // has nothing for it (a stale entry from a removed account, or the
@@ -242,6 +285,82 @@ Panel {
     threadProc.running = true
   }
 
+  // Its own Process too, for the same reason everything above gets one:
+  // downloading an attachment must never race list/draft/send/thread.
+  // `bin/wa-media` is the ONLY thing that ever downloads — this Process
+  // shells out to it exactly the way every other Process here shells out
+  // to wa-reply, and never touches wuzapi or a token directly.
+  Process {
+    id: mediaProc
+    property var done: null
+    stdout: StdioCollector {
+      onStreamFinished: if (mediaProc.done) mediaProc.done(text)
+    }
+  }
+
+  // Fire-and-forget: hands the cached path to the system's own viewer for
+  // audio/video/document. Inline playback is out of scope by design (see
+  // the media-viewing spec), so this is the whole story for those types —
+  // there is no completion to report back into the UI beyond what
+  // fetchMedia() already showed ("se abrió con el visor del sistema").
+  Process {
+    id: openProc
+  }
+
+  // Downloads (or re-serves from cache) the current entry's attachment via
+  // `wa-media get`, idempotent on wa-media's own side. Refuses to start a
+  // second download while one is already running, exactly like every
+  // other run()-style guard in this file.
+  //
+  // A failure is shown, not swallowed: this is the one path the spec calls
+  // out by name ("a download that fails says so and lets the user try
+  // again... must not spin forever, and must not look like an empty
+  // result") — the mistake it must not repeat is exactly the one this
+  // project has shipped before, an empty/blank state that actually meant
+  // "could not read it".
+  function fetchMedia() {
+    if (mediaProc.running || !root.currentId || !root.attachmentDownloadable)
+      return
+    var requestId = root.currentId
+    root.mediaRequestId = requestId
+    root.mediaError = ""
+    root.mediaLoading = true
+    mediaProc.command = [root.pluginDir + "bin/wa-media", "get", requestId]
+    mediaProc.done = function (out) {
+      // The selection may have moved on while this was in flight — same
+      // stale-response guard requestDraft() uses. Nothing here may touch
+      // root.mediaPath/mediaError/mediaLoading for a chat the user is no
+      // longer looking at.
+      if (root.mediaRequestId !== requestId)
+        return
+      root.mediaLoading = false
+      var parsed = null
+      try { parsed = JSON.parse(out) } catch (e) { parsed = null }
+      if (parsed && parsed.ok && parsed.path) {
+        root.mediaPath = parsed.path
+        root.mediaError = ""
+        // Only the two inline-image types stay in the panel; everything
+        // else downloadable hands straight off to the system viewer —
+        // there is no "open" button distinct from the download button for
+        // those, one click does both steps.
+        if (!root.attachmentIsImage) {
+          openProc.command = ["xdg-open", parsed.path]
+          openProc.running = true
+        }
+      } else {
+        root.mediaPath = ""
+        // wa-media always prints a JSON object with an `error` field on
+        // refusal, even on a network failure — see DownloadFailed/
+        // MediaRefused in bin/wa-media. Falling back to a generic string
+        // only covers a response that could not be parsed at all (a crash
+        // mid-write), the same category doSend()'s catch block handles.
+        root.mediaError = (parsed && parsed.error)
+            ? parsed.error : "no se pudo descargar el adjunto"
+      }
+    }
+    mediaProc.running = true
+  }
+
   // Its own Process too, loaded once and re-read on every refresh() —
   // labels can be renamed in accounts.json between refreshes, and this
   // is exactly how the panel is meant to find out: by asking, not by
@@ -363,6 +482,14 @@ Panel {
     root.statusWarn = false
     root.acknowledged = false
     root.sendBlocked = false
+    // A download in flight (or its result) belongs to the entry that was
+    // open when it started. Reselecting — even re-clicking the same
+    // entry — must not leave a previous chat's image, error or spinner
+    // showing under the newly opened one.
+    root.mediaPath = ""
+    root.mediaError = ""
+    root.mediaLoading = false
+    root.mediaRequestId = ""
     // Every chat opens on the extract, never straight into the composer
     // — reading and writing are deliberately separate steps.
     root.composing = false
@@ -871,6 +998,133 @@ Panel {
                     font.pixelSize: Style.font.bodySmall
                     wrapMode: Text.Wrap
                     Layout.fillWidth: true
+                  }
+                }
+              }
+            }
+          }
+
+          // The attachment viewer: what this task adds. Only for the
+          // entry actually pending a reply (root.current), never for a
+          // ring bubble above — see currentAttachment's own comment.
+          ColumnLayout {
+            visible: root.hasAttachment
+            Layout.fillWidth: true
+            spacing: Style.spacing.sm
+
+            Text {
+              textFormat: Text.PlainText
+              text: "Adjunto"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+
+            // Not downloadable: a location, a contact, or a malformed
+            // event missing a field wa-media needs. Says so plainly —
+            // no button, because no button here could ever work; the
+            // spec calls out by name the bug of offering one anyway.
+            Text {
+              textFormat: Text.PlainText
+              visible: !root.attachmentDownloadable
+              text: "Este mensaje trae "
+                    + root.attachmentTypeLabel(root.currentAttachment
+                                                ? root.currentAttachment.type : "")
+                    + " y no se puede ver desde acá: no hay forma de "
+                    + "pedírselo a WhatsApp para este tipo de adjunto."
+              color: Color.muted
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap; Layout.fillWidth: true
+            }
+
+            // Downloadable and not yet shown/opened: the button that
+            // starts the fetch, relabelled to show it is working and to
+            // offer a retry after a failure — never a silent dead end.
+            RowLayout {
+              visible: root.attachmentDownloadable && root.mediaPath === ""
+              spacing: Style.spacing.md
+              Button {
+                text: root.mediaLoading ? "Descargando…"
+                      : (root.mediaError !== "" ? "Reintentar"
+                         : (root.attachmentIsImage ? "Ver imagen" : "Abrir"))
+                foreground: root.contentForeground
+                fontFamily: root.contentFontFamily
+                bordered: true
+                // Disabled only while a download is actually running —
+                // the rest of the panel (the list, Volver, the gear)
+                // stays usable the whole time, since this is its own
+                // Process and its own guard, not a shared one.
+                enabled: !root.mediaLoading
+                onClicked: root.fetchMedia()
+              }
+            }
+
+            // A failed download: said plainly, with the retry button
+            // above still live — this is the case the spec names as the
+            // one that must never look like an empty result.
+            Text {
+              textFormat: Text.PlainText
+              visible: root.mediaError !== ""
+              text: "⚠ " + root.mediaError
+              color: root.contentUrgent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap; Layout.fillWidth: true
+            }
+
+            // Audio/video/document: xdg-open already ran the moment the
+            // download finished (see fetchMedia()) — this just confirms
+            // it, since there is nothing else this panel shows for them.
+            Text {
+              textFormat: Text.PlainText
+              visible: root.mediaPath !== "" && !root.attachmentIsImage
+              text: "Se abrió con el visor del sistema."
+              color: Color.accent
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            // Images and stickers: inline, bounded to the panel's own
+            // width so a large photo fits rather than blowing the layout
+            // out — `mediaBox`'s own height is capped too, and the whole
+            // extract screen is already inside a scrollable arrangement
+            // (this ColumnLayout sits above the Volver/Responder row,
+            // and the ring ListView above it already scrolls; a very
+            // tall image plus a long ring simply makes more of the
+            // extract need scrolling, which is the point).
+            Item {
+              id: mediaBox
+              visible: root.mediaPath !== "" && root.attachmentIsImage
+                       && mediaImage.status !== Image.Error
+              Layout.fillWidth: true
+              implicitHeight: (mediaImage.status === Image.Ready
+                               && mediaImage.sourceSize.width > 0)
+                  ? Math.min(mediaBox.width * mediaImage.sourceSize.height
+                             / mediaImage.sourceSize.width, Style.space(480))
+                  : Style.space(160)
+
+              Image {
+                id: mediaImage
+                anchors.fill: parent
+                fillMode: Image.PreserveAspectFit
+                asynchronous: true
+                source: root.mediaPath ? ("file://" + root.mediaPath) : ""
+                // The cache prunes itself (bin/wa-media's own docstring:
+                // age first, then size, oldest first) — a file that was
+                // downloaded successfully a while ago can be gone by the
+                // time this Image tries to load it. Image.Error is the
+                // one signal QML gives for exactly that (or for a file
+                // that was never a real image), and it must degrade to
+                // an honest message, never a broken-image placeholder
+                // with nothing said about why.
+                onStatusChanged: {
+                  if (status === Image.Error) {
+                    root.mediaError = "el archivo ya no está en la caché "
+                        + "(puede haberse podado) o no se pudo mostrar como "
+                        + "imagen. Probá de nuevo."
+                    root.mediaPath = ""
                   }
                 }
               }

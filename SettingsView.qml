@@ -65,11 +65,106 @@ ColumnLayout {
              && (root.linkStage === "done" || root.linkStage === "error"
                  || root.linkStage === "no_terminal"))
       root.mode = "list"
-    if (root.mode === "list")
+    if (root.mode === "list") {
       root.refreshAccounts()
+      root.fetchMediaCacheSize()
+    }
   }
 
-  Component.onCompleted: root.refreshAccounts()
+  Component.onCompleted: {
+    root.refreshAccounts()
+    root.fetchMediaCacheSize()
+  }
+
+  // -------------------------------------------------------------------
+  // Media cache — the caché de adjuntos the 2026-09-23 media-viewing plan
+  // adds (bin/wa-media). Size is read directly off disk: wa-media itself
+  // exposes only `get` and `clear` (whole cache, or one account's — see
+  // its own module docstring), never a "how big is it" query, so asking
+  // it here would mean inventing an interface it does not offer rather
+  // than reading the one it does. `clear` (no --account) is the one this
+  // control uses, whole-cache, since this is a single global control, not
+  // one per account.
+  // -------------------------------------------------------------------
+
+  property real mediaCacheBytes: -1
+  property string mediaCacheError: ""
+  property bool mediaClearBusy: false
+  property string mediaClearStatus: ""
+  property bool mediaClearStatusWarn: false
+
+  // Bytes, human-scaled. Deliberately coarse (one decimal, binary units)
+  // — this is "does it need clearing", not an audit figure.
+  function formatBytes(n) {
+    if (n < 1024) return n + " B"
+    var units = ["KiB", "MiB", "GiB", "TiB"]
+    var v = n / 1024
+    var i = 0
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++ }
+    return v.toFixed(1) + " " + units[i]
+  }
+
+  function fetchMediaCacheSize() {
+    if (mediaSizeProc.running)
+      return
+    root.mediaCacheError = ""
+    // No new script, no new subcommand: this reads the exact directory
+    // bin/wa-media's own media_root() writes to (a sibling of state/,
+    // named "media", under $WA_STATE_ROOT or its documented default —
+    // see sink/store.py's state_root()), the same way this whole panel
+    // already reads state on disk through wa-reply's read subcommands.
+    // `du -sb` over a missing directory is treated as "0 bytes", not an
+    // error — an empty cache is the normal starting state, not a fault.
+    mediaSizeProc.command = ["bash", "-c",
+      "d=\"${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}/media\"; " +
+      "if [ -d \"$d\" ]; then du -sb \"$d\" 2>/dev/null | cut -f1; " +
+      "else echo 0; fi"]
+    mediaSizeProc.running = true
+  }
+
+  Process {
+    id: mediaSizeProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var n = parseInt(String(text).trim(), 10)
+        if (isNaN(n) || n < 0) {
+          root.mediaCacheBytes = -1
+          root.mediaCacheError = "no se pudo calcular el tamaño de la caché"
+        } else {
+          root.mediaCacheBytes = n
+          root.mediaCacheError = ""
+        }
+      }
+    }
+  }
+
+  function clearMediaCache() {
+    if (mediaClearProc.running)
+      return
+    root.mediaClearBusy = true
+    root.mediaClearStatus = ""
+    mediaClearProc.command = [root.pluginDir + "bin/wa-media", "clear"]
+    mediaClearProc.running = true
+  }
+
+  Process {
+    id: mediaClearProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        root.mediaClearBusy = false
+        var r = null
+        try { r = JSON.parse(text) } catch (e) { r = null }
+        if (r && r.ok) {
+          root.mediaClearStatus = "caché vaciada"
+          root.mediaClearStatusWarn = false
+          root.fetchMediaCacheSize()
+        } else {
+          root.mediaClearStatus = (r && r.error) ? r.error : "no se pudo vaciar la caché"
+          root.mediaClearStatusWarn = true
+        }
+      }
+    }
+  }
 
   Process {
     id: listAccountsProc
@@ -107,6 +202,61 @@ ColumnLayout {
       font.pixelSize: Style.font.bodySmall
       wrapMode: Text.Wrap
       Layout.fillWidth: true
+    }
+
+    // The media cache: what the 2026-09-23 media-viewing plan requires
+    // in settings — how much it holds, and a way to empty it in one
+    // step. Whole-cache only (bin/wa-media clear, no --account): a
+    // single global control, not one per account.
+    Rectangle {
+      Layout.fillWidth: true
+      implicitHeight: cacheCol.implicitHeight + Style.spacing.xxl
+      color: Style.normalFillFor(root.foreground, Color.accent)
+      radius: Style.cornerRadius
+      ColumnLayout {
+        id: cacheCol
+        anchors.left: parent.left; anchors.right: parent.right
+        anchors.top: parent.top; anchors.margins: Style.spacing.md
+        spacing: Style.spacing.sm
+        Text {
+          textFormat: Text.PlainText
+          text: "Caché de adjuntos"
+          color: root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+        Text {
+          textFormat: Text.PlainText
+          text: root.mediaCacheError !== "" ? ("⚠ " + root.mediaCacheError)
+                : root.mediaCacheBytes < 0 ? "Calculando…"
+                : "Ocupa " + root.formatBytes(root.mediaCacheBytes) + " en disco."
+          color: root.mediaCacheError !== "" ? root.urgent : root.foreground
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap; Layout.fillWidth: true
+        }
+        RowLayout {
+          spacing: Style.spacing.md
+          Button {
+            text: root.mediaClearBusy ? "Vaciando…" : "Vaciar caché"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            bordered: true
+            enabled: !root.mediaClearBusy
+            onClicked: root.clearMediaCache()
+          }
+        }
+        Text {
+          textFormat: Text.PlainText
+          visible: root.mediaClearStatus !== ""
+          text: root.mediaClearStatus
+          color: root.mediaClearStatusWarn ? root.urgent : Color.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap; Layout.fillWidth: true
+        }
+      }
     }
 
     ListView {
