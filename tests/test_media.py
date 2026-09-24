@@ -277,6 +277,30 @@ def test_a_second_call_for_the_same_attachment_does_not_re_download():
         assert len(calls) == 1, "the second get must not call the network layer"
 
 
+def test_a_zero_byte_cached_file_is_not_trusted_and_is_re_downloaded():
+    """A truncated/empty file at the expected path (disk-full, a killed
+    write that skipped cleanup, a person poking at the cache) must not be
+    served silently — it must trigger a fresh download instead."""
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        entry = _entry()
+        store.upsert_queue(d, entry)
+        attachment = entry["attachment"]
+        path = wm._cached_path("personal", entry["id"], attachment)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"")  # corrupt: zero bytes where a real file should be
+
+        calls, fake = _fake_download(body=FAKE_IMAGE_BYTES)
+        original, wm._download_bytes = wm._download_bytes, fake
+        try:
+            result = wm.get_media_path(d, entry["id"])
+        finally:
+            wm._download_bytes = original
+
+        assert len(calls) == 1, "a corrupt cache hit must trigger exactly one re-download"
+        assert result.read_bytes() == FAKE_IMAGE_BYTES
+
+
 def test_a_new_attachment_on_the_same_jid_gets_its_own_cache_key():
     """upsert_queue overwrites the entry's attachment in place (same entry
     id), but a different fileSHA256 must still produce a fresh file rather
@@ -307,6 +331,35 @@ def test_a_new_attachment_on_the_same_jid_gets_its_own_cache_key():
 
 
 # --- Pruning -------------------------------------------------------------------
+
+
+def test_pruning_leaves_a_concurrent_temp_file_alone():
+    """A second, in-flight `wa-media get` stages its write with mkstemp in
+    the same account directory this call's prune pass sweeps. That temp
+    file must never be picked up as an age or size victim — it belongs to
+    a write nobody has finished yet, and deleting it would make the other
+    process's later os.replace fail with a missing source."""
+    with tmpdir() as t, _media_env(t) as d:
+        config = {"media_cache_max_bytes": 1, "media_cache_max_age_days": 3650}
+        (d / "config.json").write_text(json.dumps(config))
+        _prepare(d)
+        account_dir = wm._account_dir("personal")
+        concurrent_tmp = account_dir / "tmpxyz123.tmp"
+        concurrent_tmp.write_bytes(b"partially written by another process")
+        old_time = time.time() - 1000
+        os.utime(concurrent_tmp, (old_time, old_time))
+
+        store.upsert_queue(d, _entry())
+        calls, fake = _fake_download(body=FAKE_IMAGE_BYTES)
+        original, wm._download_bytes = wm._download_bytes, fake
+        try:
+            wm.get_media_path(d, "personal:1@s.whatsapp.net")
+        finally:
+            wm._download_bytes = original
+
+        assert concurrent_tmp.exists(), (
+            "a prune pass must never delete another invocation's in-progress "
+            "temp file")
 
 
 def test_pruning_respects_the_age_limit():
@@ -442,6 +495,44 @@ def test_clear_rejects_a_hostile_account_argument():
             assert False, "expected a refusal"
         except ValueError:
             pass
+
+
+# --- Limits: a hand-edited config.json must never disable the cap ------------
+
+
+def test_limits_fall_back_to_defaults_on_a_negative_max_bytes():
+    with tmpdir() as t, _media_env(t) as d:
+        (d / "config.json").write_text(json.dumps({"media_cache_max_bytes": -1}))
+        max_bytes, max_age_days = wm._limits(d)
+        assert max_bytes == wm.DEFAULT_MAX_BYTES
+        assert max_age_days == wm.DEFAULT_MAX_AGE_DAYS
+
+
+def test_limits_fall_back_to_defaults_on_a_zero_max_age():
+    with tmpdir() as t, _media_env(t) as d:
+        (d / "config.json").write_text(json.dumps({"media_cache_max_age_days": 0}))
+        max_bytes, max_age_days = wm._limits(d)
+        assert max_bytes == wm.DEFAULT_MAX_BYTES
+        assert max_age_days == wm.DEFAULT_MAX_AGE_DAYS
+
+
+def test_limits_fall_back_to_defaults_on_a_non_numeric_value():
+    with tmpdir() as t, _media_env(t) as d:
+        (d / "config.json").write_text(json.dumps({
+            "media_cache_max_bytes": "unlimited",
+            "media_cache_max_age_days": "forever",
+        }))
+        max_bytes, max_age_days = wm._limits(d)
+        assert max_bytes == wm.DEFAULT_MAX_BYTES
+        assert max_age_days == wm.DEFAULT_MAX_AGE_DAYS
+
+
+def test_limits_honour_a_valid_configured_value():
+    with tmpdir() as t, _media_env(t) as d:
+        (d / "config.json").write_text(json.dumps({
+            "media_cache_max_bytes": 42, "media_cache_max_age_days": 7,
+        }))
+        assert wm._limits(d) == (42, 7)
 
 
 if __name__ == "__main__":

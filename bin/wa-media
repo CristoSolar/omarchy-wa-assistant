@@ -29,6 +29,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -81,6 +82,17 @@ EXTENSIONS = {
 
 DEFAULT_MAX_BYTES = 500 * 1024 * 1024  # 500 MiB
 DEFAULT_MAX_AGE_DAYS = 30
+
+# What a cached file's OWN name looks like: a 64-character lowercase hex
+# digest (_cache_key's output) followed by a short lowercase-alnum
+# extension (_extension's output, whichever branch produced it). Pruning
+# matches against this shape rather than against "not a temp file",
+# because that is a positive statement about what this script wrote —
+# it stays correct even if a future change alters how temp files are
+# named (mkstemp's suffix, a different tempfile module, ...), whereas a
+# negative "isn't a temp name" rule silently stops protecting a temp
+# file the moment its naming changes.
+CACHE_NAME_RE = re.compile(r"\A[0-9a-f]{64}\.[a-z0-9]{1,10}\Z")
 
 
 class MediaRefused(Exception):
@@ -361,11 +373,25 @@ def _prune(root: Path, max_bytes, max_age_days, protect: Path) -> None:
     the configured limits exist precisely so an old file survives long
     enough in practice, and a user who reopens something pruned simply
     triggers a fresh download.
+
+    A second exclusion, just as load-bearing: only files whose NAME
+    matches a finished cache entry's shape (CACHE_NAME_RE) are ever a
+    deletion candidate. `_atomic_write_bytes` stages its write with
+    `tempfile.mkstemp(dir=path.parent, ...)` — inside this very tree —
+    so a second `wa-media get` running concurrently for a different
+    attachment has its own in-progress temp file sitting right next to
+    everything else `rglob("*")` finds. Picking that up as an age/size
+    victim would unlink a file another process still owns, and its
+    later `os.replace` would then die on a missing source. Matching the
+    finished-name shape is a positive allowlist (this is what my own
+    completed writes look like), not a denylist of today's temp-suffix
+    convention, so it keeps holding even if that convention changes
+    later.
     """
     protect = protect.resolve()
     entries = []
     for p in root.rglob("*"):
-        if not p.is_file():
+        if not p.is_file() or not CACHE_NAME_RE.match(p.name):
             continue
         rp = p.resolve()
         if rp == protect:
@@ -446,6 +472,28 @@ def _download_bytes(account, attachment, entry_id) -> bytes:
         raise DownloadFailed(entry_id, f"no se pudo decodificar la respuesta: {exc}") from None
 
 
+def _is_sane_cache_hit(path: Path) -> bool:
+    """A cheap, non-decoding sanity check before trusting an existing file.
+
+    `_atomic_write_bytes` makes a zero-byte or half-written file unlikely
+    from this script's own hand, but "unlikely from here" is not
+    "impossible": a disk-full during `os.replace`, a `SIGKILL` that skips
+    even the cleanup handler, or a person poking at the cache by hand can
+    still leave a zero-byte or truncated regular file exactly where a
+    real one is expected. Serving that silently is worse than fetching
+    again — the panel would show a broken image with nothing to say why.
+    This does not validate the media itself (that would mean decoding
+    every image/audio/document format this script can cache, real work
+    for a check that runs on every hit); it only refuses to trust a hit
+    that could not possibly be a real download, which a merely-empty or
+    unreadable file already is.
+    """
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def get_media_path(d, entry_id) -> Path:
     """The cached path for an entry's attachment, downloading it once if needed."""
     entry = _entry(d, entry_id)
@@ -454,7 +502,7 @@ def get_media_path(d, entry_id) -> Path:
     account = resolve_account(d, entry, entry_id)
     attachment = _attachment_or_refuse(entry, entry_id)
     path = _cached_path(account["id"], entry_id, attachment)
-    if path.exists():
+    if path.exists() and _is_sane_cache_hit(path):
         return path
 
     raw = _download_bytes(account, attachment, entry_id)
