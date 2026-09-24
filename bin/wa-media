@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # bin/wa-media
-"""Download a queue entry's attachment and cache it, or clear the cache.
+"""Download a queue entry's attachment and cache it, report its size, or
+clear it.
 
 Same account rule that governs bin/wa-reply, and it is not negotiable: the
 account comes from the queue entry's own `account` field and nothing else
@@ -534,6 +535,43 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
+# --- Size --------------------------------------------------------------------
+
+
+def cache_size(account_id=None) -> int:
+    """Total bytes the cache (or one account's slice of it) holds on disk.
+
+    Exists so nothing outside this script needs to know where the cache
+    lives — the same boundary `clear_cache` already keeps: a caller (the
+    panel) asks THIS script, the one place that already owns
+    media_root()/state_root()'s knowledge, rather than reconstructing that
+    path itself from an assumed default and an assumed env var name that
+    can silently drift out of sync with sink/store.py.
+
+    Counts every regular file under the target directory, not just ones
+    matching CACHE_NAME_RE — unlike `_prune`, this is a read that never
+    writes or deletes anything, so there is no in-progress-temp-file
+    hazard to guard against, and a stray file left by hand should still
+    count toward "how much does this take" rather than being invisible.
+    """
+    root = media_root()
+    if account_id is None:
+        base = root
+    else:
+        accounts.validate_id(account_id)
+        base = root / account_id
+    if not base.is_dir():
+        return 0
+    total = 0
+    for p in base.rglob("*"):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
 # --- Clearing ----------------------------------------------------------------
 
 
@@ -571,6 +609,18 @@ def cmd_clear(args):
                      ensure_ascii=False))
 
 
+def cmd_size(args):
+    # Same shape cmd_clear already uses for the same --account distinction
+    # ("all" vs a specific id in "scope"), so a caller parsing one of
+    # these subcommands' output already knows the other's.
+    try:
+        n = cache_size(args.account)
+    except ValueError as exc:
+        raise MediaRefused({"ok": False, "error": str(exc)}) from None
+    print(json.dumps({"ok": True, "bytes": n, "scope": args.account or "all"},
+                     ensure_ascii=False))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -580,6 +630,10 @@ def main():
     p.add_argument("--account", default=None,
                    help="clear only this account's cache; omit for all")
     p.set_defaults(fn=cmd_clear)
+    p = sub.add_parser("size")
+    p.add_argument("--account", default=None,
+                   help="size of only this account's cache; omit for the whole cache")
+    p.set_defaults(fn=cmd_size)
     args = ap.parse_args()
     try:
         args.fn(args)

@@ -78,13 +78,15 @@ ColumnLayout {
 
   // -------------------------------------------------------------------
   // Media cache — the caché de adjuntos the 2026-09-23 media-viewing plan
-  // adds (bin/wa-media). Size is read directly off disk: wa-media itself
-  // exposes only `get` and `clear` (whole cache, or one account's — see
-  // its own module docstring), never a "how big is it" query, so asking
-  // it here would mean inventing an interface it does not offer rather
-  // than reading the one it does. `clear` (no --account) is the one this
-  // control uses, whole-cache, since this is a single global control, not
-  // one per account.
+  // adds (bin/wa-media). Size and clearing both go through wa-media's own
+  // subcommands (`size`, `clear`) — never a path or an env var name
+  // reconstructed here. That is the whole point: this screen must stay
+  // unable to know anything about where state lives that the scripts
+  // themselves do not tell it, the same boundary that already keeps it
+  // unable to send a message (see this file's own header). A hardcoded
+  // "${WA_STATE_ROOT:-$HOME/...}/media" guess would silently drift out of
+  // sync with sink/store.py's state_root() the day either one changes,
+  // and report a reassuring zero over a directory nobody is writing to.
   // -------------------------------------------------------------------
 
   property real mediaCacheBytes: -1
@@ -108,32 +110,44 @@ ColumnLayout {
     if (mediaSizeProc.running)
       return
     root.mediaCacheError = ""
-    // No new script, no new subcommand: this reads the exact directory
-    // bin/wa-media's own media_root() writes to (a sibling of state/,
-    // named "media", under $WA_STATE_ROOT or its documented default —
-    // see sink/store.py's state_root()), the same way this whole panel
-    // already reads state on disk through wa-reply's read subcommands.
-    // `du -sb` over a missing directory is treated as "0 bytes", not an
-    // error — an empty cache is the normal starting state, not a fault.
-    mediaSizeProc.command = ["bash", "-c",
-      "d=\"${WA_STATE_ROOT:-$HOME/.local/share/omarchy-wa}/media\"; " +
-      "if [ -d \"$d\" ]; then du -sb \"$d\" 2>/dev/null | cut -f1; " +
-      "else echo 0; fi"]
+    mediaSizeTerminalSeen = false
+    mediaSizeProc.command = [root.pluginDir + "bin/wa-media", "size"]
     mediaSizeProc.running = true
   }
+
+  // Set only once a usable answer (parsed JSON, either shape) actually
+  // arrives. Checked in onExited the same way Panel.qml's `unlinkProc` and
+  // `pairProc` check their own terminal-event flags: a process that dies
+  // without ever printing something this handler could parse — killed,
+  // crashed before writing a line — must not leave the size silently
+  // wherever it last was; it has to say plainly that nothing was learned.
+  property bool mediaSizeTerminalSeen: false
 
   Process {
     id: mediaSizeProc
     stdout: StdioCollector {
       onStreamFinished: {
-        var n = parseInt(String(text).trim(), 10)
-        if (isNaN(n) || n < 0) {
-          root.mediaCacheBytes = -1
-          root.mediaCacheError = "no se pudo calcular el tamaño de la caché"
-        } else {
-          root.mediaCacheBytes = n
+        var r = null
+        try { r = JSON.parse(text) } catch (e) { r = null }
+        if (r && r.ok && typeof r.bytes === "number") {
+          root.mediaSizeTerminalSeen = true
+          root.mediaCacheBytes = r.bytes
           root.mediaCacheError = ""
+        } else if (r && r.ok === false) {
+          root.mediaSizeTerminalSeen = true
+          root.mediaCacheBytes = -1
+          root.mediaCacheError = r.error || "no se pudo calcular el tamaño de la caché"
         }
+        // Neither shape: leave mediaSizeTerminalSeen false and let
+        // onExited below report it — the same "no terminal event" case
+        // pairProc/unlinkProc already handle in Panel.qml/this file.
+      }
+    }
+    onExited: function (exitCode) {
+      if (!root.mediaSizeTerminalSeen) {
+        root.mediaCacheBytes = -1
+        root.mediaCacheError = "wa-media size terminó (código " + exitCode
+          + ") sin responder; no se sabe cuánto ocupa la caché."
       }
     }
   }

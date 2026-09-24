@@ -431,6 +431,69 @@ def test_pruning_never_removes_the_file_just_written_even_under_a_tiny_budget():
             "the one pruning removes")
 
 
+# --- Size --------------------------------------------------------------------
+
+
+def test_size_of_an_empty_cache_is_zero():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        assert wm.cache_size() == 0
+        assert wm.cache_size("personal") == 0
+
+
+def test_size_counts_the_whole_cache_across_accounts():
+    trabajo = {"id": "trabajo", "label": "Trabajo", "wuzapi_user": "trabajo",
+               "agent": "respuesta-trabajo.md", "quick_replies": []}
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d, accts=(PERSONAL, trabajo),
+                 tokens={"personal": "tok-personal", "trabajo": "tok-trabajo"})
+        store.upsert_queue(d, _entry())
+        entry_trabajo = _entry(entry_id="trabajo:2@s.whatsapp.net", account="trabajo")
+        store.upsert_queue(d, entry_trabajo)
+
+        calls, fake = _fake_download(body=b"12345")  # 5 bytes
+        original, wm._download_bytes = wm._download_bytes, fake
+        try:
+            wm.get_media_path(d, "personal:1@s.whatsapp.net")
+        finally:
+            wm._download_bytes = original
+        calls2, fake2 = _fake_download(body=b"1234567")  # 7 bytes
+        original, wm._download_bytes = wm._download_bytes, fake2
+        try:
+            wm.get_media_path(d, "trabajo:2@s.whatsapp.net")
+        finally:
+            wm._download_bytes = original
+
+        assert wm.cache_size() == 12
+        assert wm.cache_size("personal") == 5
+        assert wm.cache_size("trabajo") == 7
+
+
+def test_size_rejects_a_hostile_account_argument():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        try:
+            wm.cache_size("../../etc")
+            assert False, "expected a refusal"
+        except ValueError:
+            pass
+
+
+def test_size_reflects_a_clear():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        store.upsert_queue(d, _entry())
+        calls, fake = _fake_download(body=b"12345")
+        original, wm._download_bytes = wm._download_bytes, fake
+        try:
+            wm.get_media_path(d, "personal:1@s.whatsapp.net")
+        finally:
+            wm._download_bytes = original
+        assert wm.cache_size() == 5
+        wm.clear_cache()
+        assert wm.cache_size() == 0
+
+
 # --- Clearing --------------------------------------------------------------------
 
 

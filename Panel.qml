@@ -135,6 +135,11 @@ Panel {
   property string mediaPath: ""
   property string mediaError: ""
   property bool mediaLoading: false
+  // True from the moment xdg-open is launched (audio/video/document)
+  // until it actually exits, either way — the visible "still working"
+  // state for a step openProc's own onExited settles honestly rather
+  // than assuming success the instant it starts.
+  property bool openPending: false
   // Guards a stale response the same way requestDraft()'s `requestId`
   // does: if the user reselects a different chat while a download is in
   // flight, the late answer must not paint over the newly selected entry.
@@ -290,21 +295,64 @@ Panel {
   // `bin/wa-media` is the ONLY thing that ever downloads — this Process
   // shells out to it exactly the way every other Process here shells out
   // to wa-reply, and never touches wuzapi or a token directly.
+  //
+  // `terminalSeen`/`requestId` mirror SettingsView.qml's pairProc/
+  // unlinkProc pattern: `done` (fired from onStreamFinished) is the
+  // terminal event, and if the process exits without one ever having
+  // fired — killed, crashed before writing a line — `onExited` below is
+  // what stops the spinner and reports it, rather than leaving
+  // `mediaLoading` true forever with no way to retry.
   Process {
     id: mediaProc
     property var done: null
+    property bool terminalSeen: false
+    property string requestId: ""
     stdout: StdioCollector {
-      onStreamFinished: if (mediaProc.done) mediaProc.done(text)
+      onStreamFinished: {
+        mediaProc.terminalSeen = true
+        if (mediaProc.done) mediaProc.done(text)
+      }
+    }
+    onExited: function (exitCode) {
+      if (mediaProc.terminalSeen)
+        return
+      // Stale: the user already moved on (select() already reset every
+      // media property), so there is nothing left here to correct.
+      if (root.mediaRequestId !== mediaProc.requestId)
+        return
+      root.mediaLoading = false
+      root.mediaPath = ""
+      root.mediaError = "wa-media get terminó (código " + exitCode
+          + ") sin responder; no se sabe si el adjunto se descargó. Probá de nuevo."
     }
   }
 
-  // Fire-and-forget: hands the cached path to the system's own viewer for
-  // audio/video/document. Inline playback is out of scope by design (see
-  // the media-viewing spec), so this is the whole story for those types —
-  // there is no completion to report back into the UI beyond what
-  // fetchMedia() already showed ("se abrió con el visor del sistema").
+  // Hands the cached path to the system's own viewer for audio/video/
+  // document. Inline playback is out of scope by design (see the
+  // media-viewing spec), so this IS the whole action for those types —
+  // but "started" is not "succeeded": xdg-open can fail (missing binary,
+  // no handler registered, a broken $PATH), and reporting success
+  // regardless of its exit code is exactly the confident-lie shape this
+  // project has repeatedly shipped and corrected elsewhere today. Its
+  // exit code is checked below, honestly, rather than assumed.
   Process {
     id: openProc
+    property string requestId: ""
+    onExited: function (exitCode) {
+      root.openPending = false
+      if (root.mediaRequestId !== openProc.requestId)
+        return  // stale: the user already moved on to a different entry
+      if (exitCode !== 0) {
+        // The download itself succeeded (mediaPath was already set) —
+        // only the handoff to the system viewer failed. Clearing
+        // mediaPath re-shows the button as "Reintentar" rather than
+        // leaving a silent "Se abrió…" claim on screen that never
+        // actually happened.
+        root.mediaPath = ""
+        root.mediaError = "no se pudo abrir el adjunto con el visor del "
+            + "sistema (xdg-open salió con código " + exitCode + ")."
+      }
+    }
   }
 
   // Downloads (or re-serves from cache) the current entry's attachment via
@@ -325,6 +373,8 @@ Panel {
     root.mediaRequestId = requestId
     root.mediaError = ""
     root.mediaLoading = true
+    mediaProc.terminalSeen = false
+    mediaProc.requestId = requestId
     mediaProc.command = [root.pluginDir + "bin/wa-media", "get", requestId]
     mediaProc.done = function (out) {
       // The selection may have moved on while this was in flight — same
@@ -342,8 +392,11 @@ Panel {
         // Only the two inline-image types stay in the panel; everything
         // else downloadable hands straight off to the system viewer —
         // there is no "open" button distinct from the download button for
-        // those, one click does both steps.
+        // those, one click does both steps. Its own exit code is what
+        // decides whether this is actually a success — see openProc.
         if (!root.attachmentIsImage) {
+          root.openPending = true
+          openProc.requestId = requestId
           openProc.command = ["xdg-open", parsed.path]
           openProc.running = true
         }
@@ -489,6 +542,7 @@ Panel {
     root.mediaPath = ""
     root.mediaError = ""
     root.mediaLoading = false
+    root.openPending = false
     root.mediaRequestId = ""
     // Every chat opens on the extract, never straight into the composer
     // — reading and writing are deliberately separate steps.
@@ -1074,12 +1128,25 @@ Panel {
               wrapMode: Text.Wrap; Layout.fillWidth: true
             }
 
-            // Audio/video/document: xdg-open already ran the moment the
-            // download finished (see fetchMedia()) — this just confirms
-            // it, since there is nothing else this panel shows for them.
+            // Audio/video/document: xdg-open launched the moment the
+            // download finished (see fetchMedia()), but "launched" is not
+            // "succeeded" — this waits for its own exit code (openProc's
+            // onExited) before claiming it worked. A failure there clears
+            // mediaPath and shows mediaError instead (the Text above),
+            // re-offering the button as a retry, so this line is only
+            // ever true when it is actually true.
+            Text {
+              textFormat: Text.PlainText
+              visible: root.openPending
+              text: "Abriendo con el visor del sistema…"
+              color: root.contentForeground
+              font.family: root.contentFontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
             Text {
               textFormat: Text.PlainText
               visible: root.mediaPath !== "" && !root.attachmentIsImage
+                       && !root.openPending
               text: "Se abrió con el visor del sistema."
               color: Color.accent
               font.family: root.contentFontFamily
