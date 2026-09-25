@@ -734,8 +734,32 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
+    // Width stays a plain constant: every child either wraps (Text.Wrap),
+    // elides, or binds its own width to whatever the column is given via
+    // Layout.fillWidth — nothing in this panel has a natural width that
+    // would push the column wider than this, so there is nothing for a
+    // real implicit width to report that 420 doesn't already cover.
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(Style.space(400))
+    // Height used to be the same kind of constant, but unlike width it
+    // WAS wrong: the attachment viewer (an image up to Style.space(480)
+    // tall, plus its controls) sits below the extract's own chrome as a
+    // normal, non-fillHeight sibling, so its real height was never part
+    // of the fixed 400 budget — nothing clipped at that boundary, so it
+    // (and the Volver/Responder row after it) simply rendered past the
+    // panel's decorated box. Follow the network panel's convention
+    // (Panel.qml:986 there) and size the box off the column's own
+    // implicitHeight, which already accounts for whichever screen is
+    // visible (Layout skips hidden siblings) and for the attachment's
+    // real height. `Math.max` keeps the same floor the panel always had
+    // for the queue list, settings and composer screens — none of their
+    // scrollable regions (fillHeight ListViews/ScrollViews) contribute a
+    // meaningful implicitHeight of their own, so without the floor they
+    // would collapse to a sliver instead of keeping the room they always
+    // had. fittedContentHeight still caps the result to the screen, and
+    // the ring ListView (Layout.fillHeight, clip, StopAtBounds) is what
+    // shrinks and scrolls when a long extract plus a tall photo together
+    // don't fit — no second, nested scroll area is added.
+    contentHeight: panel.fittedContentHeight(Math.max(Style.space(400), column.implicitHeight))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -751,6 +775,7 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
       ColumnLayout {
+        id: column
         anchors.fill: parent
         anchors.margins: Style.spacing.panelPadding
         spacing: Style.spacing.lg
