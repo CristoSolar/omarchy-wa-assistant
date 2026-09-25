@@ -116,6 +116,54 @@ def extract(event: dict, groups_enabled) -> dict | None:
     return entry
 
 
+def extract_own_message(event: dict) -> dict | None:
+    """The ring-entry ingredients for a message the owner sent from ANY
+    device (`IsFromMe` true), or None if this event isn't one of those.
+
+    Unlike `extract`, this never looks at `groups_enabled` — a message the
+    owner sent is never something to queue as incoming, so the group
+    allow-list (which exists to keep unwanted group chatter out of the
+    queue) has nothing to say about it here.
+    """
+    info = (event or {}).get("event", {}).get("Info", {})
+    if not isinstance(info, dict) or not info.get("IsFromMe"):
+        return None
+    jid = info.get("Chat", "")
+    if not jid:
+        return None
+    message = (event or {}).get("event", {}).get("Message", {})
+    return {"jid": jid, "text": _text_of(message), "ts": info.get("Timestamp", "")}
+
+
+def extract_read_receipt(event: dict) -> dict | None:
+    """The chat jid a `ReadReceipt` says the OWNER has now read, or None.
+
+    A read receipt travels in both directions and wuzapi tells them apart
+    with its own `state` field, set from whatsmeow's ReceiptType:
+
+    - "ReadSelf" — one of the owner's OTHER devices marked an incoming
+      chat as read. This is "the owner is caught up on it" — the signal
+      this function exists to recognise.
+    - "Read" — the *other* party read a message the owner sent. The
+      opposite direction; must never be treated as "handled" (see the
+      design doc's "la trampa").
+    - "Delivered" (or anything else) — no read information at all.
+
+    The direction is read from this one field, never inferred from
+    `IsFromMe`/`IsGroup` on the receipt itself: those describe whose chat
+    the receipt is about, not which side did the reading.
+    """
+    if not event or event.get("state") != "ReadSelf":
+        return None
+    receipt = event.get("event")
+    if not isinstance(receipt, dict):
+        return None
+    jid = receipt.get("Chat", "")
+    if not jid:
+        return None
+    return {"jid": jid}
+
+
 def describe_skipped_group(event: dict, groups_enabled) -> dict | None:
     """Identify a group message dropped only because its JID isn't enabled.
 

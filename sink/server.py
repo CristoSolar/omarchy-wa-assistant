@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sink import accounts as accounts_module
 from sink import store
-from sink.events import describe_skipped_group, extract
+from sink.events import describe_skipped_group, extract, extract_own_message, extract_read_receipt
 from sink.purge import purge_history
 
 PORT = 8099
@@ -54,10 +54,103 @@ def _decode(raw: bytes, content_type: str):
     return event, instance_name
 
 
+def _log_unknown_instance_once(instance_name, jid) -> None:
+    if instance_name not in _logged_unknown_instances:
+        _logged_unknown_instances.add(instance_name)
+        print(f"skipping message from unrecognised instanceName "
+             f"(not in accounts.json): instance={instance_name!r} "
+             f"jid={jid!r}",
+             file=sys.stderr, flush=True)
+
+
+def _remove_unless_ambiguous(data_dir, account_id, jid) -> bool:
+    """Remove that chat's queue entry, unless its status is ambiguous.
+
+    An entry left `unknown` or `sending` may correspond to a send that
+    reached the recipient without confirmation reaching us; it is the only
+    record of that ambiguity, so neither a read receipt nor an own-device
+    message may silently clear it. Returns True only if an entry actually
+    was removed, so callers can tell "cleared" from "nothing to clear" and
+    from "kept on purpose".
+    """
+    entry_id = store.entry_id(account_id, jid)
+    for e in store.load_queue(data_dir):
+        if e["id"] == entry_id:
+            if e.get("status") in ("unknown", "sending"):
+                return False
+            store.remove_queue(data_dir, entry_id)
+            return True
+    return False
+
+
+def _handle_read_receipt(event, instance_name, data_dir) -> bool:
+    receipt = extract_read_receipt(event)
+    if receipt is None:
+        return False
+    accounts = accounts_module.load(data_dir)
+    account = accounts_module.by_instance(accounts, instance_name)
+    if account is None:
+        _log_unknown_instance_once(instance_name, receipt["jid"])
+        return False
+    return _remove_unless_ambiguous(data_dir, account["id"], receipt["jid"])
+
+
+def _handle_own_message(own, instance_name, data_dir) -> bool:
+    accounts = accounts_module.load(data_dir)
+    account = accounts_module.by_instance(accounts, instance_name)
+    if account is None:
+        _log_unknown_instance_once(instance_name, own["jid"])
+        return False
+
+    account_id = account["id"]
+    jid = own["jid"]
+    # The echo: a send made through the plugin (bin/wa-reply) already wrote
+    # this exact text to this chat's ring as "out" before this event ever
+    # arrived. There is no message id or send-token shared between the two
+    # processes to correlate on, so the only signal available here is
+    # content: if the ring's own MOST RECENT entry for this chat is already
+    # that same outgoing text, treat this as that echo and do not append a
+    # second copy.
+    #
+    # This is a bounded, deliberate trade-off, not a perfect match: it can
+    # only ever suppress a message that is byte-identical to and
+    # immediately adjacent to the last ring entry. Anything landing in
+    # between — an inbound message, a different own message — "ages out"
+    # the match, so a later, independent own message reusing the same
+    # words is recorded normally (see
+    # test_a_later_message_with_the_same_words_is_still_recorded). The one
+    # case this cannot tell apart from the echo is the owner genuinely
+    # sending the exact same text twice from the phone back-to-back with
+    # nothing at all in between; that vanishingly rare duplicate collapses
+    # to one ring entry, which is a far smaller loss than the certainty of
+    # duplicating every single plugin reply that this check exists to
+    # prevent.
+    ring = store.load_context(data_dir, jid, account_id)
+    last = ring[-1] if ring else None
+    is_echo = (isinstance(last, dict) and last.get("direction") == "out"
+              and last.get("text") == own["text"])
+    wrote = False
+    if not is_echo:
+        store.append_context(data_dir, jid,
+                             {"direction": "out", "text": own["text"],
+                              "ts": own["ts"]}, account_id)
+        wrote = True
+    removed = _remove_unless_ambiguous(data_dir, account_id, jid)
+    return wrote or removed
+
+
 def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     event, instance_name = _decode(raw, content_type)
     if event is None:
         return False
+
+    if isinstance(event, dict) and event.get("type") == "ReadReceipt":
+        return _handle_read_receipt(event, instance_name, data_dir)
+
+    own = extract_own_message(event)
+    if own is not None:
+        return _handle_own_message(own, instance_name, data_dir)
+
     config = store.load_config(data_dir)
     groups_enabled = config.get("groups_enabled", [])
     entry = extract(event, groups_enabled)

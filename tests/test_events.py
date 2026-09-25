@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run
-from sink.events import describe_skipped_group, extract
+from sink.events import (describe_skipped_group, extract, extract_own_message,
+                        extract_read_receipt)
 
 TS = "2026-09-22T16:00:00Z"
 
@@ -209,6 +210,64 @@ def test_contact_message_is_never_downloadable():
     out = extract(ev, [])
     assert out["text"] == "[contacto]"
     assert out["attachment"]["downloadable"] is False
+
+
+# --- Task 1: own-device messages and read receipts -----------------------
+
+
+def test_extract_own_message_reads_a_from_me_message():
+    ev = _ev(IsFromMe=True)
+    out = extract_own_message(ev)
+    assert out == {"jid": "56911111111@s.whatsapp.net", "text": "hola", "ts": TS}
+
+
+def test_extract_own_message_is_none_for_a_message_from_someone_else():
+    assert extract_own_message(_ev()) is None
+
+
+def test_extract_own_message_is_none_without_a_chat_jid():
+    ev = _ev(IsFromMe=True, Chat="")
+    assert extract_own_message(ev) is None
+
+
+def test_extract_own_message_ignores_the_group_allow_list_entirely():
+    # A message the owner sent, even into a group nobody enabled, is still
+    # the owner's own side of the conversation - the group allow-list has
+    # nothing to say about outgoing content.
+    ev = _ev(IsFromMe=True, Chat="123@g.us", IsGroup=True)
+    out = extract_own_message(ev)
+    assert out is not None and out["jid"] == "123@g.us"
+
+
+def _receipt(state, chat="56911111111@s.whatsapp.net", **fields):
+    base = {"Chat": chat, "Sender": chat, "IsFromMe": False, "IsGroup": False,
+            "MessageIDs": ["ABC123"], "Timestamp": TS, "Type": "read"}
+    base.update(fields)
+    return {"type": "ReadReceipt", "state": state, "event": base}
+
+
+def test_read_self_receipt_gives_the_chat_jid():
+    out = extract_read_receipt(_receipt("ReadSelf"))
+    assert out == {"jid": "56911111111@s.whatsapp.net"}
+
+
+def test_plain_read_receipt_is_none_the_other_party_read_the_owners_message():
+    assert extract_read_receipt(_receipt("Read")) is None
+
+
+def test_delivered_receipt_carries_no_read_direction():
+    assert extract_read_receipt(_receipt("Delivered")) is None
+
+
+def test_read_receipt_without_a_chat_jid_is_none():
+    ev = _receipt("ReadSelf", chat="")
+    assert extract_read_receipt(ev) is None
+
+
+def test_read_receipt_missing_state_is_none():
+    ev = _receipt("ReadSelf")
+    del ev["state"]
+    assert extract_read_receipt(ev) is None
 
 
 if __name__ == "__main__":

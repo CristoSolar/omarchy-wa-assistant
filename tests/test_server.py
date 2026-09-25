@@ -67,11 +67,15 @@ def test_inbound_ring_entry_is_marked_with_an_explicit_direction():
         assert ring[0]["direction"] == "in"
 
 
-def test_discarded_event_touches_nothing():
+def test_own_message_never_queues_as_incoming():
+    # Task 1: an own-device message is recorded in the ring and can clear a
+    # queue entry (see the dedicated tests below), but it must never itself
+    # become a NEW queue entry - it is the owner's own side, not something
+    # to answer.
     with tmpdir() as d:
         _write_accounts(d, [PERSONAL])
         ev = _event(is_from_me=True)
-        assert handle_payload(json.dumps(ev).encode(), "application/json", d) is False
+        handle_payload(json.dumps(ev).encode(), "application/json", d)
         assert store.load_queue(d) == []
 
 
@@ -275,6 +279,201 @@ def test_unexpected_exception_in_the_queueing_path_answers_500_not_crash():
             assert "disk exploded" in buf.getvalue()
         finally:
             store.upsert_queue = original
+
+
+# --- Task 1: own-device messages and read receipts -----------------------
+
+
+def _receipt(state, instance_name="omarchy",
+            chat="56911111111@s.whatsapp.net"):
+    return {"instanceName": instance_name, "type": "ReadReceipt", "state": state,
+            "event": {"Chat": chat, "Sender": chat, "IsFromMe": False,
+                     "IsGroup": False, "MessageIDs": ["ABC123"],
+                     "Timestamp": "2026-09-22T16:05:00Z", "Type": "read"}}
+
+
+def test_own_device_message_lands_in_the_ring_marked_outgoing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event(is_from_me=True, text="ya le contesté desde el celular")
+        assert handle_payload(json.dumps(ev).encode(), "application/json", d) is True
+        ring = store.load_context(d, "56911111111@s.whatsapp.net", "personal")
+        assert len(ring) == 1
+        assert ring[0]["direction"] == "out"
+        assert ring[0]["text"] == "ya le contesté desde el celular"
+
+
+def test_own_device_message_clears_that_chats_queue_entry():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        assert len(store.load_queue(d)) == 1
+        ev = _event(is_from_me=True, text="contestado desde el teléfono")
+        handle_payload(json.dumps(ev).encode(), "application/json", d)
+        assert store.load_queue(d) == []
+
+
+def test_plugins_own_echo_does_not_duplicate_the_ring_entry():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        jid = "56911111111@s.whatsapp.net"
+        # bin/wa-reply already wrote this exact "out" entry after a
+        # confirmed send, before the echo of that same send reaches us.
+        store.append_context(d, jid, {"direction": "out", "text": "ok, gracias",
+                                      "ts": "2026-09-22T16:01:00Z"}, "personal")
+        ev = _event(text="ok, gracias")
+        ev["event"]["Info"]["IsFromMe"] = True
+        handle_payload(json.dumps(ev).encode(), "application/json", d)
+        ring = store.load_context(d, jid, "personal")
+        assert len(ring) == 1, "the echo of the plugin's own send must not duplicate"
+
+
+def test_a_later_message_with_the_same_words_is_still_recorded():
+    # The echo check only compares against the ring's OWN most recent
+    # entry. As soon as anything else lands in between - here, another
+    # inbound message from the contact - a later own message that happens
+    # to reuse the same words is no longer adjacent to a matching "out"
+    # entry, so it must be recorded rather than silently swallowed as if it
+    # were the earlier send's echo.
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        jid = "56911111111@s.whatsapp.net"
+        own = _event(text="ok")
+        own["event"]["Info"]["IsFromMe"] = True
+        handle_payload(json.dumps(own).encode(), "application/json", d)
+        handle_payload(json.dumps(_event(text="¿en serio?")).encode(),
+                       "application/json", d)
+        handle_payload(json.dumps(own).encode(), "application/json", d)
+        ring = store.load_context(d, jid, "personal")
+        out_texts = [m["text"] for m in ring if m["direction"] == "out"]
+        assert out_texts == ["ok", "ok"], \
+            "a genuine repeat separated by another message must be recorded"
+
+
+def test_own_device_messages_still_respect_the_ring_cap():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        jid = "56911111111@s.whatsapp.net"
+        for i in range(store.CONTEXT_LIMIT + 5):
+            ev = _event(is_from_me=True, text=f"msg {i}")
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+        ring = store.load_context(d, jid, "personal")
+        assert len(ring) == store.CONTEXT_LIMIT
+        assert ring[-1]["text"] == f"msg {store.CONTEXT_LIMIT + 4}"
+
+
+def test_read_self_receipt_clears_that_chats_queue_entry():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        assert len(store.load_queue(d)) == 1
+        handle_payload(json.dumps(_receipt("ReadSelf")).encode(), "application/json", d)
+        assert store.load_queue(d) == []
+
+
+def test_plain_read_receipt_does_not_clear_the_queue():
+    # This is the trap: a contact opening the owner's own message must not
+    # empty the very entry that is waiting for a reply.
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        assert len(store.load_queue(d)) == 1
+        handle_payload(json.dumps(_receipt("Read")).encode(), "application/json", d)
+        assert len(store.load_queue(d)) == 1
+
+
+def test_read_receipt_for_a_chat_with_no_entry_does_nothing():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        assert handle_payload(json.dumps(_receipt("ReadSelf")).encode(),
+                              "application/json", d) is False
+        assert store.load_queue(d) == []
+
+
+def test_unknown_status_entry_survives_an_own_device_message():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        eid = store.entry_id("personal", "56911111111@s.whatsapp.net")
+        store.set_status(d, eid, "unknown")
+        ev = _event(is_from_me=True, text="respondido")
+        handle_payload(json.dumps(ev).encode(), "application/json", d)
+        q = store.load_queue(d)
+        assert len(q) == 1 and q[0]["status"] == "unknown"
+
+
+def test_sending_status_entry_survives_a_read_self_receipt():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        eid = store.entry_id("personal", "56911111111@s.whatsapp.net")
+        store.set_status(d, eid, "sending")
+        handle_payload(json.dumps(_receipt("ReadSelf")).encode(), "application/json", d)
+        q = store.load_queue(d)
+        assert len(q) == 1 and q[0]["status"] == "sending"
+
+
+def test_unknown_status_entry_survives_a_read_self_receipt():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        eid = store.entry_id("personal", "56911111111@s.whatsapp.net")
+        store.set_status(d, eid, "unknown")
+        handle_payload(json.dumps(_receipt("ReadSelf")).encode(), "application/json", d)
+        q = store.load_queue(d)
+        assert len(q) == 1 and q[0]["status"] == "unknown"
+
+
+def test_sending_status_entry_survives_an_own_device_message():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        handle_payload(json.dumps(_event()).encode(), "application/json", d)
+        eid = store.entry_id("personal", "56911111111@s.whatsapp.net")
+        store.set_status(d, eid, "sending")
+        ev = _event(is_from_me=True, text="respondido")
+        handle_payload(json.dumps(ev).encode(), "application/json", d)
+        q = store.load_queue(d)
+        assert len(q) == 1 and q[0]["status"] == "sending"
+
+
+def test_own_device_message_from_an_unknown_instance_is_dropped_and_logged_once():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        server._logged_unknown_instances.clear()
+        ev = _event(instance_name="ghost3", is_from_me=True)
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+        assert store.load_context(d, "56911111111@s.whatsapp.net", "personal") == []
+        assert buf.getvalue().count("ghost3") == 1
+
+
+def test_read_receipt_from_an_unknown_instance_is_dropped_and_logged_once():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        server._logged_unknown_instances.clear()
+        ev = _receipt("ReadSelf", instance_name="ghost4")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+            handle_payload(json.dumps(ev).encode(), "application/json", d)
+        assert buf.getvalue().count("ghost4") == 1
+
+
+def test_own_device_message_answers_200():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        ev = _event(is_from_me=True, text="desde el teléfono")
+        assert response_status(json.dumps(ev).encode(), "application/json", d) == 200
+
+
+def test_read_receipt_answers_200():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        status = response_status(json.dumps(_receipt("Read")).encode(),
+                                 "application/json", d)
+        assert status == 200
 
 
 if __name__ == "__main__":
