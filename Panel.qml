@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtMultimedia
 import Quickshell
 import Quickshell.Io
 import qs.Ui
@@ -118,13 +119,19 @@ Panel {
   readonly property var currentAttachment: root.current ? (root.current.attachment || null) : null
   readonly property bool hasAttachment: root.currentAttachment !== null && root.currentAttachment !== undefined
   readonly property bool attachmentDownloadable: root.hasAttachment && root.currentAttachment.downloadable === true
-  // Images and stickers are the only types this panel ever displays
-  // inline (both cache to a raster file wa-media can hand back — see its
-  // EXTENSIONS map). Everything else downloadable (audio, video,
-  // document) opens with the system viewer instead — inline playback and
-  // video preview are explicitly out of scope for this task.
+  // Images and stickers are the only types this panel ever displays as a
+  // raster file (both cache to one wa-media can hand back — see its
+  // EXTENSIONS map).
   readonly property bool attachmentIsImage: root.hasAttachment
       && (root.currentAttachment.type === "image" || root.currentAttachment.type === "sticker")
+  // Audio plays inline too, via QtMultimedia's MediaPlayer (see
+  // audioPlayer below) — the owner's own framing for this plugin ("casi
+  // como un ZapZap pocket sin usar navegador") rules out handing audio to
+  // xdg-open the same way it would rule out opening ZapZap itself. Video
+  // and document remain out of scope for inline preview and still open
+  // with the system viewer, same as before.
+  readonly property bool attachmentIsAudio: root.hasAttachment
+      && root.currentAttachment.type === "audio"
 
   // Media download state (Task 3 of the 2026-09-23 media-viewing plan).
   // Kept apart from `status`/`statusWarn` (the send/draft status line)
@@ -164,6 +171,18 @@ Panel {
       "ubicación": "una ubicación", "contacto": "un contacto",
     }
     return labels[atype] || ("un adjunto de tipo " + atype)
+  }
+
+  // m:ss for the audio player's elapsed/total labels. MediaPlayer reports
+  // position/duration in milliseconds; 0 or unknown (-1, NaN before the
+  // file has loaded) both read as "0:00" rather than a negative or blank
+  // time.
+  function formatDuration(ms) {
+    if (!ms || ms <= 0) return "0:00"
+    var totalSeconds = Math.floor(ms / 1000)
+    var minutes = Math.floor(totalSeconds / 60)
+    var seconds = totalSeconds % 60
+    return minutes + ":" + (seconds < 10 ? "0" : "") + seconds
   }
 
   // The label for one account id, or the id itself when accounts.json
@@ -327,14 +346,14 @@ Panel {
     }
   }
 
-  // Hands the cached path to the system's own viewer for audio/video/
-  // document. Inline playback is out of scope by design (see the
-  // media-viewing spec), so this IS the whole action for those types —
-  // but "started" is not "succeeded": xdg-open can fail (missing binary,
-  // no handler registered, a broken $PATH), and reporting success
-  // regardless of its exit code is exactly the confident-lie shape this
-  // project has repeatedly shipped and corrected elsewhere today. Its
-  // exit code is checked below, honestly, rather than assumed.
+  // Hands the cached path to the system's own viewer for video/document
+  // (audio plays inline via audioPlayer below, not through here anymore).
+  // This IS the whole action for those remaining types — but "started" is
+  // not "succeeded": xdg-open can fail (missing binary, no handler
+  // registered, a broken $PATH), and reporting success regardless of its
+  // exit code is exactly the confident-lie shape this project has
+  // repeatedly shipped and corrected elsewhere today. Its exit code is
+  // checked below, honestly, rather than assumed.
   Process {
     id: openProc
     property string requestId: ""
@@ -352,6 +371,31 @@ Panel {
         root.mediaError = "no se pudo abrir el adjunto con el visor del "
             + "sistema (xdg-open salió con código " + exitCode + ")."
       }
+    }
+  }
+
+  // Inline audio playback (task: "los audios ... que tengamos un
+  // reproductor de audio ahí mismo, no que lo baje como adjunto"). Built
+  // on QtMultimedia's MediaPlayer/AudioOutput — Quickshell's own Qt6
+  // install already links this (ffmpeg-backed; confirmed by opening a
+  // real opus-in-ogg voice note during development), so this is not a new
+  // dependency and not a hand-rolled decoder. `source` tracks mediaPath
+  // reactively and goes empty the moment mediaPath is cleared (select(),
+  // or the error path below), which stops playback the same way emptying
+  // an Image's source does.
+  MediaPlayer {
+    id: audioPlayer
+    source: (root.mediaPath !== "" && root.attachmentIsAudio)
+        ? ("file://" + root.mediaPath) : ""
+    audioOutput: AudioOutput {}
+    // Same honest-failure shape as mediaImage's onStatusChanged: a cached
+    // file that was pruned since it was downloaded (or was never really
+    // playable audio) must degrade to a clear message, never a player
+    // that just silently sits at 0:00.
+    onErrorOccurred: function (error, errorString) {
+      root.mediaError = "el archivo ya no está en la caché (puede haberse "
+          + "podado) o no se pudo reproducir como audio. Probá de nuevo."
+      root.mediaPath = ""
     }
   }
 
@@ -389,12 +433,15 @@ Panel {
       if (parsed && parsed.ok && parsed.path) {
         root.mediaPath = parsed.path
         root.mediaError = ""
-        // Only the two inline-image types stay in the panel; everything
-        // else downloadable hands straight off to the system viewer —
-        // there is no "open" button distinct from the download button for
-        // those, one click does both steps. Its own exit code is what
-        // decides whether this is actually a success — see openProc.
-        if (!root.attachmentIsImage) {
+        // Images stay inline via mediaBox, audio stays inline via
+        // audioPlayer; everything else downloadable hands straight off to
+        // the system viewer — there is no "open"/"play" button distinct
+        // from the download button for any of these, one click does both
+        // steps. For video/document, xdg-open's own exit code is what
+        // decides whether that step actually succeeded — see openProc.
+        if (root.attachmentIsAudio) {
+          audioPlayer.play()
+        } else if (!root.attachmentIsImage) {
           root.openPending = true
           openProc.requestId = requestId
           openProc.command = ["xdg-open", parsed.path]
@@ -544,6 +591,11 @@ Panel {
     root.mediaLoading = false
     root.openPending = false
     root.mediaRequestId = ""
+    // audioPlayer's own `source` binding already clears the instant
+    // mediaPath does (see audioPlayer above), which stops it — this is
+    // just the explicit, honest belt-and-suspenders stop() every other
+    // media-state reset in this function already gets.
+    audioPlayer.stop()
     // Every chat opens on the extract, never straight into the composer
     // — reading and writing are deliberately separate steps.
     root.composing = false
@@ -1102,7 +1154,8 @@ Panel {
               Button {
                 text: root.mediaLoading ? "Descargando…"
                       : (root.mediaError !== "" ? "Reintentar"
-                         : (root.attachmentIsImage ? "Ver imagen" : "Abrir"))
+                         : (root.attachmentIsImage ? "Ver imagen"
+                            : (root.attachmentIsAudio ? "Reproducir" : "Abrir")))
                 foreground: root.contentForeground
                 fontFamily: root.contentFontFamily
                 bordered: true
@@ -1128,13 +1181,14 @@ Panel {
               wrapMode: Text.Wrap; Layout.fillWidth: true
             }
 
-            // Audio/video/document: xdg-open launched the moment the
-            // download finished (see fetchMedia()), but "launched" is not
+            // Video/document: xdg-open launched the moment the download
+            // finished (see fetchMedia()), but "launched" is not
             // "succeeded" — this waits for its own exit code (openProc's
             // onExited) before claiming it worked. A failure there clears
             // mediaPath and shows mediaError instead (the Text above),
             // re-offering the button as a retry, so this line is only
-            // ever true when it is actually true.
+            // ever true when it is actually true. Never shown for audio —
+            // that never goes through openProc, see audioPlayer.
             Text {
               textFormat: Text.PlainText
               visible: root.openPending
@@ -1146,7 +1200,7 @@ Panel {
             Text {
               textFormat: Text.PlainText
               visible: root.mediaPath !== "" && !root.attachmentIsImage
-                       && !root.openPending
+                       && !root.attachmentIsAudio && !root.openPending
               text: "Se abrió con el visor del sistema."
               color: Color.accent
               font.family: root.contentFontFamily
@@ -1155,17 +1209,27 @@ Panel {
 
             // Images and stickers: inline, bounded to the panel's own
             // width so a large photo fits rather than blowing the layout
-            // out — `mediaBox`'s own height is capped too, and the whole
-            // extract screen is already inside a scrollable arrangement
-            // (this ColumnLayout sits above the Volver/Responder row,
-            // and the ring ListView above it already scrolls; a very
-            // tall image plus a long ring simply makes more of the
-            // extract need scrolling, which is the point).
+            // out. `Layout.fillWidth` on mediaBox is what actually does
+            // that binding — verified with an isolated QML reproduction
+            // (a 4000px-wide photo, a 300x3000 tall one, and a 64x64
+            // sticker, all inside this exact Item/ColumnLayout/Image
+            // structure) that mediaBox's real width never exceeds the
+            // column's, in every case; `clip: true` is added below purely
+            // as a second, independent backstop so nothing can ever
+            // render past mediaBox's edge even if a future change removes
+            // the fillWidth binding. `mediaBox`'s own height is capped too
+            // (Style.space(480)), and the whole extract screen is already
+            // inside a scrollable arrangement (this ColumnLayout sits
+            // above the Volver/Responder row, and the ring ListView above
+            // it already scrolls; a very tall image plus a long ring
+            // simply makes more of the extract need scrolling, which is
+            // the point).
             Item {
               id: mediaBox
               visible: root.mediaPath !== "" && root.attachmentIsImage
                        && mediaImage.status !== Image.Error
               Layout.fillWidth: true
+              clip: true
               implicitHeight: (mediaImage.status === Image.Ready
                                && mediaImage.sourceSize.width > 0)
                   ? Math.min(mediaBox.width * mediaImage.sourceSize.height
@@ -1177,6 +1241,15 @@ Panel {
                 anchors.fill: parent
                 fillMode: Image.PreserveAspectFit
                 asynchronous: true
+                // Caps the decode target to roughly what will actually be
+                // shown (mediaBox's own bounds) instead of decoding a
+                // full-resolution photo — e.g. 4000x3000 — just to blit
+                // it at ~400x300. Harmless for anything already smaller
+                // (a sticker): sourceSize only ever shrinks a decode, it
+                // never upscales one.
+                sourceSize.width: mediaBox.width > 0
+                    ? mediaBox.width : Style.space(420)
+                sourceSize.height: Style.space(480)
                 source: root.mediaPath ? ("file://" + root.mediaPath) : ""
                 // The cache prunes itself (bin/wa-media's own docstring:
                 // age first, then size, oldest first) — a file that was
@@ -1194,6 +1267,54 @@ Panel {
                     root.mediaPath = ""
                   }
                 }
+              }
+            }
+
+            // Audio: inline playback, not a download that hands off
+            // elsewhere — see audioPlayer's own comment for why. Play/
+            // pause, elapsed/total time, and a PanelSlider for seeking
+            // (cheap here: MediaPlayer.setPosition already does the work,
+            // this is just wiring it to the same slider every other panel
+            // in this shell uses).
+            ColumnLayout {
+              visible: root.mediaPath !== "" && root.attachmentIsAudio
+              Layout.fillWidth: true
+              spacing: Style.spacing.sm
+
+              RowLayout {
+                Layout.fillWidth: true
+                spacing: Style.spacing.md
+                Button {
+                  text: audioPlayer.playbackState === MediaPlayer.PlayingState
+                        ? "Pausar" : "Reproducir"
+                  foreground: root.contentForeground
+                  fontFamily: root.contentFontFamily
+                  bordered: true
+                  onClicked: {
+                    if (audioPlayer.playbackState === MediaPlayer.PlayingState)
+                      audioPlayer.pause()
+                    else
+                      audioPlayer.play()
+                  }
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.formatDuration(audioPlayer.position) + " / "
+                        + root.formatDuration(audioPlayer.duration)
+                  color: root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+              }
+
+              PanelSlider {
+                Layout.fillWidth: true
+                bar: root.bar
+                minimum: 0
+                maximum: Math.max(1, audioPlayer.duration)
+                value: audioPlayer.position
+                enabled: audioPlayer.seekable
+                onMoved: function (v) { audioPlayer.setPosition(v) }
               }
             }
           }
