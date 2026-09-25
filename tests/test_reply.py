@@ -1354,7 +1354,10 @@ def test_tone_and_quick_settings_output_never_leaks_a_token_or_another_account()
 # --- Task 1: the ring gains the outgoing half, marked by direction -----
 
 
-def test_a_confirmed_send_appends_the_outgoing_text_to_the_ring():
+def test_a_confirmed_send_no_longer_writes_to_the_ring():
+    # Ruling A1: the sink is the sole writer of outgoing ring entries now.
+    # WhatsApp's echo of this same send is what the sink records; wa-reply
+    # writing here too was the second writer that raced it.
     with tmpdir() as d:
         entry = _queue_entry()
         _enqueue(d, entry)
@@ -1364,10 +1367,8 @@ def test_a_confirmed_send_appends_the_outgoing_text_to_the_ring():
         finally:
             wa.send = original
         assert out == {"ok": True, "dry_run": False}
-        ring = store.load_context(d, entry["jid"], entry["account"])
-        assert len(ring) == 1
-        assert ring[0]["direction"] == "out"
-        assert ring[0]["text"] == "dale, nos vemos"
+        assert store.load_context(d, entry["jid"], entry["account"]) == [], \
+            "a confirmed send must not write to the ring itself anymore"
 
 
 def test_a_dry_run_writes_nothing_to_the_ring():
@@ -1400,26 +1401,6 @@ def test_an_unknown_outcome_writes_nothing_to_the_ring():
             wa.send = original
         assert store.load_context(d, entry["jid"], entry["account"]) == [], \
             "an unconfirmed outcome must never be recorded as a sent message"
-
-
-def test_the_ring_cap_of_ten_holds_counting_both_directions():
-    with tmpdir() as d:
-        entry = _queue_entry()
-        _enqueue(d, entry)
-        original, wa.send = wa.send, lambda jid, text, token: {"data": {"Details": "Sent"}}
-        try:
-            for i in range(12):
-                # A fresh inbound message keeps the entry present for the
-                # next send (a confirmed send removes it otherwise).
-                store.upsert_queue(d, {**entry, "text": f"in{i}",
-                                       "ts": f"2026-09-22T10:{i:02d}:00"})
-                store.append_context(d, entry["jid"], {"direction": "in",
-                                     "from": "Ana", "text": f"in{i}"}, entry["account"])
-                _run_cmd_send(d, entry["id"], text=f"out{i}")
-        finally:
-            wa.send = original
-        ring = store.load_context(d, entry["jid"], entry["account"])
-        assert len(ring) == 10, "the cap must hold across both directions combined"
 
 
 def test_build_prompt_speaker_comes_from_the_direction_mark_not_the_name():

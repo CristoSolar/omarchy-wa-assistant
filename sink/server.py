@@ -104,39 +104,21 @@ def _handle_own_message(own, instance_name, data_dir) -> bool:
 
     account_id = account["id"]
     jid = own["jid"]
-    # The echo: a send made through the plugin (bin/wa-reply) already wrote
-    # this exact text to this chat's ring as "out" before this event ever
-    # arrived. There is no message id or send-token shared between the two
-    # processes to correlate on, so the only signal available here is
-    # content: if the ring's own MOST RECENT entry for this chat is already
-    # that same outgoing text, treat this as that echo and do not append a
-    # second copy.
-    #
-    # This is a bounded, deliberate trade-off, not a perfect match: it can
-    # only ever suppress a message that is byte-identical to and
-    # immediately adjacent to the last ring entry. Anything landing in
-    # between — an inbound message, a different own message — "ages out"
-    # the match, so a later, independent own message reusing the same
-    # words is recorded normally (see
-    # test_a_later_message_with_the_same_words_is_still_recorded). The one
-    # case this cannot tell apart from the echo is the owner genuinely
-    # sending the exact same text twice from the phone back-to-back with
-    # nothing at all in between; that vanishingly rare duplicate collapses
-    # to one ring entry, which is a far smaller loss than the certainty of
-    # duplicating every single plugin reply that this check exists to
-    # prevent.
-    ring = store.load_context(data_dir, jid, account_id)
-    last = ring[-1] if ring else None
-    is_echo = (isinstance(last, dict) and last.get("direction") == "out"
-              and last.get("text") == own["text"])
-    wrote = False
-    if not is_echo:
-        store.append_context(data_dir, jid,
-                             {"direction": "out", "text": own["text"],
-                              "ts": own["ts"]}, account_id)
-        wrote = True
-    removed = _remove_unless_ambiguous(data_dir, account_id, jid)
-    return wrote or removed
+    # The sink is the sole writer of outgoing ring entries. WhatsApp echoes
+    # every outgoing message to linked devices, including a send made
+    # through the plugin (bin/wa-reply), so this one write covers both "the
+    # owner replied from another device" and "the plugin just sent this" —
+    # bin/wa-reply itself no longer writes to the ring at all. That removes
+    # the two-writer race this event used to need an echo heuristic to
+    # paper over: there is now exactly one writer, so there is nothing left
+    # to de-duplicate against, and two genuinely identical own messages
+    # sent back to back are both recorded rather than one being mistaken
+    # for the other's echo.
+    store.append_context(data_dir, jid,
+                         {"direction": "out", "text": own["text"],
+                          "ts": own["ts"]}, account_id)
+    _remove_unless_ambiguous(data_dir, account_id, jid)
+    return True
 
 
 def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:

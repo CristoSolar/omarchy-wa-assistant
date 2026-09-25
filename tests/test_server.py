@@ -313,41 +313,39 @@ def test_own_device_message_clears_that_chats_queue_entry():
         assert store.load_queue(d) == []
 
 
-def test_plugins_own_echo_does_not_duplicate_the_ring_entry():
+def test_the_echo_of_a_plugin_send_is_recorded_exactly_once():
+    # bin/wa-reply no longer writes to the ring itself (Ruling A1): the
+    # sink's own-device handling is the only writer, so the echo of a
+    # plugin send is the first and only time that text lands in the ring.
     with tmpdir() as d:
         _write_accounts(d, [PERSONAL])
         jid = "56911111111@s.whatsapp.net"
-        # bin/wa-reply already wrote this exact "out" entry after a
-        # confirmed send, before the echo of that same send reaches us.
-        store.append_context(d, jid, {"direction": "out", "text": "ok, gracias",
-                                      "ts": "2026-09-22T16:01:00Z"}, "personal")
         ev = _event(text="ok, gracias")
         ev["event"]["Info"]["IsFromMe"] = True
         handle_payload(json.dumps(ev).encode(), "application/json", d)
         ring = store.load_context(d, jid, "personal")
-        assert len(ring) == 1, "the echo of the plugin's own send must not duplicate"
+        assert len(ring) == 1
+        assert ring[0]["direction"] == "out"
+        assert ring[0]["text"] == "ok, gracias"
 
 
-def test_a_later_message_with_the_same_words_is_still_recorded():
-    # The echo check only compares against the ring's OWN most recent
-    # entry. As soon as anything else lands in between - here, another
-    # inbound message from the contact - a later own message that happens
-    # to reuse the same words is no longer adjacent to a matching "out"
-    # entry, so it must be recorded rather than silently swallowed as if it
-    # were the earlier send's echo.
+def test_two_identical_own_messages_back_to_back_both_land_in_the_ring():
+    # With bin/wa-reply no longer writing to the ring, the sink has no
+    # second writer to de-duplicate against, so the content-comparison
+    # heuristic is gone entirely: two genuinely identical own messages,
+    # sent back to back with nothing in between, now produce two ring
+    # entries rather than collapsing into one.
     with tmpdir() as d:
         _write_accounts(d, [PERSONAL])
         jid = "56911111111@s.whatsapp.net"
         own = _event(text="ok")
         own["event"]["Info"]["IsFromMe"] = True
         handle_payload(json.dumps(own).encode(), "application/json", d)
-        handle_payload(json.dumps(_event(text="¿en serio?")).encode(),
-                       "application/json", d)
         handle_payload(json.dumps(own).encode(), "application/json", d)
         ring = store.load_context(d, jid, "personal")
         out_texts = [m["text"] for m in ring if m["direction"] == "out"]
         assert out_texts == ["ok", "ok"], \
-            "a genuine repeat separated by another message must be recorded"
+            "with a single writer, two identical sends are both recorded"
 
 
 def test_own_device_messages_still_respect_the_ring_cap():

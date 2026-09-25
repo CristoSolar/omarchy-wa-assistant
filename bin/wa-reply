@@ -18,7 +18,6 @@ construction, the same way the full-JID check closes writing to the wrong
 person.
 """
 import argparse
-import datetime
 import hashlib
 import json
 import os
@@ -784,19 +783,14 @@ def cmd_send(args):
             print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
         elif _is_confirmed_sent(result):
             confirmed_sent = True
-            # The ring gains the outgoing half only now, after wuzapi has
-            # proven the message actually reached the recipient — never
-            # for a dry run (nothing was sent) and never for an "unknown"
-            # outcome (the except branch below; nobody knows if it
-            # arrived). The text recorded is exactly what send() sent
-            # (stripped the same way), not args.text verbatim, and the
-            # account/jid come from the resolved entry, the same single
-            # source every other identity decision in this script uses.
-            store.append_context(
-                d, entry["jid"],
-                {"direction": "out", "text": (args.text or "").strip(),
-                 "ts": datetime.datetime.now().isoformat()},
-                account["id"])
+            # The ring's outgoing half is no longer written here. WhatsApp
+            # echoes every outgoing message back over the webhook, to every
+            # linked device including this send, so sink/server.py records
+            # it from that echo. Writing it here too was the second writer
+            # that raced the sink's echo-based append — the echo can arrive
+            # before this confirmation does — producing a duplicate ring
+            # entry. Removing this write removes that writer instead of
+            # trying to make the two writers coordinate.
             fresh = _entry(d, entry["id"])
             if fresh is not None and fresh.get("ts") != ts_at_start:
                 store.set_status(d, entry["id"], "pending")
