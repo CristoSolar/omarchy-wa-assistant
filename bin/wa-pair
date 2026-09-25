@@ -216,7 +216,7 @@ fi
 RESP=$(curl -s -w "\n%{http_code}" -X POST "$API/admin/users" \
   -H "Authorization: $WUZAPI_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"$WUZAPI_USER\",\"token\":\"$TOKEN_VALUE\",\"events\":\"Message\"}")
+  -d "{\"name\":\"$WUZAPI_USER\",\"token\":\"$TOKEN_VALUE\",\"events\":\"Message,ReadReceipt\"}")
 HTTP_CODE=$(echo "$RESP" | tail -1)
 BODY=$(echo "$RESP" | sed '$d')
 if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" && ! "$BODY" =~ "already" ]]; then
@@ -227,7 +227,7 @@ fi
 
 curl -s -X POST "$API/session/connect" -H "token: $TOKEN_VALUE" \
   -H "Content-Type: application/json" \
-  -d '{"Subscribe":["Message"],"Immediate":true}' >/dev/null
+  -d '{"Subscribe":["Message","ReadReceipt"],"Immediate":true}' >/dev/null
 sleep 3
 
 WEBHOOK_URL="http://omarchy-wa-sink:8099"
@@ -235,7 +235,7 @@ WEBHOOK_URL="http://omarchy-wa-sink:8099"
 set_webhook() {
   curl -s -X POST "$API/webhook" -H "token: $TOKEN_VALUE" \
     -H "Content-Type: application/json" \
-    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
+    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\",\"ReadReceipt\"]}" >/dev/null
 }
 
 verify_webhook() {
@@ -291,7 +291,7 @@ for _ in $(seq 1 40); do
       echo "  Messages will NOT be delivered until this is fixed. Try:" >&2
       echo "    curl -s -X POST $API/webhook -H 'token: \$$TOKEN_VAR' \\" >&2
       echo "      -H 'Content-Type: application/json' \\" >&2
-      echo "      -d '{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}'" >&2
+      echo "      -d '{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\",\"ReadReceipt\"]}'" >&2
       echo "  then confirm with: curl -s $API/webhook -H 'token: \$$TOKEN_VAR'" >&2
       emit_terminal error reason="webhook did not stick after login (GET /webhook shows: ${GOT:-<unreadable>}, expected: $WEBHOOK_URL)" fatal=true
       exit 1

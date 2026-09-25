@@ -98,9 +98,26 @@ except Exception:
     return 0
   fi
 
+  # This POST always overwrites wuzapi's stored event list with exactly
+  # what is sent here (see handlers.go SetWebhook upstream) — it never
+  # merges. That is exactly how an already-paired install, still holding
+  # the old ["Message"]-only subscription from before ReadReceipt handling
+  # existed, picks up the new one: without re-pairing, the very next timer
+  # tick overwrites the stored list. Left at just ["Message"] here, the
+  # sink's read-receipt handling (sink/events.py, sink/server.py) would
+  # never see a single ReadReceipt event and the queue would keep growing
+  # exactly as before.
+  #
+  # Left unconditional on purpose, same as before this change: this call
+  # already runs every 5 minutes for every logged-in account regardless of
+  # whether anything is wrong (see the module docstring), so adding
+  # ReadReceipt to the payload costs no extra request — it rides the POST
+  # that already happens. Checking the current subscription first and only
+  # writing on a mismatch would need an extra GET per pass to save nothing
+  # (the POST already happens every pass), so it was not added.
   curl -s -X POST "$API/webhook" -H "token: $token" \
     -H "Content-Type: application/json" \
-    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\"]}" >/dev/null
+    -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\",\"ReadReceipt\"]}" >/dev/null
 
   # Verify by reading it back rather than trusting the POST's 200: the
   # whole point is that a re-assert can silently not stick.

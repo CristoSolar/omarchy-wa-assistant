@@ -24,6 +24,7 @@ from tests.runner import run
 
 WA_UP = (ROOT / "bin" / "wa-up").read_text()
 WA_PAIR = (ROOT / "bin" / "wa-pair").read_text()
+WA_HEAL = (ROOT / "bin" / "wa-heal").read_text()
 WA_UNLINK = (ROOT / "bin" / "wa-unlink").read_text()
 # The --json event machinery used to be a verbatim copy inside each of
 # bin/wa-pair and bin/wa-unlink. It now lives here once, sourced by both;
@@ -261,7 +262,7 @@ EXPECTED_HUMAN_ECHOES = [
     "  Messages will NOT be delivered until this is fixed. Try:",
     "    curl -s -X POST $API/webhook -H 'token: \\$$TOKEN_VAR' \\\\",
     "      -H 'Content-Type: application/json' \\\\",
-    "      -d '{\\\"webhookurl\\\":\\\"$WEBHOOK_URL\\\",\\\"events\\\":[\\\"Message\\\"]}'",
+    "      -d '{\\\"webhookurl\\\":\\\"$WEBHOOK_URL\\\",\\\"events\\\":[\\\"Message\\\",\\\"ReadReceipt\\\"]}'",
     "  then confirm with: curl -s $API/webhook -H 'token: \\$$TOKEN_VAR'",
     "webhook confirmed: $WEBHOOK_URL",
     "waiting for WhatsApp to finish sending history...",
@@ -693,6 +694,39 @@ def test_reopening_settings_after_a_finished_unlink_starts_from_the_list():
     assert "root.unlinkDone" in body and 'root.mode = "list"' in body, (
         "a finished unlink must not be re-shown as news the next time the "
         "gear is opened")
+
+
+# --- Task 2 (auto-clear): the webhook subscription must include ---------
+# --- ReadReceipt, everywhere wa-pair and wa-heal set it, not just once ---
+#
+# Task 1 taught the sink to act on ReadReceipt events (sink/events.py,
+# sink/server.py), but wuzapi only ever posts an event the account is
+# subscribed to. Without this, that handling never runs and the queue
+# keeps growing exactly as before. Verified to fail against the pre-task
+# script by comparing against `git show HEAD:bin/wa-pair` and
+# `git show HEAD:bin/wa-heal`, where every one of these payloads said only
+# ["Message"] / "Message".
+
+def test_wa_pair_subscribes_to_read_receipts_everywhere_it_sets_events():
+    assert '"Subscribe":["Message","ReadReceipt"]' in WA_PAIR, (
+        "session/connect must ask for ReadReceipt too, or a brand-new "
+        "pairing never gets it until the post-login webhook set runs")
+    assert WA_PAIR.count('\\"events\\":[\\"Message\\",\\"ReadReceipt\\"]') >= 2, (
+        "both the authoritative set_webhook() body and the manual-fix "
+        "curl command echoed on failure must list ReadReceipt, or the "
+        "printed recovery command would tell the owner to reproduce the "
+        "very gap this task closes")
+
+
+def test_wa_heal_rewrites_the_subscription_not_just_the_url():
+    # This is the path that actually repairs an already-paired install —
+    # nobody re-pairs a live number to pick up a subscription change. If
+    # wa-heal's payload still said only Message, the timer would keep
+    # confirming the URL every 5 minutes forever while silently leaving
+    # the old, narrower event list in place.
+    assert '\\"events\\":[\\"Message\\",\\"ReadReceipt\\"]' in WA_HEAL, (
+        "wa-heal must re-assert ReadReceipt too, not just the webhook URL"
+    )
 
 
 if __name__ == "__main__":
