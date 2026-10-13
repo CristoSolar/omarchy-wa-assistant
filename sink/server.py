@@ -11,6 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sink import accounts as accounts_module
 from sink import store
+from sink.contacts import display_name
 from sink.events import describe_skipped_group, extract, extract_own_message, extract_read_receipt
 from sink.purge import purge_history
 
@@ -188,10 +189,12 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
         return False
 
     account_id = account["id"]
+    wuzdata = os.path.dirname(os.environ.get("WA_WUZAPI_DB", "/wuzdata/users.db"))
+    entry["push_name"] = display_name(wuzdata, instance_name, entry["jid"], entry["push_name"])
     # "direction": "in" is an explicit mark, not something a reader is meant
     # to infer from "from" — a contact can share the user's own display name,
-    # and the user's own second number writes to them too. bin/wa-reply
-    # writes the "out" half of the same ring after a confirmed send.
+    # and the user's own second number writes to them too. The "out" half
+    # comes from _handle_own_message, via WhatsApp's echo of every send.
     store.append_context(data_dir, entry["jid"],
                          {"direction": "in", "from": entry["push_name"],
                           "text": entry["text"], "ts": entry["ts"]}, account_id)
