@@ -54,11 +54,14 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 
 - **wuzapi** es la única pieza que habla con WhatsApp. Está publicado solo
   en `127.0.0.1:8080` — nada fuera de tu máquina puede alcanzarlo.
-- **El sink** (`sink/server.py`) recibe los webhooks de wuzapi, descarta lo
-  que enviaste vos mismo, descarta los mensajes de grupo salvo que el grupo
-  esté explícitamente habilitado, y escribe el resto en una cola y en un
-  anillo de contexto corto por chat (los últimos 10 mensajes). Nunca envía
-  nada.
+- **El sink** (`sink/server.py`) recibe los webhooks de wuzapi, descarta
+  los mensajes de grupo salvo que el grupo esté explícitamente habilitado,
+  y escribe el resto en una cola y en un anillo de contexto corto por chat
+  (los últimos 10 mensajes). Lo que mandás vos — desde el teléfono, desde
+  WhatsApp Web o desde este plugin — nunca entra a la cola: va al anillo
+  marcado como tuyo, y saca ese chat de la cola, igual que leerlo en otro
+  dispositivo (ver "Qué saca un chat de la cola" más abajo). Nunca envía
+  nada, y nunca descarga nada.
 - **`bin/wa-reply`** es el único componente que puede enviar un mensaje.
   Rechaza un borrador vacío, rechaza cualquier destinatario que no sea un
   JID completo, y se niega a enviar directamente a menos que
@@ -75,17 +78,25 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 - **El widget de barra y el panel** (`BarWidget.qml`, `Panel.qml`) muestran
   los chats pendientes, te dejan escribir la idea, llaman a `claude -p`
   para redactar una respuesta según el archivo de tono de la cuenta de ese
-  chat (ver "Múltiples cuentas" más abajo) y la envían. Hay una sola caja de
+  chat (ver "Múltiples cuentas" más abajo) y la envían. Elegir un chat abre
+  primero un extracto corto de la conversación, con el adjunto que traiga
+  el mensaje pendiente (una foto se ve ahí mismo, un audio se reproduce ahí
+  mismo), y recién **Responder** pasa a escribir — ver "El extracto de la
+  conversación" y "Adjuntos" más abajo. Hay una sola caja de
   texto: escribís la idea y apretás **Redactar** (o Enter) para redactarla;
   esa misma caja pasa a tener el mensaje redactado — editable, con la idea
   de la que salió mostrada arriba — y recién ahí se habilita **Enviar**.
   Cada chat en la cola muestra una etiqueta con la cuenta a la que
   pertenece, y al abrirlo la vista de detalle dice explícitamente desde qué
   número va a salir la respuesta.
+- **`bin/wa-media`** descarga un adjunto cuando pedís verlo, con el token
+  de la cuenta por la que llegó el mensaje, a una caché local — **sin
+  cifrar**, ver "Adjuntos" más abajo. No tiene ningún camino de envío.
 - **El engranaje (⚙)** abre una pantalla de configuración incrustada en el
   mismo panel: la lista de cuentas configuradas, emparejar una nueva,
-  desvincular una y editar el tono y las respuestas rápidas de cada cuenta
-  — ver "Pantalla de configuración" más abajo.
+  desvincular una, editar el tono y las respuestas rápidas de cada cuenta,
+  y vaciar la caché de adjuntos — ver "Pantalla de configuración" más
+  abajo.
 
 ## Requisitos
 
@@ -471,6 +482,11 @@ escritura de tono y respuestas rápidas de `wa-pair`/`wa-unlink`/`wa-reply`
 aunque cierres la pantalla de configuración o todo el panel mientras uno
 está en curso.
 
+Arriba de la lista de cuentas, un recuadro "Caché de adjuntos" muestra
+cuánto disco ocupa la caché de adjuntos (según `bin/wa-media size`) y un
+botón **Vaciar caché** que la vacía, para todas las cuentas, de un clic y
+sin paso de confirmación — ver "Adjuntos" más abajo.
+
 ### Emparejar desde la UI
 
 "+ Vincular cuenta nueva" pide lo mismo que el comando de terminal — un id
@@ -544,6 +560,11 @@ desvincular es el resultado honesto, no una limitación a esquivar.
 Eso es deliberado: no tiene ninguna credencial, es prosa que escribiste y
 editaste a mano, y volver a emparejar el mismo id de cuenta más adelante te
 lo devuelve en vez de hacerte escribirlo de nuevo.
+
+**Desvincular tampoco vacía la caché de adjuntos** de esa cuenta
+(`media/<account-id>/`, ver "Adjuntos" más abajo). Vaciala con **Vaciar
+caché** (todas las cuentas) o con `./bin/wa-media clear --account
+<account-id>` (solo esa).
 
 **Desvincular sí borra el usuario de wuzapi** de esa cuenta, no solo su
 sesión. Eso es lo que hace que desvincular y volver a vincular el mismo id
@@ -696,6 +717,137 @@ editá el arreglo `quick_replies` de esa cuenta en `accounts.json` a mano
 reiniciar nada — el panel lo relee con `wa-reply quick` cada vez que abrís
 un chat que pertenece a esa cuenta.
 
+## El extracto de la conversación
+
+Elegir un chat en la cola no te lleva directo al compositor. Abre una
+pantalla intermedia, "Extracto de la conversación", con los mensajes
+recientes del chat, del más viejo al más nuevo: los del otro a la
+izquierda con el nombre del contacto, los tuyos a la derecha con "Vos".
+**Responder** es la única forma de pasar de ahí al compositor, y
+**Volver** vuelve a la lista; el Volver del compositor (o Escape) vuelve
+al extracto, no a la lista, así que salir a mitad de un borrador no te
+hace perder qué chat tenías abierto. Leer y escribir son pasos separados a
+propósito.
+
+El extracto es el mismo anillo de contexto por chat que usa la redacción —
+como mucho los últimos 10 mensajes, por chat y por cuenta
+(`state/ctx/<account-id>/`, ver "Dónde vive el estado" más abajo) — leído
+con `wa-reply thread <entry-id>`, que le pasa al panel solo la dirección y
+el texto de cada mensaje. De qué lado va cada mensaje sale de una marca
+`direction` explícita guardada con él, nunca de comparar nombres: un
+contacto se puede llamar igual que vos.
+
+Tu lado de la conversación llega por un solo camino: el sink registra cada
+mensaje que WhatsApp informa como enviado **por vos**, desde el
+dispositivo que sea — el teléfono, WhatsApp Web, ZapZap o este plugin (sus
+propios envíos le vuelven al sink como ese mismo eco; `wa-reply` ya no
+escribe en el anillo). Por eso un dry run nunca aparece como enviado:
+no se envió nada. El prompt de redacción también ve los dos lados, con
+"Yo" para los tuyos, así que Claude redacta sobre la conversación real en
+vez de adivinar qué dijiste.
+
+Dos cosas para tener en cuenta:
+
+- **El anillo solo tiene lo que pasó desde que el plugin está corriendo.**
+  Para una conversación más vieja, el extracto va a estar vacío o casi, y
+  el panel lo dice en lugar de mostrar una pantalla en blanco — es el caso
+  normal, no una falla. No se reconstruye nada desde el historial de
+  WhatsApp (ese historial es justamente lo que `wa-pair` y el sink purgan,
+  ver "Emparejar").
+- **Lo que mandás ahora queda guardado localmente**, junto con lo que
+  recibís: el anillo guarda hasta 10 mensajes de cada chat en las dos
+  direcciones, en JSON plano bajo `state/ctx/`. Desvincular una cuenta
+  borra su anillo.
+
+Si el último envío del chat quedó sin confirmar (`unknown`/`sending`, ver
+"Envíos cuyo resultado nadie conoce" más abajo), el aviso y su botón
+*"Revisé WhatsApp, quiero reenviar"* están en el extracto, y
+**Responder** queda deshabilitado hasta que lo apretás.
+
+## Adjuntos
+
+Cuando alguien manda una foto, un audio, un video, un sticker o un
+documento, la cola sigue mostrando el marcador (`[imagen]`, `[audio]`,
+...), y el extracto muestra un bloque "Adjunto" con un botón:
+
+- **Imágenes y stickers** — **Ver imagen** la descarga y la muestra ahí
+  mismo, ajustada al ancho del panel (y con un alto máximo); se decodifica
+  más o menos al tamaño en que se muestra, no a resolución completa.
+- **Audios y notas de voz** — **Reproducir** lo descarga y lo reproduce en
+  el panel mismo, con pausa, tiempo transcurrido/total y una barra para
+  adelantar o volver.
+- **Videos y documentos** — **Abrir** lo descarga y le pasa el archivo a
+  tu visor del sistema con `xdg-open`. El panel espera el código de salida
+  de `xdg-open` antes de decir "Se abrió con el visor del sistema."; si
+  falla, lo dice y vuelve a ofrecer el botón.
+- **Ubicaciones y contactos** — no hay nada que descargar (wuzapi no tiene
+  endpoint para eso), y el panel lo dice en vez de mostrar un botón que
+  nunca podría funcionar. Lo mismo para un adjunto cuyo evento llegó sin
+  algún campo que la descarga necesita.
+
+Una descarga que falla dice por qué y el botón pasa a **Reintentar**. Un
+archivo que estaba en la caché pero ya se podó se informa igual, nunca
+como una imagen rota. Solo se puede abrir el adjunto de la entrada de la
+cola en sí — el último mensaje de ese chat —; los mensajes anteriores del
+extracto se ven como su texto marcador. Ver es todo lo que hace: no hay
+forma de *mandar* un adjunto desde el panel.
+
+**Quién descarga.** `bin/wa-media`, nunca el sink: el sink sigue sin
+tener credenciales. Igual que `wa-reply`, toma la cuenta de la entrada de
+la cola y de nada más — ni flag, ni variable de entorno —, usa el token de
+esa cuenta, rechaza una entrada cuya cuenta no está en `accounts.json`, y
+solo habla con wuzapi en `127.0.0.1`. El modo dry-run no aplica acá:
+controla el envío, y descargar no envía nada.
+
+```sh
+./bin/wa-media get <entry-id>             # descarga (o reusa) e imprime la ruta
+./bin/wa-media size [--account <id>]      # bytes que ocupa la caché en disco
+./bin/wa-media clear [--account <id>]     # vacía toda la caché, o la de una cuenta
+```
+
+### La caché, y lo que significa para la privacidad
+
+Los adjuntos descargados quedan en:
+
+```
+~/.local/share/omarchy-wa/media/<account-id>/
+```
+
+(bajo `$WA_STATE_ROOT` si lo moviste). Los directorios tienen modo 0700,
+los archivos 0600. Los nombres de archivo son hashes, no ids de mensaje
+ni números de teléfono. `media/` está al lado de `state/`, no adentro, así
+que no se monta en ningún contenedor.
+
+**Estos archivos quedan guardados en disco sin cifrar.** Eso incluye
+fotos, audios y documentos que te mandan terceros que no tienen idea de
+que este plugin existe. Este proyecto se esfuerza en purgar el historial
+de texto de WhatsApp; la caché de adjuntos va en la dirección contraria, y
+fue una decisión deliberada del dueño, tomada viendo exactamente este
+costo — no un descuido. Si no la querés, vaciá la caché y no aprietes los
+botones.
+
+La caché tiene límites:
+
+- **30 días** de antigüedad máxima y **500 MiB** en total, por defecto.
+  Los dos se pueden cambiar en `state/config.json` con
+  `media_cache_max_age_days` y `media_cache_max_bytes` (un valor ausente,
+  cero, negativo o no numérico vuelve al default).
+- La poda corre **después de cada descarga nueva** — no con un timer —:
+  primero borra lo que pasó el límite de antigüedad, después lo más viejo
+  hasta que el total entre. El archivo recién descargado nunca se poda,
+  así que la caché puede pasarse del límite por ese único archivo. Entre
+  descargas, un archivo viejo sigue en disco hasta la próxima descarga o
+  hasta que vacíes la caché.
+- Pedir dos veces el mismo adjunto reusa el archivo en caché en vez de
+  descargarlo de nuevo.
+
+Para vaciarla: el botón **Vaciar caché** de la pantalla de configuración
+(toda la caché, todas las cuentas, sin confirmación), o
+`./bin/wa-media clear` — con `--account <id>` para vaciar solo la de una
+cuenta. `./bin/wa-media size` te dice cuánto ocupa ahora. Desvincular una
+cuenta **no** vacía sus adjuntos; para eso corré
+`./bin/wa-media clear --account <id>`.
+
 ## Logs de los contenedores y contenido de los mensajes
 
 `bin/wa-up` levanta wuzapi con `LOG_LEVEL=warn`. Sin esa variable, wuzapi
@@ -804,7 +956,57 @@ con el mensaje nuevo, y el panel lo dice:
 > la entrada sigue en la cola.
 
 Tu respuesta sí salió. La cola simplemente no tira a la basura lo que
-todavía no leíste.
+todavía no leíste. (Hay un hueco en esto, por el vaciado automático de
+abajo: ver el último punto de la sección siguiente.)
+
+## Qué saca un chat de la cola
+
+Un chat sale de la cola de tres formas, no de una sola:
+
+- **Lo contestás desde el panel** y el envío se confirma (con la excepción
+  de la sección anterior).
+- **Lo contestás desde otro dispositivo** — el teléfono, WhatsApp Web,
+  ZapZap. WhatsApp le avisa tu propio mensaje a cada dispositivo
+  vinculado; el sink lo registra en el extracto como tuyo y saca la
+  entrada de ese chat.
+- **Lo leés en otro dispositivo.** Cuando otro de tus dispositivos marca
+  el chat como leído, WhatsApp manda un acuse de lectura y el sink saca la
+  entrada de ese chat — **aunque no lo hayas contestado**. Es deliberado:
+  el dueño eligió una cola corta sabiendo que un mensaje que leíste y
+  pensabas contestar después también desaparece de ella. Si usás la cola
+  como lista de pendientes, no abras esos chats en el teléfono, o dejalos
+  sin leer ahí.
+
+Los acuses de lectura viajan en las dos direcciones, y solo una cuenta. El
+sink actúa únicamente sobre el estado `ReadSelf` de wuzapi — *vos* leíste
+el mensaje *del otro* en otro dispositivo. El estado `Read` a secas — *el
+otro* leyó *tu* mensaje — nunca saca nada; si no, cualquier contacto que
+abra tu mensaje vaciaría justo el chat que está esperando su respuesta.
+
+Lo que **nunca** se saca solo: una entrada cuyo último envío quedó en
+`unknown` o `sending` (ver "Envíos cuyo resultado nadie conoce" más
+arriba). Esa entrada es el único registro de que un mensaje puede haber
+salido sin confirmación; se queda, intacta, ante un acuse de lectura y
+ante un mensaje tuyo, hasta que la resuelvas en el panel.
+
+Un acuse de lectura o un mensaje tuyo para un chat sin entrada no hace
+nada, y uno que llega por un número que no está en `accounts.json` se
+descarta y se registra en el log una vez. Los mensajes entrantes nuevos se
+encolan igual que antes.
+
+Los acuses de lectura solo le llegan al sink si el webhook de la cuenta
+está suscrito a ellos: `wa-pair` suscribe las cuentas nuevas a `Message` y
+`ReadReceipt`, y `wa-heal` reafirma esa misma suscripción en cada
+corrida, así que una instalación ya emparejada la toma en el próximo tick
+del timer sin volver a emparejar.
+
+Un hueco conocido: los envíos del propio plugin también le vuelven al sink
+como un mensaje tuyo, y ese eco saca la entrada del chat como cualquier
+otro. Si llega después de que el envío se confirmó, puede sacar una
+entrada que "Un mensaje que llega mientras estás redactando" más arriba
+dejó a propósito, así que un mensaje que llegó mientras redactabas puede
+igual salir de la cola. Después de enviar, si el chat estaba activo, mirá
+WhatsApp.
 
 ## Dónde vive el estado, y cómo borrarlo
 
@@ -819,6 +1021,8 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
 │   ├── ctx/
 │   │   └── <account-id>/
 │   └── config.json
+├── media/          caché de adjuntos — NO se monta en ningún contenedor
+│   └── <account-id>/
 └── wuzdata/        se monta en los dos contenedores
 ```
 
@@ -833,12 +1037,19 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
   cada uno con la cuenta a la que llegó.
 - `state/accounts.json` — las cuentas configuradas: una entrada por
   número, ver "Múltiples cuentas" más arriba.
-- `state/ctx/<account-id>/` — un archivo JSON chico por chat, por cuenta,
-  los últimos 10 mensajes de contexto usados al redactar.
+- `state/ctx/<account-id>/` — un archivo JSON chico por chat, por cuenta:
+  los últimos 10 mensajes en las dos direcciones, usados al redactar y
+  mostrados en el extracto (ver "El extracto de la conversación" más
+  arriba).
 - `state/config.json` — `groups_enabled` (compartido por todas las
-  cuentas) y cualquier otro ajuste editado a mano, a nivel de toda la
-  instalación. Las respuestas rápidas ya no están acá — viven por cuenta
-  en `accounts.json`.
+  cuentas), los límites opcionales de la caché de adjuntos
+  `media_cache_max_bytes` y `media_cache_max_age_days`, y cualquier otro
+  ajuste editado a mano, a nivel de toda la instalación. Las respuestas
+  rápidas ya no están acá — viven por cuenta en `accounts.json`.
+- `media/<account-id>/` — los adjuntos descargados, **sin cifrar**, hasta
+  500 MiB / 30 días por defecto. Solo los escribe `bin/wa-media`, en el
+  host; se vacía con `./bin/wa-media clear` o con **Vaciar caché** en la
+  pantalla de configuración (ver "Adjuntos" más arriba).
 - `wuzdata/` — la base SQLite y los datos de sesión propios de wuzapi,
   montados en los dos contenedores. Ahí es donde cae el volcado de
   historial antes de que `wa-pair`/el sink lo purguen.
@@ -893,7 +1104,9 @@ de wuzapi de esa cuenta (para que volver a vincular el mismo id después
 funcione en vez de chocar con el viejo), la saca de `accounts.json`, borra
 su token de `secrets.env`, borra su anillo de contexto, y descarta sus
 entradas pendientes en la cola — pero deja a propósito
-`agents/<account-id>.md` (su archivo de tono) intacto. Los dos pasos
+`agents/<account-id>.md` (su archivo de tono) intacto. También deja en
+disco la caché de adjuntos de esa cuenta (`media/<account-id>/`); vaciala
+con `./bin/wa-media clear --account <account-id>`. Los dos pasos
 contra wuzapi son best-effort, porque un contenedor inalcanzable no puede
 dejar una cuenta imposible de sacar localmente; que cualquiera de los dos
 falle se informa, nunca se traga en silencio. No saca

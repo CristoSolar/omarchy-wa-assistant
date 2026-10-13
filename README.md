@@ -51,10 +51,14 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
 
 - **wuzapi** is the only piece that speaks to WhatsApp. It's published on
   `127.0.0.1:8080` only — nothing outside your machine can reach it.
-- **The sink** (`sink/server.py`) receives wuzapi's webhooks, drops
-  anything sent by you, drops group messages unless the group is explicitly
-  enabled, and writes everything else to a queue and a short per-chat
-  context ring (last 10 messages). It never sends anything.
+- **The sink** (`sink/server.py`) receives wuzapi's webhooks, drops group
+  messages unless the group is explicitly enabled, and writes everything
+  else to a queue and a short per-chat context ring (last 10 messages).
+  What you send yourself — from the phone, from WhatsApp Web, or through
+  this plugin — never enters the queue; it goes into the ring marked as
+  yours, and it takes that chat out of the queue, as does reading the chat
+  on another device (see "What takes a chat out of the queue" below). It
+  never sends anything, and it never downloads anything.
 - **`bin/wa-reply`** is the only component that can send a message. It
   refuses an empty draft, refuses any recipient that isn't a full JID, and
   refuses to send at all unless `WA_DRY_RUN=0` is set. **A reply always
@@ -70,16 +74,23 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
 - **The bar widget and panel** (`BarWidget.qml`, `Panel.qml`) show pending
   chats, let you type the idea, call `claude -p` to draft a reply against
   that chat's own account's tone file (see "Multiple accounts" below), and
-  send it. There is one text box: type the idea and press **Redactar** (or
+  send it. Picking a chat first opens a short extract of the conversation,
+  with any attachment the pending message carries (a photo shown inline, a
+  voice note playable in place), and only **Responder** moves on to
+  writing — see "The conversation extract" and "Attachments" below. There
+  is one text box: type the idea and press **Redactar** (or
   Enter) to draft it, then the same box switches to holding the drafted
   message — editable, with the idea it came from shown above it — and only
   then does **Enviar** turn on. Each queued chat shows a badge naming which
   account it belongs to, and once you open one the detail view states
   plainly which number the reply will go out from.
+- **`bin/wa-media`** downloads an attachment when you ask to see it, with
+  the token of the account the message arrived on, into a local cache —
+  **unencrypted**, see "Attachments" below. It has no send path.
 - **The gear (⚙)** opens a settings screen embedded in the same panel: the
-  list of configured accounts, linking a new one, unlinking one, and
-  editing each account's tone and quick replies — see "Settings screen"
-  below.
+  list of configured accounts, linking a new one, unlinking one, editing
+  each account's tone and quick replies, and emptying the attachment
+  cache — see "Settings screen" below.
 
 ## Requirements
 
@@ -440,6 +451,11 @@ quick replies — and it keeps running a link or an unlink in the background
 even if you close the settings screen or the whole panel while one is
 mid-flight.
 
+Above the account list, a "Caché de adjuntos" box shows how much disk the
+attachment cache takes (from `bin/wa-media size`) and a **Vaciar caché**
+button that empties it, for every account, in one click and without a
+confirmation step — see "Attachments" below.
+
 ### Linking from the UI
 
 "+ Vincular cuenta nueva" asks for the same two things the terminal command
@@ -508,6 +524,11 @@ outcome, not a limitation to route around.
 That is deliberate: it holds no credential, it is prose you wrote and
 edited by hand, and re-linking the same account id later gets it back
 instead of making you write it again.
+
+**Unlinking does not empty the account's attachment cache** either
+(`media/<account-id>/`, see "Attachments" below). Empty it with
+**Vaciar caché** (every account) or `./bin/wa-media clear --account
+<account-id>` (just that one).
 
 **Unlinking does remove the account's wuzapi user**, not just its session.
 That is what makes unlink-then-relink of the same account id work: a
@@ -650,6 +671,128 @@ change one, or delete one) and save. There's no restart needed — the panel
 re-reads it from `wa-reply quick` every time you open a chat that belongs
 to that account.
 
+## The conversation extract
+
+Picking a chat in the queue does not go straight to the composer. It opens
+an intermediate screen, "Extracto de la conversación", that shows the
+chat's recent messages oldest first: theirs on the left under the
+contact's name, yours on the right under "Vos". **Responder** is the only
+way from there into the composer, and **Volver** goes back to the list;
+the composer's own Volver (or Escape) steps back to the extract, not to
+the list, so leaving mid-draft doesn't lose which chat you had open.
+Reading and writing are separate steps on purpose.
+
+The extract is the same per-chat context ring that drafting uses — at most
+the last 10 messages, per chat, per account (`state/ctx/<account-id>/`,
+see "Where state lives" below) — read through `wa-reply thread <entry-id>`,
+which hands the panel only each message's direction and text. Which side
+a message is on comes from an explicit `direction` mark stored with it,
+never from comparing names: a contact can be called the same as you.
+
+Your side of the conversation gets there one way only: the sink records
+every message WhatsApp reports as sent **by you**, whichever device sent
+it — the phone, WhatsApp Web, ZapZap, or this plugin (whose own sends come
+back to the sink as that same echo; `wa-reply` itself no longer writes to
+the ring). So a dry run never shows up as sent, because nothing was. The
+drafting prompt sees both sides too, labelled "Yo" for yours, so Claude
+writes against the real conversation instead of guessing what you said.
+
+Two things to expect:
+
+- **The ring only holds what happened since the plugin was running.** For
+  a conversation older than that, the extract is empty or nearly so, and
+  the panel says so in place of a blank screen — it is the normal case, not
+  a failure. Nothing is reconstructed from WhatsApp's history (that history
+  is what `wa-pair` and the sink purge, see "Pairing").
+- **What you send is now stored locally**, alongside what you receive: the
+  ring holds up to 10 messages of each chat in both directions, in plain
+  JSON under `state/ctx/`. Unlinking an account removes its ring.
+
+If the chat's last send is unconfirmed (`unknown`/`sending`, see "Sends
+whose outcome nobody knows" below), the warning and its *"Revisé WhatsApp,
+quiero reenviar"* button live on the extract, and **Responder** stays
+disabled until you press it.
+
+## Attachments
+
+When someone sends a photo, a voice note, a video, a sticker or a
+document, the queue still shows the placeholder (`[imagen]`, `[audio]`,
+...), and the extract shows an "Adjunto" block for it with a button:
+
+- **Images and stickers** — **Ver imagen** downloads it and shows it
+  inline, scaled to the panel's width (and capped in height); it is decoded
+  at roughly the size it's shown, not at full resolution.
+- **Voice notes and audio** — **Reproducir** downloads it and plays it in
+  the panel itself, with play/pause, elapsed/total time and a seek bar.
+- **Video and documents** — **Abrir** downloads it and hands the file to
+  your system viewer with `xdg-open`. The panel waits for `xdg-open`'s exit
+  code before saying "Se abrió con el visor del sistema."; if it fails,
+  it says so and offers the button again.
+- **Locations and contacts** — there is nothing to download (wuzapi has no
+  endpoint for them), and the panel says that instead of showing a button
+  that could never work. Same for an attachment whose event arrived missing
+  a field the download needs.
+
+A download that fails says why and turns the button into **Reintentar**.
+A file that was in the cache but has since been pruned is reported the
+same way, never as a broken image. Only the attachment on the queue
+entry itself — the latest message in that chat — can be opened; older
+messages in the extract show as their placeholder text. Viewing is the
+whole feature: there is no way to *send* an attachment from the panel.
+
+**Who downloads.** `bin/wa-media` does, never the sink: the sink still
+holds no credentials. Like `wa-reply`, it takes the account from the queue
+entry and nothing else — no flag, no environment variable — uses that
+account's token, refuses an entry whose account is not in
+`accounts.json`, and only ever talks to wuzapi on `127.0.0.1`. Dry-run
+mode does not apply here: it gates sending, and downloading sends nothing.
+
+```sh
+./bin/wa-media get <entry-id>             # download (or reuse) and print its path
+./bin/wa-media size [--account <id>]      # bytes the cache takes on disk
+./bin/wa-media clear [--account <id>]     # empty the whole cache, or one account's
+```
+
+### The cache, and what it means for privacy
+
+Downloaded attachments are kept in:
+
+```
+~/.local/share/omarchy-wa/media/<account-id>/
+```
+
+(under `$WA_STATE_ROOT` if you moved it). Directories are mode 0700,
+files 0600. The file names are hashes, not message ids or phone numbers.
+`media/` sits next to `state/`, not inside it, so it is not mounted into
+any container.
+
+**These files are stored unencrypted on disk.** That includes photos,
+voice notes and documents sent by third parties who have no idea this
+plugin exists. This project goes out of its way to purge WhatsApp's text
+history; the media cache goes the other way, and that was the owner's
+deliberate choice, made after seeing this exact cost — not an oversight.
+If you don't want it, empty the cache and don't press the buttons.
+
+The cache is bounded:
+
+- **30 days** maximum age and **500 MiB** total, by default. Both can be
+  changed in `state/config.json` with `media_cache_max_age_days` and
+  `media_cache_max_bytes` (a missing, zero, negative or non-numeric value
+  falls back to the default).
+- Pruning runs **after each new download** — not on a timer — deleting
+  files past the age limit first, then the oldest files until the total
+  fits. The file that was just downloaded is never pruned, so the cache can
+  exceed the limit by that one file. Between downloads, an old file stays
+  on disk until the next download or until you empty the cache.
+- A second request for the same attachment reuses the cached file instead
+  of downloading it again.
+
+To empty it: the **Vaciar caché** button in the settings screen (whole
+cache, all accounts, no confirmation), or `./bin/wa-media clear` — with
+`--account <id>` to empty just one account's. `./bin/wa-media size` tells
+you how much it currently takes. Unlinking an account does **not** empty
+that account's media; run `./bin/wa-media clear --account <id>` for that.
+
 ## Container logs and message content
 
 `bin/wa-up` starts wuzapi with `LOG_LEVEL=warn`. Left unset, wuzapi defaults
@@ -751,7 +894,53 @@ it stays in the queue carrying the newer message, and the panel says so:
 > la entrada sigue en la cola.
 
 Your reply did go out. The queue is just not throwing away the thing you
-haven't read yet.
+haven't read yet. (There is one gap in this, from the auto-clear below:
+see the last point of the next section.)
+
+## What takes a chat out of the queue
+
+A chat leaves the queue in three ways, not just one:
+
+- **You answer it from the panel** and the send is confirmed (with the
+  exception described in the previous section).
+- **You answer it from another device** — the phone, WhatsApp Web,
+  ZapZap. WhatsApp reports your own message to every linked device; the
+  sink records it in the extract as yours and removes that chat's entry.
+- **You read it on another device.** When one of your other devices marks
+  the chat as read, WhatsApp sends a read receipt and the sink removes that
+  chat's entry — **even if you didn't answer it**. This is deliberate: the
+  owner chose a short queue knowing that a message you read and meant to
+  answer later disappears from it too. If you rely on the queue as a to-do
+  list, don't open those chats on the phone, or keep them unread there.
+
+Read receipts travel in both directions, and only one of them counts. The
+sink acts only on wuzapi's `ReadSelf` state — *you* read *their* message on
+another device. The plain `Read` state — *they* read *your* message — never
+clears anything; otherwise any contact opening your message would empty
+the very chat that is waiting for their answer.
+
+What is **never** cleared automatically: an entry whose last send is
+`unknown` or `sending` (see "Sends whose outcome nobody knows" above). That
+entry is the only record that a message may already have gone out
+unconfirmed; it stays, untouched, through a read receipt and through a
+message of yours, until you deal with it in the panel.
+
+A read receipt or own message for a chat with no entry does nothing, and
+one arriving on a number not in `accounts.json` is dropped and logged once.
+New incoming messages queue exactly as before.
+
+Read receipts only reach the sink if the account's webhook subscribes to
+them: `wa-pair` subscribes new accounts to `Message` and `ReadReceipt`,
+and `wa-heal` re-asserts that same subscription on every run, so an
+already-paired install picks it up on the next timer tick without
+re-pairing.
+
+One known gap: the plugin's own sends come back to the sink as a message
+from you too, and that echo clears the chat's entry like any other. If it
+arrives after the send was confirmed, it can remove an entry that "A
+message that arrives while you're drafting" above kept on purpose, so a
+message that came in while you were drafting can still leave the queue.
+After a send, glance at WhatsApp if the chat was active.
 
 ## Where state lives, and how to wipe it
 
@@ -766,6 +955,8 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
 │   ├── ctx/
 │   │   └── <account-id>/
 │   └── config.json
+├── media/          attachment cache — mounted into NO container
+│   └── <account-id>/
 └── wuzdata/        mounted into both containers
 ```
 
@@ -780,11 +971,18 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
   which account it arrived on.
 - `state/accounts.json` — the configured accounts: one entry per number,
   see "Multiple accounts" above.
-- `state/ctx/<account-id>/` — one small JSON file per chat, per account,
-  the last 10 messages of context used when drafting.
-- `state/config.json` — `groups_enabled` (shared by every account) and any
-  other hand-edited, install-wide settings. Quick replies are no longer
-  here — they live per account in `accounts.json`.
+- `state/ctx/<account-id>/` — one small JSON file per chat, per account:
+  the last 10 messages in both directions, used when drafting and shown in
+  the extract (see "The conversation extract" above).
+- `state/config.json` — `groups_enabled` (shared by every account),
+  the optional media cache limits `media_cache_max_bytes` and
+  `media_cache_max_age_days`, and any other hand-edited, install-wide
+  settings. Quick replies are no longer here — they live per account in
+  `accounts.json`.
+- `media/<account-id>/` — downloaded attachments, **unencrypted**, up to
+  500 MiB / 30 days by default. Written only by `bin/wa-media` on the
+  host; emptied with `./bin/wa-media clear` or the settings screen's
+  **Vaciar caché** (see "Attachments" above).
 - `wuzdata/` — wuzapi's own SQLite database and session data, bind-mounted
   into both containers. This is where the history dump lands before
   `wa-pair`/the sink purge it.
@@ -834,7 +1032,9 @@ account out of wuzapi, removes that account's wuzapi user (so re-linking
 the same id later works instead of colliding with the old one), removes it
 from `accounts.json`, removes its token from `secrets.env`, removes its
 context ring, and discards its pending queue entries — but deliberately
-leaves `agents/<account-id>.md` (its tone file) in place. The two wuzapi
+leaves `agents/<account-id>.md` (its tone file) in place. It also leaves
+that account's attachment cache (`media/<account-id>/`) on disk; empty it
+with `./bin/wa-media clear --account <account-id>`. The two wuzapi
 steps are best-effort, because an unreachable container must not make a
 local account un-removable; either one failing is reported, never
 swallowed. It does **not** by itself remove the device from
