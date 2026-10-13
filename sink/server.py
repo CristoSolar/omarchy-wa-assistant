@@ -54,6 +54,25 @@ def _decode(raw: bytes, content_type: str):
     return event, instance_name
 
 
+def _log_shape(event, instance_name) -> None:
+    """Diagnostics behind WA_DEBUG_EVENTS: the event's shape, never its
+    content: type, state, chat/sender ids and the message's top-level keys,
+    so a receipt or an unsupported message can be told apart without
+    writing anyone's text to the log."""
+    if not isinstance(event, dict):
+        return
+    inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+    info = inner.get("Info") if isinstance(inner.get("Info"), dict) else inner
+    message = inner.get("Message") if isinstance(inner.get("Message"), dict) else {}
+    print("event-shape", json.dumps({
+        "instance": instance_name, "type": event.get("type"),
+        "state": event.get("state"), "chat": info.get("Chat"),
+        "sender": info.get("Sender"), "from_me": info.get("IsFromMe"),
+        "msg_keys": sorted(message.keys()),
+        "receipt_keys": sorted(inner.keys()) if event.get("type") == "ReadReceipt" else None,
+    }), file=sys.stderr, flush=True)
+
+
 def _log_unknown_instance_once(instance_name, jid) -> None:
     if instance_name not in _logged_unknown_instances:
         _logged_unknown_instances.add(instance_name)
@@ -125,6 +144,8 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     event, instance_name = _decode(raw, content_type)
     if event is None:
         return False
+    if os.environ.get("WA_DEBUG_EVENTS"):
+        _log_shape(event, instance_name)
 
     if isinstance(event, dict) and event.get("type") == "ReadReceipt":
         return _handle_read_receipt(event, instance_name, data_dir)

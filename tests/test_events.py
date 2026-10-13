@@ -270,5 +270,43 @@ def test_read_receipt_missing_state_is_none():
     assert extract_read_receipt(ev) is None
 
 
+def _with_message(message, **info):
+    ev = _ev(**info)
+    ev["event"]["Message"] = message
+    return ev
+
+
+def test_a_reaction_is_not_queued():
+    ev = _with_message({"messageContextInfo": {}, "reactionMessage": {"text": "👍"}})
+    assert extract(ev, []) is None
+
+
+def test_a_key_distribution_message_is_not_queued():
+    ev = _with_message({"messageContextInfo": {}, "senderKeyDistributionMessage": {}})
+    assert extract(ev, []) is None
+
+
+def test_a_protocol_message_is_not_queued():
+    ev = _with_message({"protocolMessage": {"type": 0}})
+    assert extract(ev, []) is None
+
+
+def test_a_disappearing_message_is_read_through_its_wrapper():
+    ev = _with_message({"ephemeralMessage": {"message": {"extendedTextMessage": {"text": "se borra"}}}})
+    assert extract(ev, [])["text"] == "se borra"
+
+
+def test_a_view_once_image_is_read_through_its_wrapper():
+    ev = _with_message({"viewOnceMessageV2": {"message": {"imageMessage": {}}}})
+    out = extract(ev, [])
+    assert out["text"] == "[imagen]"
+    assert out["attachment"]["type"] == "image"
+
+
+def test_an_own_reaction_writes_nothing_to_the_ring():
+    ev = _with_message({"reactionMessage": {"text": "👍"}}, IsFromMe=True)
+    assert extract_own_message(ev) is None
+
+
 if __name__ == "__main__":
     run(dict(globals()))

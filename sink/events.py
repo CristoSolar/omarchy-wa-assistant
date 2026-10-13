@@ -43,6 +43,37 @@ DOWNLOAD_FIELDS = ("URL", "mimetype", "mediaKey", "fileSHA256",
                    "fileEncSHA256", "fileLength", "directPath")
 
 
+# Events WhatsApp delivers as messages but the phone never shows as one:
+# reactions, key exchange, edits/deletes, pins. Queueing them left entries
+# with no sender name and no text that no read receipt could ever clear,
+# because there is nothing unread on the phone to read.
+INVISIBLE = {"reactionMessage", "encReactionMessage", "senderKeyDistributionMessage",
+             "protocolMessage", "pinInChatMessage", "keepInChatMessage",
+             "pollUpdateMessage", "messageContextInfo"}
+
+# Wrappers whose real message sits one level down under "message".
+WRAPPERS = ("ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2",
+            "viewOnceMessageV2Extension", "documentWithCaptionMessage")
+
+
+def _unwrap(message):
+    for _ in range(3):  # ponytail: wrappers nest at most twice in practice
+        if not isinstance(message, dict):
+            return message
+        for key in WRAPPERS:
+            inner = message.get(key)
+            if isinstance(inner, dict) and isinstance(inner.get("message"), dict):
+                message = inner["message"]
+                break
+        else:
+            return message
+    return message
+
+
+def _is_invisible(message) -> bool:
+    return isinstance(message, dict) and bool(message) and set(message) <= INVISIBLE
+
+
 def _text_of(message: dict) -> str:
     if not isinstance(message, dict):
         return "[mensaje no soportado]"
@@ -103,7 +134,9 @@ def extract(event: dict, groups_enabled) -> dict | None:
     if info.get("IsGroup") and jid not in (groups_enabled or []):
         return None
 
-    message = (event or {}).get("event", {}).get("Message", {})
+    message = _unwrap((event or {}).get("event", {}).get("Message", {}))
+    if _is_invisible(message):
+        return None
     entry = {
         "jid": jid,
         "push_name": info.get("PushName") or jid,
@@ -131,7 +164,9 @@ def extract_own_message(event: dict) -> dict | None:
     jid = info.get("Chat", "")
     if not jid:
         return None
-    message = (event or {}).get("event", {}).get("Message", {})
+    message = _unwrap((event or {}).get("event", {}).get("Message", {}))
+    if _is_invisible(message):
+        return None
     return {"jid": jid, "text": _text_of(message), "ts": info.get("Timestamp", "")}
 
 
