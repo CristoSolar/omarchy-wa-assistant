@@ -18,8 +18,10 @@ construction, the same way the full-JID check closes writing to the wrong
 person.
 """
 import argparse
+import base64
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import socket
@@ -368,12 +370,12 @@ def build_prompt(agent_text, context, idea, push_name) -> str:
     )
 
 
-def _post(url, payload, token):
+def _post(url, payload, token, timeout=20):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "token": token})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError:
         # The server answered (with an error status): that is a definite
@@ -968,19 +970,28 @@ def cmd_chat_send(args):
         return cmd_send(argparse.Namespace(id=eid, text=args.text, mention=getattr(args, "mention", None),
                                            acknowledged=args.acknowledged))
     token = account_token(account)
-    # Same double-send guard as the queue path, for chats with no entry.
+    _deliver(d, eid, getattr(args, "acknowledged", False),
+             lambda: send(args.jid, args.text, token, **_mentions(args)))
+
+
+def _deliver(d, eid, acknowledged, do_send, entry_unconfirmed=False):
+    """Run do_send() under the chat double-send guard; print the outcome.
+
+    The same guard as the queue path, for sends with no queue entry (or an
+    attachment, which never goes through cmd_send).
+    """
     had_mark = eid in _unknown_marks(d)
-    if had_mark and not getattr(args, "acknowledged", False):
+    if (had_mark or entry_unconfirmed) and not acknowledged:
         print(json.dumps({"ok": False, "needs_ack": True, "status": "unknown",
                           "error": NEEDS_ACK_MESSAGE["unknown"]}, ensure_ascii=False))
-        return
+        return None
     # Written BEFORE the request, like the queue path's "sending": closing
     # the window mid-send kills this process, and a kill cannot write
     # anything afterwards. Cleared only once the outcome is definite.
     _set_unknown_mark(d, eid, True)
     confirmed_sent = False
     try:
-        result = send(args.jid, args.text, token, **_mentions(args))
+        result = do_send()
         if _is_dry_run(result):
             _set_unknown_mark(d, eid, had_mark)  # sent nothing, changes nothing
             out = {"ok": True, "dry_run": True}
@@ -1006,7 +1017,96 @@ def cmd_chat_send(args):
             except Exception:
                 pass  # the mark stays: one extra confirmation, never a double send
     print(json.dumps(out, ensure_ascii=False))
+    return out
 
+
+# --- attachments: photo/video, document, location, contact, poll -----------
+
+MEDIA_MAX = {"image": 16 << 20, "video": 64 << 20, "document": 100 << 20}
+ENDPOINT = {"image": "/chat/send/image", "video": "/chat/send/video", "document": "/chat/send/document",
+            "location": "/chat/send/location", "contact": "/chat/send/contact", "poll": "/chat/send/poll"}
+
+
+def media_payload(path, caption=""):
+    """(kind, payload) for a file: image/* and video/* go as such, the rest as a document."""
+    path = Path(path)
+    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    kind = "image" if mime.startswith("image/") and mime != "image/svg+xml" else (
+        "video" if mime.startswith("video/") else "document")
+    size = path.stat().st_size
+    if size == 0:
+        raise ValueError(f"{path.name} está vacío")
+    if size > MEDIA_MAX[kind]:
+        raise ValueError(f"{path.name} pesa {size >> 20} MB; el máximo para {kind} es {MEDIA_MAX[kind] >> 20} MB")
+    b64 = base64.b64encode(path.read_bytes()).decode()
+    if kind == "document":
+        # octet-stream prefix: older wuzapi builds require it; MimeType carries the real type.
+        return kind, {"Document": "data:application/octet-stream;base64," + b64,
+                      "FileName": path.name, "MimeType": mime, "Caption": caption}
+    return kind, {kind.capitalize(): f"data:{mime};base64,{b64}", "Caption": caption, "MimeType": mime}
+
+
+def location_payload(lat, lon, name=""):
+    lat, lon = float(lat), float(lon)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (lat == 0 and lon == 0):
+        raise ValueError("coordenadas inválidas")
+    return {"Latitude": lat, "Longitude": lon, "Name": name}
+
+
+def contact_payload(name, phone):
+    digits = "".join(ch for ch in str(phone) if ch.isdigit())
+    name = " ".join(str(name).split())
+    if not name or len(digits) < 8:
+        raise ValueError("el contacto necesita nombre y número con código de país")
+    vcard = ("BEGIN:VCARD\nVERSION:3.0\n"
+             f"FN:{name}\nTEL;type=CELL;waid={digits}:+{digits}\nEND:VCARD")
+    return {"Name": name, "Vcard": vcard}
+
+
+def poll_payload(question, options):
+    options = [o.strip() for o in options or [] if o and o.strip()]
+    if not str(question).strip() or not 2 <= len(options) <= 12 or len(set(options)) != len(options):
+        raise ValueError("la encuesta necesita pregunta y de 2 a 12 opciones distintas")
+    return {"Header": str(question).strip(), "Options": options}
+
+
+def send_attachment(kind, jid, payload, token) -> dict:
+    """POST one attachment. Same rules as send(): full jid, local API, dry run by default."""
+    if not history.is_chat(jid):
+        raise ValueError(f"{jid!r} no es un chat")
+    if not API.startswith("http://127.0.0.1:"):
+        raise ValueError(f"refusing to send: WA_API must stay on 127.0.0.1, got {API!r}")
+    if os.environ.get("WA_DRY_RUN", "1") != "0":
+        return {"dry_run": True, "jid": jid, "kind": kind}
+    if not token:
+        raise ValueError("refusing to send without a token")
+    # The poll handler names its recipient "Group" (any jid works).
+    body = dict(payload, **({"Group": jid} if kind == "poll" else {"Phone": jid}))
+    return _post(f"{API}{ENDPOINT[kind]}", body, token, timeout=300 if kind in MEDIA_MAX else 20)
+
+
+def cmd_chat_attach(args):
+    d = store.data_dir()
+    account, _ = _chat_history(d, args.account, args.jid, new=getattr(args, "new", False))
+    eid = store.entry_id(account["id"], args.jid)
+    try:
+        if args.kind == "media":
+            kind, payload = media_payload(args.file or "", args.caption or "")
+        elif args.kind == "location":
+            kind, payload = "location", location_payload(args.lat, args.lon, args.name or "")
+        elif args.kind == "contact":
+            kind, payload = "contact", contact_payload(args.name or "", args.phone or "")
+        else:
+            kind, payload = "poll", poll_payload(args.question or "", args.option)
+    except (ValueError, TypeError, OSError) as exc:  # bad input: nothing was sent
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return
+    token = account_token(account)
+    entry = _entry(d, eid)
+    out = _deliver(d, eid, args.acknowledged, lambda: send_attachment(kind, args.jid, payload, token),
+                   entry_unconfirmed=entry is not None and entry.get("status") in UNCONFIRMED_STATUSES)
+    if out and out.get("ok") and not out.get("dry_run") and entry is not None:
+        store.remove_queue(d, eid)  # answered, like a text reply
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1047,6 +1147,13 @@ def main():
     p.add_argument("--new", action="store_true", help="a chat the owner starts: no history needed")
     p.add_argument("--mention", action="append", help="a group member's jid, whose @number is in the text")
     p.set_defaults(fn=cmd_chat_send)
+    p = sub.add_parser("chat-attach"); p.add_argument("account"); p.add_argument("jid")
+    p.add_argument("--kind", required=True, choices=["media", "location", "contact", "poll"])
+    p.add_argument("--file"); p.add_argument("--caption")
+    p.add_argument("--lat"); p.add_argument("--lon"); p.add_argument("--name")
+    p.add_argument("--phone"); p.add_argument("--question"); p.add_argument("--option", action="append")
+    p.add_argument("--acknowledged", action="store_true"); p.add_argument("--new", action="store_true")
+    p.set_defaults(fn=cmd_chat_attach)
     args = ap.parse_args()
     try:
         args.fn(args)

@@ -118,6 +118,17 @@ miembro elegido se ve como `@Nombre` y sale como mención real de WhatsApp.
 Las menciones que recibís muestran el nombre de la persona en vez de su
 número, en la conversación, la lista y las notificaciones.
 
+**Adjuntos.** **📎 Adjuntar**, al lado de "Sale por", ofrece las categorías
+de WhatsApp: **Fotos y videos** y **Documento** (el selector de archivos del
+sistema, varios a la vez, con un comentario opcional en el primero),
+**Ubicación** (coordenadas o un link de Google Maps, y un nombre opcional),
+**Contacto** (de la agenda de esa cuenta) y **Encuesta** (pregunta y de 2 a
+12 opciones). **Evento** aparece deshabilitado: wuzapi no puede enviar
+eventos. Límites: 16 MB por foto, 64 MB por video, 100 MB por documento.
+Los adjuntos salen por `wa-reply chat-attach` con la misma protección
+contra envíos dobles que el texto, y uno enviado a un chat de la cola lo
+da por respondido.
+
 **Fotos de perfil.** Las filas y la cabecera de la conversación muestran
 la foto de cada chat o contacto (su inicial si no tiene). Solo las filas
 que están en pantalla la piden, de a pocas, vía wuzapi (`/user/avatar`) y
@@ -185,7 +196,8 @@ servicio solo lee; nunca envía.
   al teléfono el historial viejo no funcionó. El rodeo es desvincular y
   volver a emparejar la cuenta con `days_to_sync_history`, lo que hace que
   WhatsApp vuelque de nuevo lo que tiene.
-- Enviar adjuntos, reacciones, editar o borrar mensajes.
+- Enviar eventos, notas de voz o stickers; reacciones; editar o borrar
+  mensajes. (wuzapi no tiene cómo enviar eventos.)
 
 ## Requisitos
 

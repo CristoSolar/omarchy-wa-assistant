@@ -1867,5 +1867,124 @@ def test_queue_send_on_a_refused_connection_is_failed_not_unknown():
             wa.urllib.request.urlopen = original
 
 
+
+# --- chat-attach ---------------------------------------------------------------
+
+class _live:
+    """WA_DRY_RUN=0 for the block only: a leak would make later tests post for real."""
+
+    def __enter__(self):
+        self._prev = os.environ.get("WA_DRY_RUN")
+        os.environ["WA_DRY_RUN"] = "0"
+
+    def __exit__(self, *a):
+        os.environ.pop("WA_DRY_RUN") if self._prev is None else os.environ.__setitem__("WA_DRY_RUN", self._prev)
+        return False
+
+
+def _attach_args(**kw):
+    base = dict(account="personal", jid=DM, kind="media", file=None, caption=None, lat=None, lon=None,
+                name=None, phone=None, question=None, option=None, acknowledged=False, new=False)
+    base.update(kw)
+    return base
+
+
+def test_media_payload_picks_image_video_or_document_by_type():
+    with tmpdir() as d:
+        (d / "f.jpg").write_bytes(b"JPG"); (d / "v.mp4").write_bytes(b"MP4"); (d / "a.pdf").write_bytes(b"PDF")
+        kind, pl = wa.media_payload(d / "f.jpg", "mirá")
+        assert kind == "image" and pl["Image"] == "data:image/jpeg;base64,SlBH" and pl["Caption"] == "mirá"
+        assert wa.media_payload(d / "v.mp4")[0] == "video"
+        kind, pl = wa.media_payload(d / "a.pdf")
+        assert kind == "document" and pl["FileName"] == "a.pdf" and pl["MimeType"] == "application/pdf"
+        assert pl["Document"].startswith("data:application/octet-stream;base64,")
+        (d / "vacio.txt").write_bytes(b"")
+        for bad in (d / "vacio.txt", d / "no-existe.png"):
+            try:
+                wa.media_payload(bad)
+            except (ValueError, OSError):
+                pass
+            else:
+                raise AssertionError(bad)
+
+
+def test_location_contact_and_poll_payloads_validate():
+    assert wa.location_payload("-33.45", "-70.66", "Casa") == {"Latitude": -33.45, "Longitude": -70.66, "Name": "Casa"}
+    pl = wa.contact_payload(" Ana  Pérez ", "+56 9 1234 5678")
+    assert pl["Name"] == "Ana Pérez" and "waid=56912345678:+56912345678" in pl["Vcard"]
+    assert wa.poll_payload("¿Cuándo?", ["lunes", " martes ", ""]) == {"Header": "¿Cuándo?", "Options": ["lunes", "martes"]}
+    for fn, a in ((wa.location_payload, ("0", "0")), (wa.location_payload, ("91", "1")),
+                  (wa.contact_payload, ("", "56912345678")), (wa.contact_payload, ("Ana", "123")),
+                  (wa.poll_payload, ("q", ["una"])), (wa.poll_payload, ("q", ["a", "a"])),
+                  (wa.poll_payload, ("", ["a", "b"]))):
+        try:
+            fn(*a)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError((fn.__name__, a))
+
+
+def test_send_attachment_posts_to_its_endpoint_poll_by_group_field():
+    called = []
+    original, wa._post = wa._post, lambda url, body, token, timeout=20: called.append((url, body, timeout)) or {}
+    previous = os.environ.get("WA_DRY_RUN")
+    os.environ["WA_DRY_RUN"] = "0"
+    try:
+        wa.send_attachment("location", DM, {"Latitude": 1.5, "Longitude": 2.5}, "tok")
+        wa.send_attachment("poll", GROUP, {"Header": "q", "Options": ["a", "b"]}, "tok")
+        wa.send_attachment("image", DM, {"Image": "data:image/png;base64,AA"}, "tok")
+        assert called[0] == (wa.API + "/chat/send/location", {"Latitude": 1.5, "Longitude": 2.5, "Phone": DM}, 20)
+        assert called[1][0].endswith("/chat/send/poll") and called[1][1]["Group"] == GROUP and "Phone" not in called[1][1]
+        assert called[2][0].endswith("/chat/send/image") and called[2][2] == 300
+        try:
+            wa.send_attachment("location", "status@broadcast", {}, "tok")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a status must be refused")
+        assert len(called) == 3
+    finally:
+        wa._post = original
+        os.environ.pop("WA_DRY_RUN") if previous is None else os.environ.__setitem__("WA_DRY_RUN", previous)
+
+
+def test_chat_attach_dry_run_bad_input_and_the_double_send_guard():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="location", lat="-33.4", lon="-70.6"))
+        assert out == {"ok": True, "dry_run": True}
+        out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="poll", question="q", option=["x"]))
+        assert out["ok"] is False and "opciones" in out["error"]
+        out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="location", lat="1", lon="1", jid=GROUP))
+        assert isinstance(out, wa.ChatNotInAccount)
+        original, wa.send_attachment = wa.send_attachment, _raise_unknown
+        try:
+            with _live():
+                out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="contact", name="Ana", phone="56912345678"))
+                assert out["unknown"] is True
+                wa.send_attachment = _no_network
+                out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="contact", name="Ana", phone="56912345678"))
+                assert out["needs_ack"] is True
+        finally:
+            wa.send_attachment = original
+
+
+def test_a_sent_attachment_answers_the_queue_entry():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        _enqueue(d, _queue_entry(jid=DM))
+        original = wa.send_attachment
+        wa.send_attachment = lambda *a: {"data": {"Details": "Sent"}}
+        try:
+            with _live():
+                out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(kind="location", lat="-33.4", lon="-70.6"))
+        finally:
+            wa.send_attachment = original
+        assert out == {"ok": True, "dry_run": False} and store.load_queue(d) == []
+
+
 if __name__ == "__main__":
     run(dict(globals()))

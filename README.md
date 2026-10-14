@@ -112,6 +112,16 @@ as `@Name` and goes out as a real WhatsApp mention. Mentions you receive
 show the person's name instead of their number, in the conversation, the
 list and notifications.
 
+**Attachments.** **📎 Adjuntar**, next to "Sale por", offers WhatsApp's
+categories: **Fotos y videos** and **Documento** (the system file picker,
+several files at once, an optional comment on the first), **Ubicación**
+(coordinates or a Google Maps link, and an optional place name),
+**Contacto** (from that account's address book) and **Encuesta** (a question
+and 2–12 options). **Evento** is shown disabled: wuzapi cannot send events.
+Limits: 16 MB per photo, 64 MB per video, 100 MB per document. Attachments
+go through `wa-reply chat-attach` with the same double-send guard as text,
+and one sent to a chat in the queue answers it.
+
 **Profile pictures.** Rows and the conversation header show each chat's
 or contact's picture (its initial when there is none). Only rows on screen
 ask for one, a few at a time, through wuzapi (`/user/avatar`) and
@@ -175,7 +185,8 @@ only reads; it never sends.
   phone for older history did not work. The workaround is to unlink and
   re-pair the account with `days_to_sync_history` set, which makes WhatsApp
   dump what it has again.
-- Sending attachments, reactions, editing or deleting messages.
+- Sending events, voice notes or stickers; reactions; editing or deleting
+  messages. (wuzapi has no endpoint for events.)
 
 ## Requirements
 

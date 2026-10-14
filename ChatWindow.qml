@@ -157,6 +157,117 @@ Item {
     return out
   }
 
+  // ---- attachments -------------------------------------------------------
+  // 📎 opens the same categories as WhatsApp. Files come from the system
+  // picker (zenity); everything goes out through `wa-reply chat-attach`,
+  // under the same double-send guard as text.
+  property string attachMode: ""  // "", menu, media, location, contact, poll
+  property var attachFiles: []
+  property var attachQueue: []
+  property var attachAckArgs: null
+  property string attachSearch: ""
+  ListModel { id: pollOptions }
+
+  function openAttach(mode) {
+    root.attachMode = mode
+    root.status = ""
+    root.statusWarn = false
+    if (mode === "photos" || mode === "document") { root.attachMode = "menu"; root.pickFiles(mode) }
+    if (mode === "poll") { pollOptions.clear(); pollOptions.append({ v: "" }); pollOptions.append({ v: "" }) }
+    if (mode === "contact") root.attachSearch = ""
+  }
+  function pickFiles(kind) {
+    if (filePicker.running) return
+    var cmd = ["zenity", "--file-selection", "--multiple", "--separator=\n",
+               "--title=" + (kind === "photos" ? "Fotos y videos" : "Documentos")]
+    if (kind === "photos")
+      cmd.push("--file-filter=Fotos y videos | *.jpg *.jpeg *.png *.webp *.gif *.heic *.mp4 *.mov *.m4v *.3gp *.mkv *.webm *.JPG *.JPEG *.PNG *.MP4 *.MOV")
+    filePicker.command = cmd
+    filePicker.running = true
+  }
+  Process {
+    id: filePicker
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var files = String(text).split("\n").filter(function(f) { return f.trim() !== "" })
+        if (files.length === 0) return  // cancelled: the menu stays
+        root.attachFiles = files
+        root.attachMode = "media"
+      }
+    }
+  }
+  function parseLatLon(t) {
+    var m = String(t).match(/(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)/)
+    return m ? [m[1], m[2]] : null
+  }
+  readonly property var attachContacts: {
+    if (root.attachMode !== "contact") return []
+    var q = root.attachSearch.trim().toLowerCase(), out = []
+    for (var i = 0; i < root.contacts.length && out.length < 40; i++) {
+      var c = root.contacts[i]
+      if (c.account !== root.curAcc) continue
+      if (q !== "" && c.name.toLowerCase().indexOf(q) === -1 && c.phone.indexOf(q) === -1) continue
+      out.push(c)
+    }
+    return out
+  }
+  // jobs: [[args...], ...] sent one after another.
+  function runAttach(jobs, acknowledged) {
+    if (root.sending || root.drafting || !root.curJid || jobs.length === 0) return
+    root.resetComposer()
+    root.attachAckArgs = null
+    root.attachQueue = jobs.slice(1)
+    root.startAttach(jobs[0], acknowledged)
+  }
+  function startAttach(args, acknowledged) {
+    root.sending = true
+    root.status = "Enviando adjunto…" + (root.attachQueue.length > 0 ? " (quedan " + root.attachQueue.length + ")" : "")
+    attachProc.key = root.curKey
+    attachProc.args = args
+    attachProc.gotAnswer = false
+    var cmd = [root.pluginDir + "bin/wa-reply", "chat-attach", root.curAcc, root.curJid].concat(args)
+    if (root.curNew) cmd.push("--new")
+    if (acknowledged) cmd.push("--acknowledged")
+    attachProc.command = cmd
+    attachProc.running = true
+  }
+  Process {
+    id: attachProc
+    property string key: ""
+    property var args: []
+    property bool gotAnswer: false
+    stdout: StdioCollector {
+      onStreamFinished: { attachProc.gotAnswer = true; root.onAttached(text, attachProc.key, attachProc.args) }
+    }
+    onExited: if (!attachProc.gotAnswer) root.onAttached("", attachProc.key, attachProc.args)
+  }
+  function onAttached(out, key, args) {
+    root.sending = false
+    if (key !== root.curKey) return
+    var r = null
+    try { r = JSON.parse(out) } catch (e) { r = null }
+    if (r && r.ok) {
+      root.fetchMessages(0)
+      if (r.dry_run) { root.status = "DRY RUN: no se envió nada."; root.statusWarn = true }
+      if (root.attachQueue.length > 0) { var next = root.attachQueue.shift(); root.startAttach(next, false); return }
+      if (!r.dry_run) root.status = ""
+      root.attachMode = ""
+      root.attachFiles = []
+      return
+    }
+    root.attachQueue = []
+    if (r && r.needs_ack) {
+      root.ackMessage = r.error || "Un envío anterior quedó sin confirmación."
+      root.attachAckArgs = args
+    } else if (!r || r.unknown) {
+      root.status = "Sin confirmación: puede que el adjunto ya haya salido. Revisá WhatsApp antes de reintentar."
+      root.statusWarn = true
+    } else {
+      root.status = "No salió: " + (r.error || "error desconocido")
+      root.statusWarn = true
+    }
+  }
+
   // ---- @mentions ----------------------------------------------------------
   // In a group, "@" in the composer suggests its members. A picked member
   // shows as "@Name"; on send each "@Name" becomes "@<number>" plus a
@@ -456,6 +567,10 @@ Item {
     root.quickReplies = []
     root.mentionMap = ({})
     root.mentionOpen = false
+    root.attachMode = ""
+    root.attachFiles = []
+    root.attachQueue = []
+    root.attachAckArgs = null
     root.loadMembers()
     root.fetchMessages(0)
     if (root.curExplicit) root.markRead(c, true)
@@ -1383,14 +1498,15 @@ Item {
                       fontFamily: root.fontFamily
                       bordered: true
                       enabled: !root.sending
-                      onClicked: root.doSend(root.ackText, true)
+                      onClicked: root.attachAckArgs ? root.runAttach([root.attachAckArgs], true)
+                                                    : root.doSend(root.ackText, true)
                     }
                     Button {
                       text: "Cancelar"
                       foreground: root.fg
                       fontFamily: root.fontFamily
                       bordered: true
-                      onClicked: { root.ackMessage = ""; root.ackText = "" }
+                      onClicked: { root.ackMessage = ""; root.ackText = ""; root.attachAckArgs = null }
                     }
                   }
                 }
@@ -1413,6 +1529,208 @@ Item {
                     bordered: true
                     enabled: !root.sending && !root.drafting
                     onClicked: root.doSend(modelData, false)
+                  }
+                }
+              }
+
+              // -- attachments --
+              Rectangle {
+                visible: root.attachMode !== ""
+                Layout.fillWidth: true
+                implicitHeight: attachCol.implicitHeight + Style.spacing.md * 2
+                color: root.bg
+                border.width: Style.spacing.hairline
+                border.color: Style.normalBorderFor(root.fg, root.accent)
+                radius: Style.cornerRadius
+                ColumnLayout {
+                  id: attachCol
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.top: parent.top; anchors.margins: Style.spacing.md
+                  spacing: Style.spacing.sm
+
+                  RowLayout {
+                    Layout.fillWidth: true
+                    Text {
+                      text: ({ menu: "Adjuntar", media: "Fotos, videos y documentos", location: "Ubicación",
+                               contact: "Contacto", poll: "Encuesta" })[root.attachMode] || ""
+                      color: root.fg
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                      Layout.fillWidth: true
+                    }
+                    Button {
+                      visible: root.attachMode !== "menu"
+                      text: "‹ Volver"
+                      foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
+                      enabled: !root.sending
+                      onClicked: root.attachMode = "menu"
+                    }
+                    Button {
+                      text: "✕"
+                      foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
+                      enabled: !root.sending
+                      onClicked: { root.attachMode = ""; root.attachFiles = [] }
+                    }
+                  }
+
+                  // categories, as in WhatsApp
+                  Flow {
+                    visible: root.attachMode === "menu"
+                    Layout.fillWidth: true
+                    spacing: Style.spacing.sm
+                    Repeater {
+                      model: [ { id: "photos", label: "🖼️ Fotos y videos" }, { id: "document", label: "📄 Documento" },
+                               { id: "location", label: "📍 Ubicación" }, { id: "contact", label: "👤 Contacto" },
+                               { id: "poll", label: "📊 Encuesta" }, { id: "event", label: "📅 Evento" } ]
+                      delegate: Button {
+                        required property var modelData
+                        text: modelData.label
+                        foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
+                        bordered: true
+                        enabled: modelData.id !== "event" && !filePicker.running
+                        tooltipText: modelData.id === "event" ? "wuzapi todavía no permite enviar eventos" : ""
+                        onClicked: root.openAttach(modelData.id)
+                      }
+                    }
+                  }
+
+                  // files
+                  Text {
+                    visible: root.attachMode === "media"
+                    textFormat: Text.PlainText
+                    text: root.attachFiles.map(function(f) { return "• " + f.split("/").pop() }).join("\n")
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideMiddle
+                    Layout.fillWidth: true
+                  }
+                  TextField {
+                    id: captionField
+                    visible: root.attachMode === "media"
+                    Layout.fillWidth: true
+                    placeholderText: root.attachFiles.length > 1 ? "Comentario (va con el primero)" : "Comentario (opcional)"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  // location
+                  TextField {
+                    id: locField
+                    visible: root.attachMode === "location"
+                    Layout.fillWidth: true
+                    placeholderText: "Coordenadas (-33.45, -70.66) o link de Google Maps"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                  TextField {
+                    id: locName
+                    visible: root.attachMode === "location"
+                    Layout.fillWidth: true
+                    placeholderText: "Nombre del lugar (opcional)"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  // contact
+                  TextField {
+                    visible: root.attachMode === "contact"
+                    Layout.fillWidth: true
+                    placeholderText: "Buscar en la agenda de " + root.curLabel
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    onTextChanged: root.attachSearch = text
+                  }
+                  ListView {
+                    visible: root.attachMode === "contact"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(contentHeight, 200)
+                    clip: true
+                    model: root.attachContacts
+                    delegate: Rectangle {
+                      id: pickRow
+                      required property var modelData
+                      width: ListView.view.width
+                      height: pickText.implicitHeight + Style.spacing.sm * 2
+                      radius: Style.cornerRadius
+                      color: pickMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent"
+                      Text {
+                        id: pickText
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left; anchors.leftMargin: Style.spacing.md
+                        textFormat: Text.PlainText
+                        text: pickRow.modelData.name + "   +" + pickRow.modelData.phone
+                        color: root.fg
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                      MouseArea {
+                        id: pickMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: !root.sending
+                        onClicked: root.runAttach([["--kind=contact", "--name=" + pickRow.modelData.name,
+                                                    "--phone=" + pickRow.modelData.phone]], false)
+                      }
+                    }
+                  }
+
+                  // poll
+                  TextField {
+                    id: pollQuestion
+                    visible: root.attachMode === "poll"
+                    Layout.fillWidth: true
+                    placeholderText: "Pregunta"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                  Repeater {
+                    model: pollOptions
+                    delegate: TextField {
+                      required property int index
+                      required property string v
+                      visible: root.attachMode === "poll"
+                      Layout.fillWidth: true
+                      placeholderText: "Opción " + (index + 1)
+                      text: v
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      onTextChanged: pollOptions.setProperty(index, "v", text)
+                    }
+                  }
+                  Button {
+                    visible: root.attachMode === "poll" && pollOptions.count < 12
+                    text: "+ Opción"
+                    foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
+                    bordered: true
+                    onClicked: pollOptions.append({ v: "" })
+                  }
+
+                  Button {
+                    visible: ["media", "location", "poll"].indexOf(root.attachMode) !== -1
+                    text: root.sending ? "Enviando…" : "Enviar"
+                    foreground: root.fg; fontFamily: root.fontFamily
+                    bordered: true
+                    enabled: !root.sending
+                    onClicked: {
+                      var jobs = []
+                      if (root.attachMode === "media") {
+                        for (var i = 0; i < root.attachFiles.length; i++)
+                          jobs.push(["--kind=media", "--file=" + root.attachFiles[i]]
+                                    .concat(i === 0 && captionField.text.trim() !== "" ? ["--caption=" + captionField.text] : []))
+                      } else if (root.attachMode === "location") {
+                        var ll = root.parseLatLon(locField.text)
+                        if (!ll) { root.status = "No encuentro coordenadas en eso."; root.statusWarn = true; return }
+                        jobs.push(["--kind=location", "--lat=" + ll[0], "--lon=" + ll[1], "--name=" + locName.text.trim()])
+                      } else {
+                        var job = ["--kind=poll", "--question=" + pollQuestion.text]
+                        for (var k = 0; k < pollOptions.count; k++)
+                          if (pollOptions.get(k).v.trim() !== "") job.push("--option=" + pollOptions.get(k).v)
+                        jobs.push(job)
+                      }
+                      root.runAttach(jobs, false)
+                    }
                   }
                 }
               }
@@ -1514,6 +1832,16 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.spacing.md
+                Button {
+                  text: "📎 Adjuntar"
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  bordered: true
+                  selected: root.attachMode !== ""
+                  enabled: !root.sending && !root.drafting
+                  onClicked: root.attachMode = root.attachMode === "" ? "menu" : ""
+                }
                 Text {
                   text: "Sale por: " + root.curLabel
                   color: root.fg
