@@ -112,15 +112,22 @@ def messages(conn, uid, jid, before=None, limit=50):
     return _decoded(reversed(rows)), len(rows) == limit
 
 
+def _unread(conn, uid, jid, after_id) -> list:
+    """Incoming rows after the marker that the chat shows: same rule as _decode."""
+    rows = conn.execute(f"{_SELECT} WHERE user_id = ? AND chat_jid = ? AND id > ? AND {_INCOMING} ORDER BY id",
+                        (uid, jid, after_id)).fetchall()
+    return [r for r in rows if _decode(r) is not None]
+
+
 def unread_count(conn, uid, jid, after_id) -> int:
-    return conn.execute(f"SELECT count(*) FROM message_history WHERE user_id = ? AND chat_jid = ?"
-                        f" AND id > ? AND {_VISIBLE} AND {_INCOMING}", (uid, jid, after_id)).fetchone()[0]
+    return len(_unread(conn, uid, jid, after_id))
 
 
 def unread_ids(conn, uid, jid, after_id) -> list:
-    """(message_id, sender) of every unread incoming message, for /chat/markread."""
-    return conn.execute(f"SELECT message_id, sender_jid FROM message_history WHERE user_id = ? AND chat_jid = ?"
-                        f" AND id > ? AND {_INCOMING} ORDER BY id", (uid, jid, after_id)).fetchall()
+    """(message_id, sender) of every unread visible message, for /chat/markread.
+    Hidden rows are left out on purpose: the badge, the chat and the read
+    receipts all describe the same set."""
+    return [(r[2], r[1]) for r in _unread(conn, uid, jid, after_id)]
 
 
 def last_id(conn, uid=None, jid=None) -> int:

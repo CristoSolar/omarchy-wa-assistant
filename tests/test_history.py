@@ -112,6 +112,21 @@ def test_unread_counts_only_incoming_after_the_marker():
         assert [s for _, s in ids] == [DM, DM]
 
 
+def test_unread_ignores_what_the_chat_hides():
+    with tmpdir() as d:
+        db = Db(d)
+        first = db.add(DM, "leído")
+        db.add(DM, "", message={"protocolMessage": {"type": 0}})
+        db.add(DM, "", mtype="reaction", message={"reactionMessage": {"text": "x"}})
+        real = db.add(DM, "nuevo")
+        c = _conn(d)
+        shown = [m["id"] for m in history.messages(c, "u1", DM)[0] if m["id"] > first]
+        assert shown == [real]
+        assert history.unread_count(c, "u1", DM, first) == 1
+        # marking read covers exactly what is counted: hidden rows are not marked
+        assert len(history.unread_ids(c, "u1", DM, first)) == 1
+
+
 def test_an_image_carries_its_attachment_type():
     with tmpdir() as d:
         db = Db(d); db.add(DM, "", mtype="image", message={"imageMessage": {"URL": "u"}})
