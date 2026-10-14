@@ -1620,5 +1620,41 @@ def test_chat_draft_refuses_a_chat_that_is_not_in_the_account():
         assert isinstance(out, wa.ChatNotInAccount)
 
 
+def _raise_unknown(*a, **k):
+    raise wa.SendOutcomeUnknown("timeout")
+
+
+def test_chat_send_unknown_outcome_writes_a_marker_and_guards_the_next_send():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        os.environ["WA_DRY_RUN"] = "0"
+        original, wa.send = wa.send, _raise_unknown
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out["unknown"] is True
+            assert store.entry_id("personal", DM) in json.loads((d / "chat_unknown.json").read_text())
+            wa.send = _no_network
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out["needs_ack"] is True and out["status"] == "unknown" and out["ok"] is False
+            wa.send = lambda jid, text, token: {"data": {"Details": "Sent"}}
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=True)
+        finally:
+            wa.send = original
+            os.environ.pop("WA_DRY_RUN", None)
+        assert out == {"ok": True, "dry_run": False}
+        assert json.loads((d / "chat_unknown.json").read_text()) == []
+
+
+def test_chat_send_and_draft_answer_a_refusal_when_history_is_unreadable():
+    with tmpdir() as d:
+        _prepare(d, (PERSONAL,))  # no users.db at all
+        for fn, kw in ((wa.cmd_chat_send, dict(text="x", acknowledged=False)),
+                       (wa.cmd_chat_draft, dict(idea="x"))):
+            out = _run_chat(fn, d, account="personal", jid=DM, **kw)
+            assert isinstance(out, wa.ReplyRefused) and out.payload["ok"] is False
+            assert out.payload["error"]
+
+
 if __name__ == "__main__":
     run(dict(globals()))

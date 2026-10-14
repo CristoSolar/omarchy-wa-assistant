@@ -23,6 +23,7 @@ import json
 import os
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import urllib.error
@@ -866,7 +867,15 @@ def cmd_send(args):
 def _chat_history(d, account_id, jid, limit=0):
     """(account, last `limit` messages) for a chat, or ChatNotInAccount."""
     account = _account_or_refuse(d, account_id)
-    conn = history.connect(store.wuzdata_dir())
+    try:
+        conn = history.connect(store.wuzdata_dir())
+    except history.SchemaError:
+        raise ReplyRefused({"ok": False, "error": "el historial de wuzapi tiene un esquema "
+                            "distinto del esperado (esquema); no se envía nada."}) from None
+    except sqlite3.OperationalError as exc:
+        why = "ocupada" if "locked" in str(exc) else str(exc)
+        raise ReplyRefused({"ok": False, "error": f"no se pudo leer el historial de wuzapi "
+                            f"({why}); no se envía nada."}) from None
     try:
         uid = history.user_ids(conn).get(account["wuzapi_user"])
         if not uid or not history.has_chat(conn, uid, jid):
@@ -889,6 +898,18 @@ def cmd_chat_draft(args):
     print(json.dumps(run_claude(prompt), ensure_ascii=False))
 
 
+def _unknown_marks(d) -> list:
+    v = store.read_json(Path(d) / "chat_unknown.json", [])
+    return v if isinstance(v, list) else []
+
+
+def _set_unknown_mark(d, eid, on):
+    marks = [m for m in _unknown_marks(d) if m != eid]
+    if on:
+        marks.append(eid)
+    store.atomic_write(Path(d) / "chat_unknown.json", json.dumps(marks))
+
+
 def cmd_chat_send(args):
     d = store.data_dir()
     account, _ = _chat_history(d, args.account, args.jid)
@@ -898,15 +919,22 @@ def cmd_chat_send(args):
         return cmd_send(argparse.Namespace(id=eid, text=args.text,
                                            acknowledged=args.acknowledged))
     token = account_token(account)
+    # Same double-send guard as the queue path, for chats with no entry.
+    if eid in _unknown_marks(d) and not getattr(args, "acknowledged", False):
+        print(json.dumps({"ok": False, "needs_ack": True, "status": "unknown",
+                          "error": NEEDS_ACK_MESSAGE["unknown"]}, ensure_ascii=False))
+        return
     try:
         result = send(args.jid, args.text, token)
         if _is_dry_run(result):
             out = {"ok": True, "dry_run": True}
         elif _is_confirmed_sent(result):
+            _set_unknown_mark(d, eid, False)
             out = {"ok": True, "dry_run": False}
         else:
             out = {"ok": False, "error": json.dumps(result, ensure_ascii=False)}
     except SendOutcomeUnknown as exc:
+        _set_unknown_mark(d, eid, True)
         out = {"ok": False, "unknown": True, "error": str(exc)}
     except Exception as exc:
         out = {"ok": False, "error": str(exc)}

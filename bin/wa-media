@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -525,7 +526,15 @@ def get_msg_path(d, account_id, message_id) -> Path:
     account = accounts.by_id(accounts.load(d), account_id)
     if account is None:
         raise UnknownAccount(account_id)
-    conn = history.connect(store.wuzdata_dir())
+    try:
+        conn = history.connect(store.wuzdata_dir())
+    except history.SchemaError:
+        raise MediaRefused({"ok": False, "error": "el historial de wuzapi tiene un esquema "
+                            "distinto del esperado (esquema); no se descarga nada."}) from None
+    except sqlite3.OperationalError as exc:
+        why = "ocupada" if "locked" in str(exc) else str(exc)
+        raise MediaRefused({"ok": False, "error": f"no se pudo leer el historial de wuzapi "
+                            f"({why}); no se descarga nada."}) from None
     try:
         uid = history.user_ids(conn).get(account["wuzapi_user"])
         event = history.message_event(conn, uid, message_id) if uid else None

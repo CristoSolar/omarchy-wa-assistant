@@ -662,5 +662,18 @@ def test_get_msg_refuses_a_text_message_a_missing_one_and_an_unknown_account():
             os.environ.pop("WA_WUZAPI_DB", None)
 
 
+def test_get_msg_refuses_with_a_payload_when_history_is_unreadable():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        os.environ["WA_WUZAPI_DB"] = str(t / "nope" / "users.db")
+        try:
+            wm.get_msg_path(d, "personal", "M1")
+            assert False, "should have refused"
+        except wm.MediaRefused as exc:
+            assert exc.payload["ok"] is False and exc.payload["error"]
+        finally:
+            os.environ.pop("WA_WUZAPI_DB", None)
+
+
 if __name__ == "__main__":
     run(globals())
