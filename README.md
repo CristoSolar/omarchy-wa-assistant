@@ -91,8 +91,17 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
 
 Open it with **SUPER+ALT+W** or by clicking the counter in the bar (which
 opens it on **No leídos**). It is an overlay window with a chat list on the
-left (search box, and the tabs **Todos / No leídos / Trabajo / Personal**)
-and the conversation on the right.
+left (search box, and the tabs **Todos / No leídos / Trabajo / Personal /
+Contactos**) and the conversation on the right.
+
+**Starting a chat.** **Contactos** lists the address book each account
+synced from its phone; a search in the other tabs also shows contacts you
+have no chat with yet (👤). Typing a full number with country code
+(`+56912345678`) adds a ✏️ row per account to write to it. Either way
+WhatsApp is asked first (`/user/check`): a number not on WhatsApp is
+refused, and one you already have a chat with opens that chat instead of
+a duplicate. You pick the account by the row you click; groups cannot be
+started from here.
 
 The shortcut lives in your own `~/.config/hypr/bindings.lua`; `install.sh`
 does not add it. Add:
@@ -135,8 +144,9 @@ nobody knows". A send wuzapi refused outright (the bridge is down) shows
 service (`bin/wa-notify`) that raises a desktop notification per incoming
 message — one per chat, replaced by the next message in it. Clicking it opens
 that chat in the window (without marking it read). There is no notification
-for your own messages, for groups you have not enabled unless they mention
-you, for the chat that is open and focused in the window, or for messages
+for your own messages, for chats you muted on the phone (a mention still
+notifies, and an enabled group always does), for the chat that is open and
+focused in the window, or for messages
 more than ten minutes old, so the history WhatsApp dumps when you link an
 account does not notify. Whatever of that dump is already stored when
 linking finishes does not show as unread either; anything that lands

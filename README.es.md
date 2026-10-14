@@ -98,7 +98,16 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 Se abre con **SUPER+ALT+W** o tocando el contador de la barra (que la abre
 en **No leídos**). Es una ventana superpuesta con la lista de chats a la
 izquierda (caja de búsqueda y las pestañas **Todos / No leídos / Trabajo /
-Personal**) y la conversación a la derecha.
+Personal / Contactos**) y la conversación a la derecha.
+
+**Empezar un chat.** **Contactos** muestra la agenda que cada cuenta
+sincronizó desde su teléfono; una búsqueda en las otras pestañas también
+muestra contactos con los que todavía no tenés chat (👤). Si escribís un
+número completo con código de país (`+56912345678`), aparece una fila ✏️
+por cuenta para escribirle. En los dos casos primero se le pregunta a
+WhatsApp (`/user/check`): un número que no está en WhatsApp se rechaza, y
+uno con el que ya tenés chat abre ese chat en vez de duplicarlo. La cuenta
+la elegís con la fila que tocás; desde acá no se crean grupos.
 
 El atajo vive en tu propio `~/.config/hypr/bindings.lua`; `install.sh` no
 lo agrega. Agregalo así:
@@ -145,8 +154,9 @@ puente está caído) muestra "No salió" y podés reintentarlo sin más.
 usuario (`bin/wa-notify`) que muestra una notificación de escritorio por
 cada mensaje entrante — una por chat, reemplazada por el siguiente mensaje
 de ese chat. Al tocarla se abre ese chat en la ventana (sin marcarlo como
-leído). No hay notificación para tus propios mensajes, para grupos que no
-habilitaste salvo que te mencionen, ni para el chat que está abierto y con
+leído). No hay notificación para tus propios mensajes, para chats que
+silenciaste en el teléfono (una mención igual avisa, y un grupo habilitado
+siempre), ni para el chat que está abierto y con
 foco en la ventana, ni para mensajes de hace más de diez minutos, así que
 el historial que WhatsApp vuelca al vincular una cuenta no avisa. Lo que
 de ese volcado ya está guardado cuando termina la vinculación tampoco

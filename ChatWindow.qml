@@ -53,10 +53,11 @@ Item {
     var p = {}
     try { p = payloadJson ? JSON.parse(String(payloadJson)) : {} } catch (e) { p = {} }
     if (p && typeof p.filter === "string"
-        && ["all", "unread", "trabajo", "personal"].indexOf(p.filter) !== -1)
+        && ["all", "unread", "trabajo", "personal", "contacts"].indexOf(p.filter) !== -1)
       root.filter = p.filter
     root.opened = true
     root.loadChats()
+    root.loadContacts()
     // A chat named in the payload (a notification click) wins; otherwise
     // the last chat that was open comes back. Either way it is only SHOWN:
     // reading on the phone needs a click on its row (see openChat).
@@ -106,7 +107,8 @@ Item {
     var q = root.search.trim().toLowerCase()
     var qDigits = q.replace(/[^0-9]/g, "")
     var out = []
-    for (var i = 0; i < root.chats.length; i++) {
+    var i
+    for (i = 0; root.filter !== "contacts" && i < root.chats.length; i++) {
       var c = root.chats[i]
       if (root.filter === "unread" && !(c.unread > 0)) continue
       if ((root.filter === "trabajo" || root.filter === "personal") && c.account !== root.filter) continue
@@ -117,7 +119,87 @@ Item {
       }
       out.push(c)
     }
+    // Starting a chat: the address book on the Contactos tab, and on a
+    // search in the other tabs; a typed number can always be written to.
+    if (root.filter === "unread") return out
+    var accs = (root.filter === "trabajo" || root.filter === "personal") ? [root.filter] : null
+    if (q !== "" || root.filter === "contacts") {
+      var have = {}
+      for (i = 0; i < root.chats.length; i++) {
+        var ch = root.chats[i]
+        have[ch.account + "|" + String(ch.name || "").toLowerCase()] = true
+        have[ch.account + "|" + String(ch.jid).split("@")[0]] = true
+      }
+      for (i = 0; i < root.contacts.length; i++) {
+        var k = root.contacts[i]
+        if (accs && accs.indexOf(k.account) === -1) continue
+        if (have[k.account + "|" + k.name.toLowerCase()] || have[k.account + "|" + k.phone]) continue
+        if (q !== "" && k.name.toLowerCase().indexOf(q) === -1
+            && (qDigits === "" || k.phone.indexOf(qDigits) === -1)) continue
+        out.push({ kind: "contact", account: k.account, label: k.label, name: k.name,
+                   phone: k.phone, last_text: "+" + k.phone })
+      }
+    }
+    if (qDigits.length >= 8 && q.replace(/[0-9+\s()-]/g, "") === "") {
+      var labels = {}
+      for (i = 0; i < root.contacts.length; i++) labels[root.contacts[i].account] = root.contacts[i].label
+      for (i = 0; i < root.chats.length; i++) labels[root.chats[i].account] = root.chats[i].label
+      for (var a in labels) {
+        if (accs && accs.indexOf(a) === -1) continue
+        out.push({ kind: "number", account: a, label: labels[a], name: "Escribir a +" + qDigits,
+                   phone: qDigits, last_text: "Nuevo chat por " + labels[a] })
+      }
+    }
     return out
+  }
+
+  // ---- starting a chat ---------------------------------------------------
+  property var contacts: []
+  property string newError: ""
+
+  function loadContacts() {
+    if (contactsProc.running) return
+    contactsProc.command = [root.pluginDir + "bin/wa-chat", "contacts"]
+    contactsProc.running = true
+  }
+  Process {
+    id: contactsProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        if (d && Array.isArray(d.contacts)) root.contacts = d.contacts
+      }
+    }
+  }
+
+  // WhatsApp confirms the number and names the jid it uses; a chat that
+  // already exists under that jid opens instead of a duplicate.
+  function startChat(c) {
+    if (resolveProc.running || root.sending || root.drafting) return
+    root.newError = ""
+    resolveProc.item = c
+    resolveProc.command = [root.pluginDir + "bin/wa-chat", "resolve", c.account, c.phone]
+    resolveProc.running = true
+  }
+  Process {
+    id: resolveProc
+    property var item: null
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var c = resolveProc.item
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        if (!d || d.error || !d.jid) {
+          root.newError = (d && d.error) ? d.error : "wa-chat no respondió"
+          return
+        }
+        var existing = root.findChat(c.account, d.jid)
+        if (existing) { root.openChat(existing, true); return }
+        root.openChat({ account: c.account, label: c.label, jid: d.jid, group: false, isNew: true,
+                        name: c.kind === "contact" ? c.name : (d.name || "+" + c.phone) }, false)
+      }
+    }
   }
 
   function findChat(acc, jid) {
@@ -182,6 +264,8 @@ Item {
   property string curName: ""
   property string curLabel: ""
   property bool curGroup: false
+  // A chat the owner is starting: no history yet, sends carry --new.
+  property bool curNew: false
   readonly property string curKey: root.curJid ? root.curAcc + ":" + root.curJid : ""
   property bool msgMore: false
   property string msgError: ""
@@ -206,6 +290,7 @@ Item {
     root.curName = c.name || c.jid
     root.curLabel = c.label || c.account
     root.curGroup = c.group === true
+    root.curNew = c.isNew === true
     msgModel.clear()
     root.msgMore = false
     root.msgError = ""
@@ -503,6 +588,7 @@ Item {
     sendProc.gotAnswer = false
     var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text=" + text]
     if (acknowledged) cmd.push("--acknowledged")
+    if (root.curNew) cmd.push("--new")
     sendProc.command = cmd
     sendProc.running = true
   }
@@ -559,6 +645,7 @@ Item {
     root.status = "Redactando…"
     draftProc.key = root.curKey
     draftProc.command = [root.pluginDir + "bin/wa-reply", "chat-draft", root.curAcc, root.curJid, "--idea=" + idea]
+    if (root.curNew) draftProc.command = draftProc.command.concat(["--new"])
     draftProc.running = true
   }
 
@@ -703,19 +790,20 @@ Item {
             TextField {
               id: searchField
               Layout.fillWidth: true
-              placeholderText: "Buscar nombre o número"
+              placeholderText: "Buscar, o un número para chat nuevo"
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               onTextChanged: root.search = text
               Keys.onEscapePressed: root.requestClose()
             }
 
-            RowLayout {
+            Flow {
               Layout.fillWidth: true
               spacing: Style.spacing.sm
               Repeater {
                 model: [ { id: "all", label: "Todos" }, { id: "unread", label: "No leídos" },
-                         { id: "trabajo", label: "Trabajo" }, { id: "personal", label: "Personal" } ]
+                         { id: "trabajo", label: "Trabajo" }, { id: "personal", label: "Personal" },
+                         { id: "contacts", label: "Contactos" } ]
                 delegate: Button {
                   required property var modelData
                   text: modelData.label
@@ -740,9 +828,21 @@ Item {
             }
 
             Text {
+              visible: root.newError !== ""
+              text: "⚠ " + root.newError
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.Wrap
+              Layout.fillWidth: true
+            }
+
+            Text {
               visible: root.listError === "" && root.visibleChats.length === 0
               text: root.chats.length === 0 ? "Todavía no hay chats en el historial."
-                    : (root.filter === "unread" ? "Nada sin leer." : "Ningún chat coincide.")
+                    : (root.filter === "unread" ? "Nada sin leer."
+                       : (root.filter === "contacts" && root.contacts.length === 0 ? "Sin contactos sincronizados."
+                          : "Ningún chat coincide."))
               color: Color.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -782,7 +882,8 @@ Item {
                     spacing: Style.spacing.sm
                     Text {
                       textFormat: Text.PlainText
-                      text: (chatRow.modelData.muted ? "🔕 " : "") + (chatRow.modelData.name || chatRow.modelData.jid)
+                      text: (chatRow.modelData.kind === "contact" ? "👤 " : chatRow.modelData.kind === "number" ? "✏️ " : "")
+                            + (chatRow.modelData.muted ? "🔕 " : "") + (chatRow.modelData.name || chatRow.modelData.jid)
                       color: root.fg
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.subtitle
@@ -849,7 +950,11 @@ Item {
                   hoverEnabled: true
                   // Blocked mid-send/draft: switching would drop the result.
                   enabled: !root.sending && !root.drafting
-                  onClicked: { root.settingsOpen = false; root.openChat(chatRow.modelData, true) }
+                  onClicked: {
+                    root.settingsOpen = false
+                    if (chatRow.modelData.kind) root.startChat(chatRow.modelData)
+                    else root.openChat(chatRow.modelData, true)
+                  }
                 }
               }
             }
