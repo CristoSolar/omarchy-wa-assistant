@@ -58,13 +58,15 @@ Item {
     root.opened = true
     root.loadChats()
     // A chat named in the payload (a notification click) wins; otherwise
-    // the last chat that was open comes back.
+    // the last chat that was open comes back. Either way it is only SHOWN:
+    // reading on the phone needs a click on its row (see openChat).
     var acc = (p && p.account) || ""
     var jid = (p && p.jid) || ""
+    root.pendingRestored = false
     if (!acc || !jid) {
       var last = String(lastChatFile.text() || "").trim()
       var cut = last.indexOf(":")
-      if (cut > 0) { acc = last.slice(0, cut); jid = last.slice(cut + 1) }
+      if (cut > 0) { acc = last.slice(0, cut); jid = last.slice(cut + 1); root.pendingRestored = true }
     }
     if (acc && jid && (acc !== root.curAcc || jid !== root.curJid))
       root.pendingOpen = acc + ":" + jid
@@ -97,6 +99,8 @@ Item {
   property bool settingsOpen: false
   // "acc:jid" to select once the list arrives (restored or from payload).
   property string pendingOpen: ""
+  // pendingOpen came from window-last-chat, not from the payload.
+  property bool pendingRestored: false
 
   readonly property var visibleChats: {
     var q = root.search.trim().toLowerCase()
@@ -155,13 +159,19 @@ Item {
       root.pendingOpen = ""
       var cut = key.indexOf(":")
       var c = root.findChat(key.slice(0, cut), key.slice(cut + 1))
-      if (c) root.openChat(c)
+      // Opened on "No leídos": a remembered chat with nothing unread would
+      // only be noise next to that list.
+      if (c && !(root.pendingRestored && root.filter === "unread" && !(c.unread > 0)))
+        root.openChat(c, false)
     } else if (root.curJid !== "") {
       var cur = root.findChat(root.curAcc, root.curJid)
       if (cur) {
         root.curName = cur.name || root.curName
-        // New messages in the chat being looked at count as read.
-        if (cur.unread > 0 && root.windowActive) root.markRead()
+        // New messages in the chat being looked at count as read, but only
+        // in a chat the user clicked open this session, while the window is
+        // active and the conversation is actually visible.
+        if (cur.unread > 0 && root.curExplicit && root.windowActive && !root.settingsOpen)
+          root.markRead(cur)
       }
     }
   }
@@ -177,9 +187,20 @@ Item {
   property string msgError: ""
   property var quickReplies: []
 
+  property bool curExplicit: false
+  // "acc:jid@last_id" of the last read attempt. One attempt per newest
+  // message: a read that fails without raising the marker (ocupada, no
+  // account, offline) can't turn read → chats → read into a loop.
+  property string readTriedAt: ""
+
   ListModel { id: msgModel }
 
-  function openChat(c) {
+  // explicit: the user clicked this chat's row. Only then is it marked read
+  // on the phone. Refused while a send or draft is in flight, so their
+  // outcome (and the text in the box) is never lost to a chat switch.
+  function openChat(c, explicit) {
+    if (root.sending || root.drafting) return
+    root.curExplicit = explicit === true
     root.curAcc = c.account
     root.curJid = c.jid
     root.curName = c.name || c.jid
@@ -195,7 +216,7 @@ Item {
     composer.text = ""
     root.quickReplies = []
     root.fetchMessages(0)
-    root.markRead()
+    if (root.curExplicit) root.markRead(c, true)
     root.loadQuick()
     lastChatFile.setText(root.curKey)
     Qt.callLater(function() { composer.forceActiveFocus() })
@@ -286,8 +307,13 @@ Item {
   }
 
   // Opening a chat marks it read on the phone (owner's decision).
-  function markRead() {
+  // force: a click on the row (bounded by the user) may retry the same
+  // attempt; the automatic path may not.
+  function markRead(c, force) {
     if (!root.curJid || readProc.running) return
+    var attempt = root.curKey + "@" + String(c && c.last_id !== undefined ? c.last_id : "")
+    if (attempt === root.readTriedAt && !force) return
+    root.readTriedAt = attempt
     readProc.command = [root.pluginDir + "bin/wa-chat", "read", root.curAcc, root.curJid]
     readProc.running = true
   }
@@ -334,7 +360,7 @@ Item {
 
   // ---- state/focused and the remembered chat ----------------------------
   readonly property bool windowActive: content.Window.active === true
-  readonly property string focusedKey: (root.opened && root.windowActive) ? root.curKey : ""
+  readonly property string focusedKey: (root.opened && root.windowActive && !root.settingsOpen) ? root.curKey : ""
   onFocusedKeyChanged: focusedFile.setText(root.focusedKey)
 
   FileView {
@@ -475,7 +501,7 @@ Item {
     sendProc.key = root.curKey
     sendProc.text = text
     sendProc.gotAnswer = false
-    var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text", text]
+    var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text=" + text]
     if (acknowledged) cmd.push("--acknowledged")
     sendProc.command = cmd
     sendProc.running = true
@@ -532,7 +558,7 @@ Item {
     root.drafting = true
     root.status = "Redactando…"
     draftProc.key = root.curKey
-    draftProc.command = [root.pluginDir + "bin/wa-reply", "chat-draft", root.curAcc, root.curJid, "--idea", idea]
+    draftProc.command = [root.pluginDir + "bin/wa-reply", "chat-draft", root.curAcc, root.curJid, "--idea=" + idea]
     draftProc.running = true
   }
 
@@ -820,7 +846,9 @@ Item {
                   id: rowMouse
                   anchors.fill: parent
                   hoverEnabled: true
-                  onClicked: { root.settingsOpen = false; root.openChat(chatRow.modelData) }
+                  // Blocked mid-send/draft: switching would drop the result.
+                  enabled: !root.sending && !root.drafting
+                  onClicked: { root.settingsOpen = false; root.openChat(chatRow.modelData, true) }
                 }
               }
             }
