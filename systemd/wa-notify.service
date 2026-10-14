@@ -1,0 +1,11 @@
+[Unit]
+Description=Desktop notifications for incoming WhatsApp messages (omarchy-wa)
+Documentation=https://github.com/CristoSolar/omarchy-wa-assistant
+
+[Service]
+ExecStart=%h/.config/omarchy/plugins/io.github.cristosolar.waassistant/bin/wa-notify
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

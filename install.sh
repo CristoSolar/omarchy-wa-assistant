@@ -34,10 +34,12 @@ fi
 # the README for what this does and how to disable it.
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
-cp "$ROOT/systemd/wa-heal.service" "$ROOT/systemd/wa-heal.timer" "$UNIT_DIR/"
+cp "$ROOT/systemd/wa-heal.service" "$ROOT/systemd/wa-heal.timer" "$ROOT/systemd/wa-notify.service" "$UNIT_DIR/"
 if command -v systemctl >/dev/null; then
   systemctl --user daemon-reload
   systemctl --user enable --now wa-heal.timer
+  # wa-notify: desktop notifications that open the chat (see bin/wa-notify).
+  systemctl --user enable --now wa-notify.service
 fi
 
 echo "Installed. Next:"
