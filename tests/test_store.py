@@ -567,5 +567,19 @@ def test_migration_retry_before_the_config_cleanup_loses_nothing():
         assert config_after["groups_enabled"] == ["1@g.us"]
 
 
+def test_wuzdata_dir_follows_the_sink_mount_or_the_state_root():
+    import os
+    from sink import store
+    old = os.environ.pop("WA_WUZAPI_DB", None)
+    try:
+        assert store.wuzdata_dir() == store.state_root() / "wuzdata"
+        os.environ["WA_WUZAPI_DB"] = "/wuzdata/users.db"
+        assert str(store.wuzdata_dir()) == "/wuzdata"
+    finally:
+        os.environ.pop("WA_WUZAPI_DB", None)
+        if old is not None:
+            os.environ["WA_WUZAPI_DB"] = old
+
+
 if __name__ == "__main__":
     run(dict(globals()))

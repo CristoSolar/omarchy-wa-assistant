@@ -35,6 +35,27 @@ def _our_jid(wuzdata: Path, instance_name: str) -> str:
     return _bare(row[0]) if row and row[0] else ""
 
 
+def our_ids(wuzdata, instance_name: str) -> set:
+    """The account's own number jid and its @lid, without a device part.
+
+    A group mention names the owner by either one, so both count.
+    """
+    try:
+        wuzdata = Path(wuzdata)
+        our = _our_jid(wuzdata, instance_name)
+        if not our:
+            return set()
+        conn = _ro(wuzdata / "main.db")
+        try:
+            row = conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?",
+                               (our.split("@")[0],)).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return set()
+    return {our} | ({row[0] + "@lid"} if row and row[0] else set())
+
+
 def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> str:
     event_name = push_name if push_name and push_name != chat_jid else ""
     try:

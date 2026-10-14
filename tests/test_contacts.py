@@ -3,7 +3,7 @@ import sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
-from sink.contacts import display_name
+from sink.contacts import display_name, our_ids
 
 OUR = "56900000001@s.whatsapp.net"
 LID = "237786636488820@lid"
@@ -78,6 +78,13 @@ def test_a_missing_store_never_breaks_queueing():
     with tmpdir() as d:
         assert display_name(d, "trabajo", LID, "Ana") == "Ana"
         assert display_name(d, "trabajo", LID, LID) == LID
+
+
+def test_our_ids_are_the_account_number_and_its_lid():
+    with tmpdir() as d:
+        _wuzdata(d, lids=[("999", "56900000001")])
+        assert our_ids(d, "trabajo") == {OUR, "999@lid"}
+        assert our_ids(d, "nadie") == set()
 
 
 if __name__ == "__main__":

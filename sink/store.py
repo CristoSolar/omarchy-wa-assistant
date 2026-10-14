@@ -40,6 +40,13 @@ def data_dir() -> Path:
     return d
 
 
+def wuzdata_dir() -> Path:
+    """wuzapi's SQLite directory: the sink's /wuzdata mount (named through
+    WA_WUZAPI_DB), or <state root>/wuzdata on the host."""
+    db = os.environ.get("WA_WUZAPI_DB")
+    return Path(db).parent if db else state_root() / "wuzdata"
+
+
 def secrets_path() -> Path:
     """Where WA_TOKEN lives.
 
