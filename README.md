@@ -5,7 +5,7 @@
 An Omarchy bar widget and chat window for WhatsApp: it shows your chats and
 their full history, and drafts replies with Claude. You give the idea in one line ("tell them I'm running
 late"), Claude writes the message in the chat's own context, and nothing is
-sent until you press **Enviar** — the plugin starts every install in a
+sent until you press Enter (or click a quick reply) — the plugin starts every install in a
 dry-run mode that never touches the network.
 
 ## Read this before you pair anything
@@ -385,11 +385,10 @@ scenario where the same JID needs different enablement per account, so
 splitting this setting per account would only add a place for the same
 JID to disagree with itself.
 
-**In the chat window:** each queued chat in the list carries a small badge naming
-the account it arrived on, and once you open a chat, the detail view states
-plainly which number the reply will go out on ("La respuesta va a salir
-desde: …") — never a choice, since a reply always leaves by the number it
-arrived on (see "What it does" above).
+**In the chat window:** every chat in the list is tagged with its account's
+label, and the conversation states plainly which number a message will go
+out from ("Sale por: <cuenta>") — never a choice, since a reply always
+leaves by the number it arrived on (see "What it does" above).
 
 ### Migrating from a single-account install
 
@@ -439,7 +438,7 @@ redoing finished steps or losing anything.
 
 The gear (⚙) in the chat window's top-right corner opens a settings screen
 embedded in the chat window; the same button, now labelled "Volver", closes
-it and returns to the message queue exactly where you left it. It lists
+it and returns to the conversation exactly where you left it. It lists
 every configured account, and from there you can link a new one, edit an
 existing account's tone or quick replies, or unlink it. It never sends a
 message — there is no send path in the settings screen at all, only
@@ -619,14 +618,15 @@ message. Copy the JID into the array above.
 
 ## Quick replies
 
-The chat window's chat detail view shows a row of quick-reply buttons above the
-composer. **Clicking one sends that exact text immediately — there is no
+The conversation shows a row of quick-reply buttons above the composer.
+**Clicking one sends that exact text immediately — there is no
 confirmation step, no undo, and no draft to review first.** It is not a
-shortcut for filling the composer; the message goes out on that click.
-They're disabled while a draft or a send is already in progress, and an
-entry whose last send is unconfirmed (`unknown`/`sending`) still requires
-you to acknowledge that before a quick reply — same as `Enviar` — because
-the guard exists on the `wa-reply send` side, not in the button.
+shortcut for filling the composer; the message goes out on that click
+(still subject to dry-run). The buttons are disabled while a send or a
+draft is in progress. If the chat's last send has an unknown outcome (see
+"Sends whose outcome nobody knows"), the guard lives in `wa-reply
+chat-send`, not in the button: the click is refused and the window shows
+its confirmation banner instead.
 
 Quick replies are per account: each account's own list lives in its
 `quick_replies` field in `~/.local/share/omarchy-wa/state/accounts.json`
@@ -668,29 +668,26 @@ removes its ring.
 ## Attachments
 
 When someone sends a photo, a voice note, a video, a sticker or a
-document, the queue still shows the placeholder (`[imagen]`, `[audio]`,
-...), and the conversation shows an "Adjunto" block for it with a button:
+document, the message in the conversation carries a label for it
+(`[imagen]`, `[audio]`, ...). Click the label to download it, and the
+file is then handled by type:
 
-- **Images and stickers** — **Ver imagen** downloads it and shows it
-  inline, scaled to the chat window's width (and capped in height); it is decoded
-  at roughly the size it's shown, not at full resolution.
-- **Voice notes and audio** — **Reproducir** downloads it and plays it in
-  the chat window itself, with play/pause, elapsed/total time and a seek bar.
-- **Video and documents** — **Abrir** downloads it and hands the file to
-  your system viewer with `xdg-open`. The chat window waits for `xdg-open`'s exit
-  code before saying "Se abrió con el visor del sistema."; if it fails,
-  it says so and offers the button again.
-- **Locations and contacts** — there is nothing to download (wuzapi has no
-  endpoint for them), and the chat window says that instead of showing a button
-  that could never work. Same for an attachment whose event arrived missing
-  a field the download needs.
+- **Images and stickers** — shown inline under the message, decoded at
+  roughly the size they are shown; click the image to open it in your
+  system viewer.
+- **Voice notes and audio** — play in the chat window itself; the label
+  becomes ▶ / ⏸ with elapsed/total time, and clicking toggles it.
+- **Video and documents** — handed to your system viewer with `xdg-open`.
+- **Locations and contacts**, or an attachment whose event arrived missing a
+  field the download needs, are labelled "(no disponible)": there is nothing
+  to download (wuzapi has no endpoint for them).
 
-A download that fails says why and turns the button into **Reintentar**.
-A file that was in the cache but has since been pruned is reported the
-same way, never as a broken image. Only the attachment on the queue
-entry itself — the latest message in that chat — can be opened; older
-messages in the conversation show as their placeholder text. Viewing is the
-whole feature: there is no way to *send* an attachment from the chat window.
+The label says "descargando…" while it works. A download that fails shows
+why, ending in "(clic para reintentar)". A file that was in the cache but
+has since been pruned is reported the same way, never as a broken image.
+Any message's attachment can be opened, not only the latest one in a chat
+(`wa-media get-msg`). Viewing is the whole feature: there is no way to
+*send* an attachment from the chat window.
 
 **Who downloads.** `bin/wa-media` does, never the sink: the sink still
 holds no credentials. Like `wa-reply`, it takes the account from the queue
@@ -779,12 +776,10 @@ docker rm -f omarchy-wuzapi
 ## Turning off dry-run
 
 Every send goes through `bin/wa-reply`, and by default it does nothing but
-report what it *would* have sent. No request ever reaches wuzapi, and
-nothing in the queue changes: the chat window shows "DRY RUN — no se envió nada.
-La entrada sigue pendiente en la cola.", the entry stays open, and its
-stored status is left exactly as it was — including an `unknown` or
-`sending` guard, which a dry run must never clear — so you can keep
-iterating on the draft. This is the
+report what it *would* have sent. No request ever reaches wuzapi: the chat
+window shows "DRY RUN: no se envió nada." and keeps what you typed, so you
+can keep iterating on the draft. A dry run never clears an
+unknown-outcome mark (see the next section). This is the
 tool's default state on every fresh install, not something you have to
 remember to enable.
 
@@ -802,58 +797,43 @@ you're comfortable with both of those facts.
 
 ## Sends whose outcome nobody knows
 
-Two things can leave an entry in a state where the message may already have
-reached WhatsApp and nothing recorded the answer:
+A send can end in a state where the message may already have reached
+WhatsApp and nothing recorded the answer: the POST timed out, the
+connection dropped mid-request, or `wa-reply` was killed (a bar restart, an
+OOM kill) between starting the POST and learning its result. The request
+can take up to 20 seconds, so this window is real.
 
-- **`unknown`** — the POST timed out or the connection dropped mid-request.
-- **`sending`** — `wa-reply` was killed between starting the POST and
-  learning its result: a bar restart, a logout, an OOM kill. The request
-  can take up to 20 seconds, so this window is real.
+`wa-reply chat-send` records that as a per-chat mark in
+`state/chat_unknown.json` (not on any queue entry), and the chat window
+shows:
 
-Both get the same treatment, because both have the same consequence.
-`wa-reply` records the status on that entry in `queue.json` and the chat window
-shows (wording adjusted for which of the two it was):
+> Sin confirmación: puede que ya haya salido. Revisá WhatsApp antes de
+> reintentar.
 
-> sin confirmación: puede que el mensaje ya se haya enviado — revisá
-> WhatsApp antes de reintentar
+The mark is durable, and the protection is enforced by `chat-send` itself:
 
-That record is durable, and it is what both halves of the protection read:
-
-- `bin/wa-reply send` **refuses** an entry whose stored status is
-  `unknown` or `sending` and returns
-  `{"ok": false, "needs_ack": true, "status": "...", ...}` unless it is
-  called with `--acknowledged`.
-- The chat window marks the entry in the queue list itself ("⚠ sin confirmar" or
-  "⚠ envío interrumpido"), not just once you open it, and keeps **Enviar**
-  disabled until you press *"Revisé WhatsApp, quiero reenviar"*. Pressing
-  that is what passes `--acknowledged`.
-- A new incoming message in the same chat does **not** clear either status.
-
-Closing the popup, restarting the bar, letting the queue refresh, or doing
-a dry run does **not** clear the block — the warning is recomputed from
-what is on disk every time, so it cannot be lost by reopening the chat window or
-by pressing Enviar while dry-run is still on. Check WhatsApp yourself to
-see whether the message went out before you acknowledge.
-
-## A message that arrives while you're drafting
-
-If someone writes again in the same chat between the moment you open an
-entry and the moment the send is confirmed, the entry is **not** removed —
-it stays in the queue carrying the newer message, and the chat window says so:
-
-> enviado. Llegó un mensaje nuevo en este chat mientras redactabas, así que
-> la entrada sigue en la cola.
-
-Your reply did go out. The queue is just not throwing away the thing you
-haven't read yet. (There is one gap in this, from the auto-clear below:
-see the last point of the next section.)
+- `wa-reply chat-send` **refuses** a chat with a mark and returns
+  `{"ok": false, "needs_ack": true, ...}` unless it is called with
+  `--acknowledged`. That includes quick replies and Enter.
+- The window turns that refusal into a banner with two buttons: **"Revisé
+  WhatsApp, enviar igual"**, which resends with `--acknowledged`, and
+  **Cancelar**, which drops the pending text.
+- A new incoming message in the same chat does **not** clear the mark, and
+  neither does closing the window, restarting the bar or a dry run: it is
+  recomputed from what is on disk. Check WhatsApp yourself to see whether
+  the message went out before you press the button.
 
 ## What takes a chat out of the queue
 
-A chat leaves the queue in three ways, not just one:
+This section is about the **bar counter** and `queue.json`, not about the
+window's chat list. The window shows every chat, and marks one read on the
+phone only when you click it (`state/read.json`); nothing below removes a
+chat from the window.
 
-- **You answer it from the chat window** and the send is confirmed (with the
-  exception described in the previous section).
+A chat leaves the counter's queue in three ways:
+
+- **You answer it from the chat window** (or any other device) and the
+  send is confirmed.
 - **You answer it from another device** — the phone, WhatsApp Web,
   ZapZap. WhatsApp reports your own message to every linked device; the
   sink records it in the context ring as yours and removes that chat's entry.
@@ -861,20 +841,14 @@ A chat leaves the queue in three ways, not just one:
   the chat as read, WhatsApp sends a read receipt and the sink removes that
   chat's entry — **even if you didn't answer it**. This is deliberate: the
   owner chose a short queue knowing that a message you read and meant to
-  answer later disappears from it too. If you rely on the queue as a to-do
-  list, don't open those chats on the phone, or keep them unread there.
+  answer later disappears from it too. If you rely on the counter as a
+  to-do list, don't open those chats on the phone, or keep them unread there.
 
 Read receipts travel in both directions, and only one of them counts. The
 sink acts only on wuzapi's `ReadSelf` state — *you* read *their* message on
 another device. The plain `Read` state — *they* read *your* message — never
 clears anything; otherwise any contact opening your message would empty
 the very chat that is waiting for their answer.
-
-What is **never** cleared automatically: an entry whose last send is
-`unknown` or `sending` (see "Sends whose outcome nobody knows" above). That
-entry is the only record that a message may already have gone out
-unconfirmed; it stays, untouched, through a read receipt and through a
-message of yours, until you deal with it in the chat window.
 
 A read receipt or own message for a chat with no entry does nothing, and
 one arriving on a number not in `accounts.json` is dropped and logged once.
@@ -886,12 +860,8 @@ and `wa-heal` re-asserts that same subscription on every run, so an
 already-paired install picks it up on the next timer tick without
 re-pairing.
 
-One known gap: the plugin's own sends come back to the sink as a message
-from you too, and that echo clears the chat's entry like any other. If it
-arrives after the send was confirmed, it can remove an entry that "A
-message that arrives while you're drafting" above kept on purpose, so a
-message that came in while you were drafting can still leave the queue.
-After a send, glance at WhatsApp if the chat was active.
+The plugin's own sends come back to the sink as a message from you too,
+and that echo clears the chat's entry like any other.
 
 ## Where state lives, and how to wipe it
 

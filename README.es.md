@@ -5,7 +5,7 @@
 Un widget de barra y una ventana de chat para Omarchy: muestra tus chats con
 su historial completo y redacta respuestas con Claude. Vos das la idea en una línea ("decile
 que voy a llegar tarde"), Claude escribe el mensaje usando el contexto de ese
-chat, y no se envía nada hasta que apretás **Enviar** — el plugin arranca
+chat, y no se envía nada hasta que apretás Enter (o tocás una respuesta rápida) — el plugin arranca
 cada instalación en modo dry-run, que nunca toca la red.
 
 ## Leé esto antes de emparejar nada
@@ -312,7 +312,7 @@ en sí, no algo que haga este plugin.
 ## Emparejar
 
 Esto se puede hacer desde la terminal, tal cual abajo, o desde la pantalla
-de configuración dla ventana de chat (el engranaje, ⚙ — "+ Vincular cuenta nueva"),
+de configuración de la ventana de chat (el engranaje, ⚙ — "+ Vincular cuenta nueva"),
 que corre este mismo script por detrás. Ver "Pantalla de configuración" más
 abajo para cómo se ve el camino desde la UI; el comportamiento de fondo no
 cambia entre uno y otro.
@@ -324,7 +324,7 @@ cambia entre uno y otro.
 `<account-id>` nombra la cuenta que estás emparejando — es lo que
 `accounts.json` va a usar para llamar a este número en el resto del
 sistema: se convierte en el usuario de wuzapi, en el nombre por defecto del
-archivo de tono, y en la etiqueta que se muestra en las badges dla ventana de chat
+archivo de tono, y en la etiqueta que se muestra en las badges de la ventana de chat
 (ver "Múltiples cuentas" más abajo). En una instalación nueva, elegí el id
 que quieras para tu primer número, por ejemplo:
 
@@ -379,7 +379,7 @@ entrada en `~/.local/share/omarchy-wa/state/accounts.json`, una lista JSON.
 Cada entrada tiene:
 
 - `id` — el account id que le diste a `wa-pair`.
-- `label` — se muestra en las badges dla ventana de chat y en la línea "sale desde";
+- `label` — se muestra en las badges de la ventana de chat y en la línea "sale desde";
   por defecto es el id con los guiones bajos convertidos en espacios y con
   la primera letra de cada palabra en mayúscula (`trabajo` → `Trabajo`), y
   podés cambiarla a lo que quieras.
@@ -400,7 +400,7 @@ Para cambiarle el nombre a una cuenta, editá su entrada en `accounts.json`
 directamente y guardá — hoy no hay un comando para esto. Su tono y sus
 respuestas rápidas también se pueden editar a mano de la misma forma (el
 archivo que indica su campo `agent`, y su array `quick_replies`
-respectivamente), o desde la pantalla de configuración dla ventana de chat (el
+respectivamente), o desde la pantalla de configuración de la ventana de chat (el
 engranaje, ⚙ — ver "Pantalla de configuración" más abajo), que lee y
 escribe exactamente los mismos archivos vía `wa-reply tone-get`/`tone-set`
 y `quick-get`/`quick-set`. Ninguna de las dos vías es una capa de
@@ -415,12 +415,11 @@ ningún escenario donde el mismo JID necesite habilitación distinta según
 la cuenta, así que separar este ajuste por cuenta solo agregaría un lugar
 donde el mismo JID podría contradecirse a sí mismo.
 
-**En la ventana de chat:** cada chat en la cola lleva una pequeña badge con el
-nombre de la cuenta a la que llegó, y una vez que abrís un chat, la vista
-de detalle dice explícitamente por qué número va a salir la respuesta
-("La respuesta va a salir desde: …") — nunca una elección, porque una
-respuesta siempre sale por el número al que llegó (ver "Qué hace, en
-resumen" más arriba).
+**En la ventana de chat:** cada chat de la lista lleva la etiqueta de su
+cuenta, y la conversación dice explícitamente por qué número va a salir un
+mensaje ("Sale por: <cuenta>") — nunca una elección, porque una respuesta
+siempre sale por el número al que llegó (ver "Qué hace, en resumen" más
+arriba).
 
 ### Migrar desde una instalación de una sola cuenta
 
@@ -471,9 +470,9 @@ rehacer pasos ya terminados o perder algo.
 
 ## Pantalla de configuración
 
-El engranaje (⚙) en la esquina superior derecha dla ventana de chat abre una pantalla
+El engranaje (⚙) en la esquina superior derecha de la ventana de chat abre una pantalla
 de configuración incrustada en la ventana de chat; el mismo botón, ahora
-rotulado "Volver", la cierra y vuelve a la cola de mensajes exactamente
+rotulado "Volver", la cierra y vuelve a la conversación exactamente
 donde la dejaste. Lista todas las cuentas configuradas, y desde ahí podés
 emparejar una nueva, editar el tono o las respuestas rápidas de una cuenta
 existente, o desvincularla. Nunca envía un mensaje — no hay ningún camino
@@ -665,15 +664,15 @@ mensaje. Copiá el JID al arreglo de arriba.
 
 ## Respuestas rápidas
 
-La vista de detalle dla ventana de chat muestra una fila de botones de respuesta
-rápida arriba del cuadro de redacción. **Tocar uno manda ese texto tal
-cual, al instante — no hay confirmación, no hay deshacer, no hay borrador
-para revisar antes.** No es un atajo para llenar el cuadro; el mensaje
-sale con ese clic. Quedan deshabilitados mientras hay un borrador o un
-envío en curso, y una entrada cuyo último envío quedó sin confirmar
-(`unknown`/`sending`) también exige el mismo reconocimiento que pide
-`Enviar` antes de dejar pasar una respuesta rápida — porque esa guarda
-vive del lado de `wa-reply send`, no en el botón.
+La conversación muestra una fila de botones de respuesta rápida arriba del
+cuadro de redacción. **Tocar uno manda ese texto tal cual, al instante — no
+hay confirmación, no hay deshacer, no hay borrador para revisar antes.** No
+es un atajo para llenar el cuadro; el mensaje sale con ese clic (sigue
+sujeto al dry-run). Los botones quedan deshabilitados mientras hay un envío
+o una redacción en curso. Si el último envío del chat tiene un resultado
+desconocido (ver "Envíos cuyo resultado nadie conoce"), la guarda vive en
+`wa-reply chat-send`, no en el botón: el toque se rechaza y la ventana
+muestra su aviso de confirmación.
 
 Las respuestas rápidas son por cuenta: la lista propia de cada cuenta vive
 en su campo `quick_replies` dentro de
@@ -718,30 +717,27 @@ borra su anillo.
 ## Adjuntos
 
 Cuando alguien manda una foto, un audio, un video, un sticker o un
-documento, la cola sigue mostrando el marcador (`[imagen]`, `[audio]`,
-...), y la conversación muestra un bloque "Adjunto" con un botón:
+documento, el mensaje en la conversación lleva una etiqueta (`[imagen]`,
+`[audio]`, ...). Tocá la etiqueta para descargarlo, y después el archivo se
+maneja según el tipo:
 
-- **Imágenes y stickers** — **Ver imagen** la descarga y la muestra ahí
-  mismo, ajustada al ancho dla ventana de chat (y con un alto máximo); se decodifica
-  más o menos al tamaño en que se muestra, no a resolución completa.
-- **Audios y notas de voz** — **Reproducir** lo descarga y lo reproduce en
-  la ventana de chat mismo, con pausa, tiempo transcurrido/total y una barra para
-  adelantar o volver.
-- **Videos y documentos** — **Abrir** lo descarga y le pasa el archivo a
-  tu visor del sistema con `xdg-open`. La ventana de chat espera el código de salida
-  de `xdg-open` antes de decir "Se abrió con el visor del sistema."; si
-  falla, lo dice y vuelve a ofrecer el botón.
-- **Ubicaciones y contactos** — no hay nada que descargar (wuzapi no tiene
-  endpoint para eso), y la ventana de chat lo dice en vez de mostrar un botón que
-  nunca podría funcionar. Lo mismo para un adjunto cuyo evento llegó sin
-  algún campo que la descarga necesita.
+- **Imágenes y stickers** — se ven ahí mismo debajo del mensaje, decodificadas
+  más o menos al tamaño en que se muestran; tocá la imagen para abrirla en
+  tu visor del sistema.
+- **Audios y notas de voz** — se reproducen en la ventana de chat misma; la
+  etiqueta pasa a ▶ / ⏸ con tiempo transcurrido/total, y tocarla alterna.
+- **Videos y documentos** — se le pasan a tu visor del sistema con
+  `xdg-open`.
+- **Ubicaciones y contactos**, o un adjunto cuyo evento llegó sin un campo
+  que la descarga necesita, dicen "(no disponible)": no hay nada que
+  descargar (wuzapi no tiene endpoint para eso).
 
-Una descarga que falla dice por qué y el botón pasa a **Reintentar**. Un
-archivo que estaba en la caché pero ya se podó se informa igual, nunca
-como una imagen rota. Solo se puede abrir el adjunto de la entrada de la
-cola en sí — el último mensaje de ese chat —; los mensajes anteriores de la
-conversación se ven como su texto marcador. Ver es todo lo que hace: no hay
-forma de *mandar* un adjunto desde la ventana de chat.
+La etiqueta dice "descargando…" mientras trabaja. Una descarga que falla
+dice por qué, terminando en "(clic para reintentar)". Un archivo que estaba
+en la caché pero ya se podó se informa igual, nunca como una imagen rota.
+Se puede abrir el adjunto de cualquier mensaje, no solo el último de un
+chat (`wa-media get-msg`). Ver es todo lo que hace: no hay forma de
+*mandar* un adjunto desde la ventana de chat.
 
 **Quién descarga.** `bin/wa-media`, nunca el sink: el sink sigue sin
 tener credenciales. Igual que `wa-reply`, toma la cuenta de la entrada de
@@ -836,12 +832,10 @@ docker rm -f omarchy-wuzapi
 ## Desactivar el dry-run
 
 Todo envío pasa por `bin/wa-reply`, y por defecto no hace nada más que
-reportar lo que *habría* enviado. Ninguna petición llega a wuzapi y nada
-cambia en la cola: la ventana de chat muestra "DRY RUN — no se envió nada. La
-entrada sigue pendiente en la cola.", la entrada queda abierta y su
-estado guardado queda tal cual estaba — incluido un `unknown` o un
-`sending`, que un dry run nunca debe borrar — así que podés seguir
-iterando el borrador.
+reportar lo que *habría* enviado. Ninguna petición llega a wuzapi: la
+ventana de chat muestra "DRY RUN: no se envió nada." y conserva lo que
+escribiste, así que podés seguir iterando el borrador. Un dry run nunca
+borra una marca de resultado desconocido (ver la sección siguiente).
 Este es el estado por defecto de la herramienta en cada instalación nueva,
 no algo que haya que acordarse de activar.
 
@@ -859,61 +853,43 @@ el número. Activala solo cuando estés cómodo con ambos hechos.
 
 ## Envíos cuyo resultado nadie conoce
 
-Hay dos cosas que pueden dejar una entrada en un estado donde el mensaje
-quizás ya llegó a WhatsApp y nadie registró la respuesta:
+Un envío puede terminar en un estado en que el mensaje quizás ya llegó a
+WhatsApp y nada registró la respuesta: el POST agotó el tiempo, se cortó la
+conexión a mitad, o se mató a `wa-reply` (un reinicio de la barra, un OOM)
+entre empezar el POST y enterarse del resultado. La petición puede tardar
+hasta 20 segundos, así que esa ventana es real.
 
-- **`unknown`** — el POST se cayó por timeout o se cortó la conexión a
-  mitad de camino.
-- **`sending`** — `wa-reply` murió entre que empezó el POST y que supo el
-  resultado: un reinicio de la barra, un logout, un OOM kill. La petición
-  puede tardar hasta 20 segundos, así que esa ventana es real.
+`wa-reply chat-send` lo anota como una marca por chat en
+`state/chat_unknown.json` (no en ninguna entrada de la cola), y la ventana
+de chat muestra:
 
-Los dos reciben el mismo tratamiento, porque los dos tienen la misma
-consecuencia. `wa-reply` escribe el estado en esa entrada de `queue.json`,
-y la ventana de chat muestra (con la redacción ajustada a cuál de los dos fue):
+> Sin confirmación: puede que ya haya salido. Revisá WhatsApp antes de
+> reintentar.
 
-> sin confirmación: puede que el mensaje ya se haya enviado — revisá
-> WhatsApp antes de reintentar
+La marca es durable, y la protección la aplica el propio `chat-send`:
 
-Ese registro es durable, y es lo que leen las dos mitades de la
-protección:
-
-- `bin/wa-reply send` **se niega** a enviar una entrada cuyo estado
-  guardado sea `unknown` o `sending`, y devuelve
-  `{"ok": false, "needs_ack": true, "status": "...", ...}` salvo que se lo
-  llame con `--acknowledged`.
-- La ventana de chat marca la entrada en la lista de la cola ("⚠ sin confirmar" o
-  "⚠ envío interrumpido"), no solo cuando la abrís, y deja **Enviar**
-  deshabilitado hasta que apretés *"Revisé WhatsApp, quiero reenviar"*.
-  Apretar eso es lo que pasa `--acknowledged`.
-- Un mensaje nuevo en el mismo chat **no** limpia ninguno de los dos
-  estados.
-
-Cerrar el popup, reiniciar la barra, dejar que la cola se refresque o hacer
-un dry run **no** levanta el bloqueo: la advertencia se recalcula desde lo
-que hay en disco cada vez, así que no se pierde reabriendo la ventana de chat ni
-apretando Enviar con el dry-run todavía activo. Revisá WhatsApp vos mismo
-para ver si salió antes de confirmar.
-
-## Un mensaje que llega mientras estás redactando
-
-Si alguien vuelve a escribir en el mismo chat entre que abrís la entrada y
-que el envío se confirma, la entrada **no** se elimina: queda en la cola
-con el mensaje nuevo, y la ventana de chat lo dice:
-
-> enviado. Llegó un mensaje nuevo en este chat mientras redactabas, así que
-> la entrada sigue en la cola.
-
-Tu respuesta sí salió. La cola simplemente no tira a la basura lo que
-todavía no leíste. (Hay un hueco en esto, por el vaciado automático de
-abajo: ver el último punto de la sección siguiente.)
+- `wa-reply chat-send` **se niega** a enviar a un chat con marca y devuelve
+  `{"ok": false, "needs_ack": true, ...}` salvo que se lo llame con
+  `--acknowledged`. Eso incluye las respuestas rápidas y Enter.
+- La ventana convierte ese rechazo en un aviso con dos botones: **"Revisé
+  WhatsApp, enviar igual"**, que reenvía con `--acknowledged`, y
+  **Cancelar**, que descarta el texto pendiente.
+- Un mensaje nuevo entrante en el mismo chat **no** borra la marca, ni
+  tampoco cerrar la ventana, reiniciar la barra o hacer un dry run: se
+  recalcula de lo que hay en disco. Revisá WhatsApp vos mismo para ver si el
+  mensaje salió antes de apretar el botón.
 
 ## Qué saca un chat de la cola
 
-Un chat sale de la cola de tres formas, no de una sola:
+Esta sección trata del **contador de la barra** y de `queue.json`, no de la
+lista de chats de la ventana. La ventana muestra todos los chats, y marca
+uno como leído en el teléfono solo cuando lo tocás (`state/read.json`);
+nada de lo que sigue saca un chat de la ventana.
 
-- **Lo contestás desde la ventana de chat** y el envío se confirma (con la excepción
-  de la sección anterior).
+Un chat sale de la cola del contador de tres formas:
+
+- **Lo contestás desde la ventana de chat** (o desde otro dispositivo) y el
+  envío se confirma.
 - **Lo contestás desde otro dispositivo** — el teléfono, WhatsApp Web,
   ZapZap. WhatsApp le avisa tu propio mensaje a cada dispositivo
   vinculado; el sink lo registra en el anillo de contexto como tuyo y saca la
@@ -922,21 +898,15 @@ Un chat sale de la cola de tres formas, no de una sola:
   el chat como leído, WhatsApp manda un acuse de lectura y el sink saca la
   entrada de ese chat — **aunque no lo hayas contestado**. Es deliberado:
   el dueño eligió una cola corta sabiendo que un mensaje que leíste y
-  pensabas contestar después también desaparece de ella. Si usás la cola
-  como lista de pendientes, no abras esos chats en el teléfono, o dejalos
-  sin leer ahí.
+  pensabas contestar después también desaparece de ella. Si usás el
+  contador como lista de pendientes, no abras esos chats en el teléfono, o
+  dejalos sin leer ahí.
 
 Los acuses de lectura viajan en las dos direcciones, y solo una cuenta. El
 sink actúa únicamente sobre el estado `ReadSelf` de wuzapi — *vos* leíste
 el mensaje *del otro* en otro dispositivo. El estado `Read` a secas — *el
 otro* leyó *tu* mensaje — nunca saca nada; si no, cualquier contacto que
 abra tu mensaje vaciaría justo el chat que está esperando su respuesta.
-
-Lo que **nunca** se saca solo: una entrada cuyo último envío quedó en
-`unknown` o `sending` (ver "Envíos cuyo resultado nadie conoce" más
-arriba). Esa entrada es el único registro de que un mensaje puede haber
-salido sin confirmación; se queda, intacta, ante un acuse de lectura y
-ante un mensaje tuyo, hasta que la resuelvas en la ventana de chat.
 
 Un acuse de lectura o un mensaje tuyo para un chat sin entrada no hace
 nada, y uno que llega por un número que no está en `accounts.json` se
@@ -949,13 +919,8 @@ está suscrito a ellos: `wa-pair` suscribe las cuentas nuevas a `Message` y
 corrida, así que una instalación ya emparejada la toma en el próximo tick
 del timer sin volver a emparejar.
 
-Un hueco conocido: los envíos del propio plugin también le vuelven al sink
-como un mensaje tuyo, y ese eco saca la entrada del chat como cualquier
-otro. Si llega después de que el envío se confirmó, puede sacar una
-entrada que "Un mensaje que llega mientras estás redactando" más arriba
-dejó a propósito, así que un mensaje que llegó mientras redactabas puede
-igual salir de la cola. Después de enviar, si el chat estaba activo, mirá
-WhatsApp.
+Los envíos del propio plugin también le vuelven al sink como un mensaje
+tuyo, y ese eco saca la entrada del chat como cualquier otro.
 
 ## Dónde vive el estado, y cómo borrarlo
 

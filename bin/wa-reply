@@ -541,8 +541,8 @@ def cmd_accounts(args):
 def cmd_quick(args):
     """The quick replies of the account the given entry belongs to.
 
-    It takes the SAME entry id the panel passes to `draft` and `send`,
-    not an account: the panel already knows which entry it is showing,
+    It takes the SAME entry id the window passes to `draft` and `send`,
+    not an account: the window already knows which entry it is showing,
     and deriving the account from the entry here (rather than letting the
     caller name one) keeps every account decision in this script coming
     from the one place the invariant allows. A stale id is the same

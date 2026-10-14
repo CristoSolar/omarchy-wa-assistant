@@ -12,12 +12,12 @@ import qs.Commons
 //
 // Embedded as a plain child of ChatWindow.qml (not a Loader), so it is never
 // destroyed while a link or unlink is mid-flight — toggling the gear only
-// changes `visible`, the same technique the queue/detail split in ChatWindow.qml
+// changes `visible`, the same technique the list/conversation split in ChatWindow.qml
 // already uses. This is deliberate: a pairing run takes a while, and the
-// person may close the panel to do something else while it waits. The Process instances below keep running regardless.
+// person may close the window to do something else while it waits. The Process instances below keep running regardless.
 //
 // This view owns its OWN Processes for everything it does. It never calls
-// into Panel.qml's `run()`, `doSend()` or any of its Process ids — that is
+// into ChatWindow.qml's `doSend()` or any of its Process ids — that is
 // the boundary that makes "the settings screen must not be able to send a
 // message" true by construction rather than by discipline: there is no
 // send path here at all, only wa-pair/wa-unlink/wa-reply's read/write
@@ -44,7 +44,7 @@ ColumnLayout {
     listAccountsProc.running = true
   }
 
-  // Called by Panel.qml whenever the gear opens this screen. Deliberately
+  // Called by ChatWindow.qml whenever the gear opens this screen. Deliberately
   // does NOT reset `mode` while something is still IN PROGRESS — a link or
   // unlink mid-flight must keep showing its own progress when the person
   // reopens settings, not snap back to the account list and lose their
@@ -115,7 +115,7 @@ ColumnLayout {
   }
 
   // Set only once a usable answer (parsed JSON, either shape) actually
-  // arrives. Checked in onExited the same way Panel.qml's `unlinkProc` and
+  // arrives. Checked in onExited the same way this file's `unlinkProc` and
   // `pairProc` check their own terminal-event flags: a process that dies
   // without ever printing something this handler could parse — killed,
   // crashed before writing a line — must not leave the size silently
@@ -139,7 +139,7 @@ ColumnLayout {
         }
         // Neither shape: leave mediaSizeTerminalSeen false and let
         // onExited below report it — the same "no terminal event" case
-        // pairProc/unlinkProc already handle in Panel.qml/this file.
+        // pairProc/unlinkProc already handle in this file.
       }
     }
     onExited: function (exitCode) {
@@ -1012,7 +1012,7 @@ ColumnLayout {
 
     // The tone box holds a whole prompt file — it will certainly overflow
     // a fixed-height panel. Same ScrollView-around-TextArea idiom as the
-    // composer in Panel.qml: `toneBox` stays the TextArea's own id, so
+    // composer in ChatWindow.qml: `toneBox` stays the TextArea's own id, so
     // every toneBox.text reference (toneDirty(), saveTone(), the fetch
     // handlers) and its own enabled/selectByMouse keep working unchanged.
     ScrollView {
