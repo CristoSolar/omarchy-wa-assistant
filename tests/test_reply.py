@@ -1594,6 +1594,25 @@ def test_chat_send_with_a_queue_entry_goes_through_cmd_send_and_its_guard():
         assert store.load_queue(d)[0]["status"] == "unknown"  # dry run keeps the guard
 
 
+def test_chat_send_new_starts_a_chat_with_no_history_but_never_a_group_or_a_status():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add("5699@s.whatsapp.net", "otro chat")  # the account exists in history
+        out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="hola", acknowledged=False, new=True)
+        assert out == {"ok": True, "dry_run": True}
+        original, wa.send = wa.send, _no_network
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert isinstance(out, wa.ChatNotInAccount)  # without --new: unchanged
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=GROUP, text="x", acknowledged=False, new=True)
+            assert isinstance(out, wa.ChatNotInAccount)
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid="status@broadcast", text="x",
+                            acknowledged=False, new=True)
+            assert isinstance(out, wa.NotAChat)
+        finally:
+            wa.send = original
+
+
 def test_chat_draft_builds_the_prompt_from_the_last_ten_with_yo_for_mine():
     with tmpdir() as d:
         db = _chat_env(d)

@@ -5,11 +5,13 @@
 Always prints one JSON object on stdout and exits 0, so the QML caller can
 show an error instead of losing it in a non-zero exit. It reads history
 through sink/history.py and talks to wuzapi for exactly two things:
-POST /chat/markread and GET /group/list. It never sends a message; only
+POST /chat/markread and GET /group/list, plus POST /user/check to
+confirm a number before the owner starts a chat. It never sends a message; only
 bin/wa-reply does. A read here also takes the chat off the bar counter
 (queue.json), by the sink's own rule for a read on the phone.
 
 Usage: wa-chat chats | messages ACC JID [--before ID] | read ACC JID
+              | contacts | resolve ACC PHONE
 """
 import json
 import os
@@ -198,6 +200,7 @@ def list_chats(d, wuzdata, post, get=http_get):
             uid = uids.get(acc["wuzapi_user"])
             if uid is None:
                 continue
+            muted = contacts.muted_chats(wuzdata, acc["wuzapi_user"], time.time())
             for c in history.chats(conn, uid):
                 jid, last = c["jid"], c["last"]
                 group = jid.endswith("@g.us")
@@ -207,7 +210,7 @@ def list_chats(d, wuzdata, post, get=http_get):
                     "account": acc["id"], "label": acc.get("label", acc["id"]), "jid": jid, "name": name,
                     "last_text": _text(last), "last_ts": last["ts"], "last_id": c["last_id"],
                     "unread": history.unread_count(conn, uid, jid, readstate.marker(state, acc["id"], jid)),
-                    "group": group, "muted": group and jid not in enabled})
+                    "group": group, "muted": jid in muted and jid not in enabled})
     finally:
         conn.close()
     out.sort(key=lambda c: -c["last_id"])
@@ -233,6 +236,32 @@ def messages_page(d, wuzdata, acc_id, jid, before=None):
     return {"messages": msgs, "more": more}
 
 
+def list_contacts(d, wuzdata):
+    return {"contacts": [dict(c, account=a["id"], label=a.get("label", a["id"]))
+                         for a in accounts_mod.load(d)
+                         for c in contacts.address_book(wuzdata, a["wuzapi_user"])]}
+
+
+def resolve(d, wuzdata, acc_id, phone, post):
+    """The chat jid WhatsApp gives a number (often an @lid, the same one an
+    existing chat already uses), or an error if it is not on WhatsApp."""
+    acc = _account(d, acc_id)
+    digits = "".join(ch for ch in phone if ch.isdigit())
+    if len(digits) < 8:
+        return {"error": "número incompleto: con código de país, ej. +56912345678"}
+    try:
+        users = (post(acc_id, "/user/check", {"Phone": [digits]}).get("data") or {}).get("Users") or []
+    except Exception:
+        return {"error": "sin conexión con WhatsApp: no se pudo confirmar el número"}
+    hit = next((u for u in users if u.get("IsInWhatsapp") and u.get("JID")), None)
+    if hit is None:
+        return {"error": f"+{digits} no está en WhatsApp"}
+    jid = _user_server(hit["JID"])
+    if not history.is_chat(jid) or jid.endswith("@g.us"):
+        return {"error": f"WhatsApp devolvió algo que no es una persona: {jid}"}
+    return {"jid": jid, "name": contacts.display_name(wuzdata, acc["wuzapi_user"], jid, "")}
+
+
 def run_cli(argv, d, wuzdata):
     try:
         cmd = argv[0]
@@ -243,13 +272,18 @@ def run_cli(argv, d, wuzdata):
             return messages_page(d, wuzdata, argv[1], argv[2], before)
         if cmd == "read":
             return read_chat(d, wuzdata, argv[1], argv[2], http_post)
+        if cmd == "contacts":
+            return list_contacts(d, wuzdata)
+        if cmd == "resolve":
+            return resolve(d, wuzdata, argv[1], argv[2], http_post)
         return {"error": f"comando desconocido: {cmd}"}
     except history.SchemaError:
         return {"error": "esquema"}
     except sqlite3.OperationalError as exc:
         return {"error": "ocupada" if "locked" in str(exc) else str(exc)}
     except (IndexError, ValueError):
-        return {"error": "uso: wa-chat chats | messages ACC JID [--before ID] | read ACC JID"}
+        return {"error": "uso: wa-chat chats | messages ACC JID [--before ID] | read ACC JID"
+                         " | contacts | resolve ACC PHONE"}
     except Exception as exc:  # the window shows whatever we say
         return {"error": f"{type(exc).__name__}: {exc}"}
 

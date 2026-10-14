@@ -891,8 +891,13 @@ def cmd_send(args):
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
 
 
-def _chat_history(d, account_id, jid, limit=0):
-    """(account, last `limit` messages) for a chat, or ChatNotInAccount."""
+def _chat_history(d, account_id, jid, limit=0, new=False):
+    """(account, last `limit` messages) for a chat, or ChatNotInAccount.
+
+    new: the owner is starting this chat from the window (a contact or a
+    number WhatsApp confirmed via `wa-chat resolve`), so it may have no
+    history yet. Only a person: a group is never started from here.
+    """
     if not history.is_chat(jid):
         raise NotAChat(jid)
     account = _account_or_refuse(d, account_id)
@@ -907,7 +912,7 @@ def _chat_history(d, account_id, jid, limit=0):
                             f"({why}); no se envía nada."}) from None
     try:
         uid = history.user_ids(conn).get(account["wuzapi_user"])
-        if not uid or not history.has_chat(conn, uid, jid):
+        if not uid or not (history.has_chat(conn, uid, jid) or (new and not jid.endswith("@g.us"))):
             raise ChatNotInAccount(account_id, jid)
         msgs = history.messages(conn, uid, jid, limit=limit)[0] if limit else []
     finally:
@@ -917,7 +922,7 @@ def _chat_history(d, account_id, jid, limit=0):
 
 def cmd_chat_draft(args):
     d = store.data_dir()
-    account, msgs = _chat_history(d, args.account, args.jid, limit=10)
+    account, msgs = _chat_history(d, args.account, args.jid, limit=10, new=getattr(args, "new", False))
     agent_file = agent_path(account)
     agent_text = agent_file.read_text() if agent_file.exists() else ""
     context = [{"direction": "out" if m["from_me"] else "in",
@@ -941,7 +946,7 @@ def _set_unknown_mark(d, eid, on):
 
 def cmd_chat_send(args):
     d = store.data_dir()
-    account, _ = _chat_history(d, args.account, args.jid)
+    account, _ = _chat_history(d, args.account, args.jid, new=getattr(args, "new", False))
     eid = store.entry_id(account["id"], args.jid)
     if _entry(d, eid) is not None:
         # Queue bookkeeping and the "unknown outcome" guard live in cmd_send.
@@ -1019,11 +1024,12 @@ def main():
                         "unconfirmed ('unknown') send; required to retry one")
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser("chat-draft"); p.add_argument("account"); p.add_argument("jid")
-    p.add_argument("--idea", required=True)
+    p.add_argument("--idea", required=True); p.add_argument("--new", action="store_true")
     p.set_defaults(fn=cmd_chat_draft)
     p = sub.add_parser("chat-send"); p.add_argument("account"); p.add_argument("jid")
     p.add_argument("--text", required=True)
     p.add_argument("--acknowledged", action="store_true")
+    p.add_argument("--new", action="store_true", help="a chat the owner starts: no history needed")
     p.set_defaults(fn=cmd_chat_send)
     args = ap.parse_args()
     try:

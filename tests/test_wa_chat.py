@@ -1,5 +1,5 @@
 # tests/test_wa_chat.py
-import importlib.machinery, importlib.util, json, sys
+import importlib.machinery, importlib.util, json, sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
@@ -48,10 +48,65 @@ def test_chats_list_names_groups_muted_and_unread():
         db.add(DM, "hola", push="Ana"); db.add(GROUP, "buenas", sender="56922@s.whatsapp.net")
         cs = _chats(d, get=_get({GROUP: "Equipo"}))
         by = {c["jid"]: c for c in cs}
-        assert by[GROUP]["name"] == "Equipo" and by[GROUP]["group"] and by[GROUP]["muted"]
+        assert by[GROUP]["name"] == "Equipo" and by[GROUP]["group"] and not by[GROUP]["muted"]
         assert by[DM]["name"] == "Ana" and not by[DM]["group"] and not by[DM]["muted"]
         assert by[DM]["unread"] == 1 and by[DM]["account"] == "personal" and by[DM]["label"] == "Personal"
         assert by[DM]["last_text"] == "hola" and by[DM]["last_id"] == 1
+
+
+def _main_db(d, muted=(), contacts=()):
+    """whatsmeow's store, keyed by the device jid of u1 (personal)."""
+    m = sqlite3.connect(d / "main.db")
+    m.execute("CREATE TABLE whatsmeow_chat_settings (our_jid TEXT, chat_jid TEXT, muted_until BIGINT)")
+    m.execute("CREATE TABLE whatsmeow_contacts (our_jid TEXT, their_jid TEXT, first_name TEXT,"
+              " full_name TEXT, push_name TEXT, business_name TEXT, redacted_phone TEXT)")
+    m.execute("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT)")
+    dev = "56900000001:27@s.whatsapp.net"
+    m.executemany("INSERT INTO whatsmeow_chat_settings VALUES (?, ?, -1)", [(dev, j) for j in muted])
+    m.executemany("INSERT INTO whatsmeow_contacts VALUES (?, ?, '', ?, '', '', '')",
+                  [(dev, j, n) for j, n in contacts])
+    m.commit(); m.close()
+
+
+def test_a_chat_muted_on_the_phone_is_muted_unless_enabled():
+    with tmpdir() as d:
+        db = _setup(d)
+        _main_db(d, muted=[GROUP])
+        db.add(GROUP, "buenas", sender="56922@s.whatsapp.net"); db.add(DM, "hola")
+        assert {c["jid"]: c["muted"] for c in _chats(d)} == {GROUP: True, DM: False}
+        (d / "config.json").write_text(json.dumps({"groups_enabled": [GROUP]}))
+        assert {c["jid"]: c["muted"] for c in _chats(d)} == {GROUP: False, DM: False}
+
+
+def test_contacts_lists_the_address_book_of_each_account_by_name():
+    with tmpdir() as d:
+        _setup(d).c.commit()  # users.db's account rows
+        _main_db(d, contacts=[("56933@s.whatsapp.net", "zoe"), ("56944@s.whatsapp.net", "Ana"),
+                              ("77@lid", "Sin número"), ("56955@s.whatsapp.net", "")])
+        out = wc.run_cli(["contacts"], d, d)
+        assert out == {"contacts": [
+            {"name": "Ana", "phone": "56944", "account": "personal", "label": "Personal"},
+            {"name": "zoe", "phone": "56933", "account": "personal", "label": "Personal"}]}
+
+
+def test_resolve_returns_the_jid_whatsapp_gives_or_an_error():
+    with tmpdir() as d:
+        _setup(d).c.commit()
+        _main_db(d, contacts=[("56944444444@s.whatsapp.net", "Ana")])
+        seen = []
+
+        def post(acc, path, body):
+            seen.append((acc, path, body))
+            q = body["Phone"][0]
+            return {"data": {"Users": [{"IsInWhatsapp": q == "56944444444", "JID": f"{q}:2@s.whatsapp.net", "Query": q}]}}
+        assert wc.resolve(d, d, "personal", "+569 4444 4444", post) == {"jid": "56944444444@s.whatsapp.net",
+                                                                        "name": "Ana"}
+        assert seen == [("personal", "/user/check", {"Phone": ["56944444444"]})]
+        assert "no está en WhatsApp" in wc.resolve(d, d, "personal", "56911111", post)["error"]
+        assert "incompleto" in wc.resolve(d, d, "personal", "123", post)["error"]
+        assert "sin conexión" in wc.resolve(d, d, "personal", "56911111", lambda *a: 1 / 0)["error"]
+        lid = lambda acc, path, body: {"data": {"Users": [{"IsInWhatsapp": True, "JID": "status@broadcast"}]}}
+        assert "error" in wc.resolve(d, d, "personal", "56911111", lid)
 
 
 def test_enabled_group_is_not_muted_and_marker_clears_unread():

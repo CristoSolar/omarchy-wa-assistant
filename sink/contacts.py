@@ -86,6 +86,26 @@ def muted_chats(wuzdata, instance_name: str, now: float) -> set:
     return {r[0] for r in rows}
 
 
+def address_book(wuzdata, instance_name: str) -> list:
+    """[{name, phone}] the owner saved on the phone, by name. Unreadable -> []."""
+    try:
+        wuzdata = Path(wuzdata)
+        our = _our_jid(wuzdata, instance_name)
+        if not our:
+            return []
+        conn = _ro(wuzdata / "main.db")
+        try:
+            rows = conn.execute(
+                f"SELECT full_name, their_jid FROM whatsmeow_contacts WHERE {_OWNER}"
+                " AND full_name <> '' AND their_jid LIKE '_%@s.whatsapp.net'", _owner(our)).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return []
+    out = [{"name": n, "phone": j.split("@")[0]} for n, j in rows]
+    return sorted(out, key=lambda c: c["name"].casefold())
+
+
 def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> str:
     event_name = push_name if push_name and push_name != chat_jid else ""
     try:
