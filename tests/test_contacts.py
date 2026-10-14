@@ -3,7 +3,7 @@ import sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
-from sink.contacts import display_name, our_ids
+from sink.contacts import display_name, muted_chats, our_ids
 
 OUR = "56900000001@s.whatsapp.net"
 LID = "237786636488820@lid"
@@ -22,8 +22,9 @@ def _wuzdata(d, contacts=(), lids=()):
               " full_name TEXT, push_name TEXT, business_name TEXT, redacted_phone TEXT)")
     m.execute("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT)")
     for their, full, push, biz in contacts:
+        # whatsmeow's real key is the device jid, not the bare one users.db has.
         m.execute("INSERT INTO whatsmeow_contacts VALUES (?, ?, '', ?, ?, ?, '')",
-                  (OUR, their, full, push, biz))
+                  ("56900000001:27@s.whatsapp.net", their, full, push, biz))
     m.executemany("INSERT INTO whatsmeow_lid_map VALUES (?, ?)", lids)
     m.commit(); m.close()
     return d
@@ -85,6 +86,22 @@ def test_our_ids_are_the_account_number_and_its_lid():
         _wuzdata(d, lids=[("999", "56900000001")])
         assert our_ids(d, "trabajo") == {OUR, "999@lid"}
         assert our_ids(d, "nadie") == set()
+
+
+
+def test_muted_chats_are_the_ones_muted_on_the_phone_and_not_yet_expired():
+    with tmpdir() as d:
+        _wuzdata(d)
+        m = sqlite3.connect(d / "main.db")
+        m.execute("CREATE TABLE whatsmeow_chat_settings (our_jid TEXT, chat_jid TEXT,"
+                  " muted_until BIGINT NOT NULL DEFAULT 0)")
+        dev, other = "56900000001:27@s.whatsapp.net", "569000000012:3@s.whatsapp.net"
+        m.executemany("INSERT INTO whatsmeow_chat_settings VALUES (?, ?, ?)", [
+            (dev, "1@g.us", -1), (dev, "2@g.us", 2000), (dev, "3@g.us", 500),
+            (dev, "4@g.us", 0), (other, "5@g.us", -1)])
+        m.commit(); m.close()
+        assert muted_chats(d, "trabajo", 1000) == {"1@g.us", "2@g.us"}
+        assert muted_chats(d, "nadie", 1000) == set()
 
 
 if __name__ == "__main__":

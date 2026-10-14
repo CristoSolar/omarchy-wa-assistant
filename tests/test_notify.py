@@ -24,8 +24,9 @@ def _msg(**kw):
     return m
 
 
-def _ok(msg, jid=DM, enabled=(), focused="", acc="personal"):
-    return wn.should_notify(msg, acc, jid, enabled_groups=set(enabled), focused=focused, our_ids=OURS)
+def _ok(msg, jid=DM, enabled=(), focused="", acc="personal", muted=()):
+    return wn.should_notify(msg, acc, jid, enabled_groups=set(enabled), focused=focused,
+                            our_ids=OURS, muted=set(muted))
 
 
 def test_dm_notifies():
@@ -42,18 +43,23 @@ def test_focused_chat_does_not():
     assert _ok(_msg(), focused="")
 
 
-def test_group_not_enabled_is_silent():
-    assert not _ok(_msg(), jid=GROUP)
+def test_group_notifies_like_the_phone():
+    assert _ok(_msg(), jid=GROUP)
 
 
-def test_group_enabled_notifies():
-    assert _ok(_msg(), jid=GROUP, enabled=[GROUP])
+def test_chat_muted_on_the_phone_is_silent():
+    assert not _ok(_msg(), jid=GROUP, muted=[GROUP])
+    assert not _ok(_msg(), muted=[DM])
 
 
-def test_mention_in_disabled_group_notifies_even_with_device_suffix():
-    assert _ok(_msg(mentions=["56900000001:12@s.whatsapp.net"]), jid=GROUP)
-    assert _ok(_msg(mentions=["99999@lid"]), jid=GROUP)
-    assert not _ok(_msg(mentions=["5698@s.whatsapp.net"]), jid=GROUP)
+def test_group_enabled_notifies_even_if_muted():
+    assert _ok(_msg(), jid=GROUP, enabled=[GROUP], muted=[GROUP])
+
+
+def test_mention_in_muted_group_notifies_even_with_device_suffix():
+    assert _ok(_msg(mentions=["56900000001:12@s.whatsapp.net"]), jid=GROUP, muted=[GROUP])
+    assert _ok(_msg(mentions=["99999@lid"]), jid=GROUP, muted=[GROUP])
+    assert not _ok(_msg(mentions=["5698@s.whatsapp.net"]), jid=GROUP, muted=[GROUP])
 
 
 def test_mention_does_not_override_focus_or_own():
@@ -154,6 +160,17 @@ def test_rows_older_than_ten_minutes_never_notify_and_the_cursor_passes_them():
         cur, n = {"id": 0}, Fake()
         wn.process(d, d, cur, n, now=NOW)
         assert sorted(t for _, t in n.shown) == ["rara", "reciente"] and cur["id"] == last
+
+
+
+def test_without_now_the_age_filter_still_applies():
+    # main() calls process() without `now`; the filter must not go dead.
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "viejo", ts="2020-01-01T00:00:00-03:00")
+        cur, n = {"id": 0}, Fake()
+        wn.process(d, d, cur, n)
+        assert n.shown == []
 
 
 if __name__ == "__main__":

@@ -35,6 +35,14 @@ def _our_jid(wuzdata: Path, instance_name: str) -> str:
     return _bare(row[0]) if row and row[0] else ""
 
 
+# whatsmeow keys its tables by the device jid ('569…:27@…'); users.db has it bare.
+_OWNER = "(our_jid = ? OR our_jid LIKE ?)"
+
+
+def _owner(our: str) -> tuple:
+    return (our, our.split("@")[0] + ":%")
+
+
 def our_ids(wuzdata, instance_name: str) -> set:
     """The account's own number jid and its @lid, without a device part.
 
@@ -54,6 +62,28 @@ def our_ids(wuzdata, instance_name: str) -> set:
     except sqlite3.Error:
         return set()
     return {our} | ({row[0] + "@lid"} if row and row[0] else set())
+
+
+def muted_chats(wuzdata, instance_name: str, now: float) -> set:
+    """Chats the owner muted on the phone (-1 = forever, else Unix seconds).
+
+    Unreadable store -> empty set: a muted chat notifying beats a lost message.
+    """
+    try:
+        wuzdata = Path(wuzdata)
+        our = _our_jid(wuzdata, instance_name)
+        if not our:
+            return set()
+        conn = _ro(wuzdata / "main.db")
+        try:
+            rows = conn.execute(
+                f"SELECT chat_jid FROM whatsmeow_chat_settings WHERE {_OWNER}"
+                " AND (muted_until = -1 OR muted_until > ?)", (*_owner(our), int(now))).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return set()
+    return {r[0] for r in rows}
 
 
 def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> str:
@@ -76,7 +106,7 @@ def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> 
                     return ("", "", "")
                 row = conn.execute(
                     "SELECT full_name, business_name, push_name FROM whatsmeow_contacts"
-                    " WHERE our_jid = ? AND their_jid = ?", (our, jid)).fetchone()
+                    f" WHERE {_OWNER} AND their_jid = ?", (*_owner(our), jid)).fetchone()
                 return tuple(v or "" for v in row) if row else ("", "", "")
 
             by_pn, by_chat = contact(pn), contact(chat_jid if chat_jid != pn else "")

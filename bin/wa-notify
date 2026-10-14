@@ -45,10 +45,11 @@ def _bare(jid):
     return f"{user.split(':')[0]}@{server}"
 
 
-def should_notify(msg, account, jid, *, enabled_groups, focused, our_ids):
+def should_notify(msg, account, jid, *, enabled_groups, focused, our_ids, muted=frozenset()):
+    """Like the phone: everything except chats muted there; a mention always."""
     if msg["from_me"] or focused == f"{account}:{jid}":
         return False
-    if not jid.endswith("@g.us") or jid in enabled_groups:
+    if jid not in muted or jid in enabled_groups:
         return True
     return any(_bare(m) in our_ids for m in msg.get("mentions") or [])
 
@@ -121,6 +122,7 @@ def process(d, wuzdata, cursor, notifier, now=None):
     failed notification is lost rather than repeated: neither can stall the
     rows behind it or re-run the batch.
     """
+    now = time.time() if now is None else now
     accts = accounts_mod.load(d)
     enabled = set(store.load_config(d).get("groups_enabled", []))
     focused = _read_focused(d)
@@ -130,7 +132,7 @@ def process(d, wuzdata, cursor, notifier, now=None):
         rows = history.rows_after(conn, cursor["id"])
     finally:
         conn.close()
-    latest, ours = {}, {}
+    latest, ours, muted = {}, {}, {}
     for uid, jid, msg in rows:
         cursor["id"] = max(cursor["id"], msg["id"])
         try:
@@ -139,8 +141,9 @@ def process(d, wuzdata, cursor, notifier, now=None):
                 continue
             if acc["id"] not in ours:
                 ours[acc["id"]] = contacts.our_ids(wuzdata, acc["wuzapi_user"])
+                muted[acc["id"]] = contacts.muted_chats(wuzdata, acc["wuzapi_user"], now)
             if should_notify(msg, acc["id"], jid, enabled_groups=enabled, focused=focused,
-                             our_ids=ours[acc["id"]]):
+                             our_ids=ours[acc["id"]], muted=muted[acc["id"]]):
                 latest[(acc["id"], jid)] = (acc, msg)
         except Exception as exc:
             _log(exc)
