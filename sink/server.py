@@ -5,15 +5,17 @@ only wuzapi on the private Docker network can reach it.
 """
 import json
 import os
+import sqlite3
 import sys
+from datetime import datetime
+from pathlib import Path
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from sink import accounts as accounts_module
-from sink import store
+from sink import history, readstate, store
 from sink.contacts import display_name
 from sink.events import describe_skipped_group, extract, extract_own_message, extract_read_receipt
-from sink.purge import purge_history
 
 PORT = 8099
 
@@ -83,7 +85,45 @@ def _log_unknown_instance_once(instance_name, jid) -> None:
              file=sys.stderr, flush=True)
 
 
-def _remove_unless_ambiguous(data_dir, account_id, jid) -> bool:
+def touch_changed(d) -> None:
+    """state/changed: bumped after every processed event, so a window or
+    notifier can watch one file instead of polling."""
+    p = Path(d) / "changed"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.touch()
+
+
+def _mark_read(data_dir, instance_name, account_id, jid) -> None:
+    """Record that the owner has read `jid` up to wuzapi's newest row for it.
+
+    A missing, locked or unrecognisable users.db must never stop a message
+    from being queued, so every failure here is logged and swallowed.
+    """
+    try:
+        conn = history.connect(store.wuzdata_dir())
+        try:
+            readstate.ensure(data_dir, history.last_id(conn))
+            uid = history.user_ids(conn).get(instance_name)
+            if uid is not None:
+                readstate.mark(data_dir, account_id, jid,
+                               history.last_id(conn, uid, jid))
+        finally:
+            conn.close()
+    except (sqlite3.Error, history.SchemaError) as exc:
+        print(f"read marker not updated: {exc}", file=sys.stderr, flush=True)
+
+
+def _newer_than_entry(own_ts, entry_ts) -> bool:
+    """False only when the own message is provably older than the queue
+    entry (anything unparsable counts as newer, the old behaviour)."""
+    try:
+        return (datetime.fromisoformat(own_ts.replace("Z", "+00:00"))
+                >= datetime.fromisoformat(entry_ts.replace("Z", "+00:00")))
+    except (AttributeError, TypeError, ValueError):
+        return True
+
+
+def _remove_unless_ambiguous(data_dir, account_id, jid, since_ts=None) -> bool:
     """Remove that chat's queue entry, unless its status is ambiguous.
 
     An entry left `unknown` or `sending` may correspond to a send that
@@ -97,6 +137,11 @@ def _remove_unless_ambiguous(data_dir, account_id, jid) -> bool:
     for e in store.load_queue(data_dir):
         if e["id"] == entry_id:
             if e.get("status") in ("unknown", "sending"):
+                return False
+            # The echo of a send that a newer incoming message superseded
+            # (wa-reply put the entry back to "pending") is older than the
+            # entry; it must not delete the message nobody answered yet.
+            if since_ts is not None and not _newer_than_entry(since_ts, e.get("ts")):
                 return False
             store.remove_queue(data_dir, entry_id)
             return True
@@ -112,6 +157,7 @@ def _handle_read_receipt(event, instance_name, data_dir) -> bool:
     if account is None:
         _log_unknown_instance_once(instance_name, receipt["jid"])
         return False
+    _mark_read(data_dir, instance_name, account["id"], receipt["jid"])
     return _remove_unless_ambiguous(data_dir, account["id"], receipt["jid"])
 
 
@@ -137,7 +183,8 @@ def _handle_own_message(own, instance_name, data_dir) -> bool:
     store.append_context(data_dir, jid,
                          {"direction": "out", "text": own["text"],
                           "ts": own["ts"]}, account_id)
-    _remove_unless_ambiguous(data_dir, account_id, jid)
+    _mark_read(data_dir, instance_name, account_id, jid)
+    _remove_unless_ambiguous(data_dir, account_id, jid, own["ts"])
     return True
 
 
@@ -145,6 +192,13 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     event, instance_name = _decode(raw, content_type)
     if event is None:
         return False
+    try:
+        return _handle_event(event, instance_name, data_dir)
+    finally:
+        touch_changed(data_dir)
+
+
+def _handle_event(event, instance_name, data_dir) -> bool:
     if os.environ.get("WA_DEBUG_EVENTS"):
         _log_shape(event, instance_name)
 
@@ -189,8 +243,7 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
         return False
 
     account_id = account["id"]
-    wuzdata = os.path.dirname(os.environ.get("WA_WUZAPI_DB", "/wuzdata/users.db"))
-    entry["push_name"] = display_name(wuzdata, instance_name, entry["jid"], entry["push_name"])
+    entry["push_name"] = display_name(store.wuzdata_dir(), instance_name, entry["jid"], entry["push_name"])
     # "direction": "in" is an explicit mark, not something a reader is meant
     # to infer from "from" — a contact can share the user's own display name,
     # and the user's own second number writes to them too. The "out" half
@@ -253,32 +306,8 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-def purge_or_warn(db_path) -> int:
-    """Purge wuzapi's history table, but never let a corrupt DB stop the sink.
-
-    The purge is the only thing keeping the user's WhatsApp history off disk.
-    If it fails we must not silently continue as if it worked: we shout a
-    loud warning to stderr so the failure is visible, then let the sink keep
-    serving anyway (staying up beats a crash-loop with no webhook sink at
-    all).
-    """
-    try:
-        return purge_history(db_path)
-    except Exception as exc:
-        print("!" * 70, file=sys.stderr)
-        print("WARNING: history purge FAILED — wuzapi DB may still hold "
-              "the user's WhatsApp message history unencrypted on disk.",
-              file=sys.stderr)
-        print(f"WARNING: purge_history({db_path!r}) raised: {exc}",
-              file=sys.stderr)
-        print("!" * 70, file=sys.stderr, flush=True)
-        return 0
-
-
 def main():
     Handler.data_dir = store.data_dir()
-    wuz_db = os.environ.get("WA_WUZAPI_DB", "/wuzdata/users.db")
-    print(f"purged {purge_or_warn(wuz_db)} history rows", flush=True)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

@@ -4,8 +4,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
 import sink.server as server
-from sink.server import handle_payload, purge_or_warn, response_status
-from sink import store
+from sink.server import handle_payload, response_status
+from sink import readstate, store
+from tests.test_history import Db
+import os
 
 PERSONAL = {"id": "personal", "label": "Personal", "wuzapi_user": "omarchy"}
 TRABAJO = {"id": "trabajo", "label": "Trabajo", "wuzapi_user": "trabajo"}
@@ -99,11 +101,124 @@ def test_an_unenabled_group_jid_is_logged_only_once():
             "the same unenabled group JID must be logged only once per process"
 
 
-def test_a_corrupt_wuzapi_db_does_not_stop_the_sink_from_starting():
+DM = "56911111111@s.whatsapp.net"
+
+
+class _wuz:
+    """Point the sink's /wuzdata at `d` for one block (what the container's
+    WA_WUZAPI_DB does)."""
+    def __init__(self, d):
+        self.d = d
+
+    def __enter__(self):
+        self.old = os.environ.get("WA_WUZAPI_DB")
+        os.environ["WA_WUZAPI_DB"] = str(self.d / "users.db")
+
+    def __exit__(self, *a):
+        if self.old is None:
+            os.environ.pop("WA_WUZAPI_DB", None)
+        else:
+            os.environ["WA_WUZAPI_DB"] = self.old
+
+
+def _post(ev, d):
+    return handle_payload(json.dumps(ev).encode(), "application/json", d)
+
+
+def _setup(d):
+    """A state dir with accounts and a users.db in a sibling wuzdata dir."""
+    state, wuz = d / "state", d / "wuz"
+    state.mkdir(); wuz.mkdir()
+    _write_accounts(state, [PERSONAL])
+    return state, wuz, Db(wuz)
+
+
+def test_read_self_marks_the_chats_last_row_id():
     with tmpdir() as d:
-        p = d / "users.db"
-        p.write_bytes(b"this is not a sqlite database")
-        assert purge_or_warn(p) == 0
+        state, wuz, db = _setup(d)
+        db.add(DM, "uno"); last = db.add(DM, "dos")
+        db.add("56922222222@s.whatsapp.net", "otro chat")
+        with _wuz(wuz):
+            _post(_receipt("ReadSelf"), state)
+        assert readstate.marker(readstate.load(state), "personal", DM) == last
+
+
+def test_a_plain_read_receipt_marks_nothing():
+    with tmpdir() as d:
+        state, wuz, db = _setup(d)
+        db.add(DM, "uno")
+        with _wuz(wuz):
+            _post(_receipt("Read"), state)
+        assert not (state / "read.json").exists()
+
+
+def test_an_own_device_message_marks_the_chat_read():
+    with tmpdir() as d:
+        state, wuz, db = _setup(d)
+        db.add(DM, "uno"); last = db.add(DM, "yo", from_me=True)
+        with _wuz(wuz):
+            _post(_event(is_from_me=True, text="yo"), state)
+        assert readstate.marker(readstate.load(state), "personal", DM) == last
+
+
+def test_history_present_before_the_first_mark_never_reads_as_unread():
+    with tmpdir() as d:
+        state, wuz, db = _setup(d)
+        old = db.add("56933333333@s.whatsapp.net", "viejo")
+        with _wuz(wuz):
+            _post(_receipt("ReadSelf"), state)
+        s = readstate.load(state)
+        assert s["since"] == old
+        assert readstate.marker(s, "personal", "56933333333@s.whatsapp.net") == old
+
+
+def test_every_processed_event_touches_changed():
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        for ev in (_event(), _event(is_from_me=True), _receipt("Read"),
+                   _event(instance_name="nadie"), _event(chat="1203@g.us", is_group=True)):
+            (d / "changed").unlink(missing_ok=True)
+            _post(ev, d)
+            assert (d / "changed").exists(), ev
+
+
+def test_a_missing_users_db_does_not_stop_queueing():
+    with tmpdir() as d:
+        state = d / "state"; state.mkdir()
+        _write_accounts(state, [PERSONAL])
+        with _wuz(d / "nowhere"):
+            assert _post(_event(), state) is True
+            _post(_receipt("ReadSelf"), state)
+            _post(_event(is_from_me=True), state)
+        assert (state / "changed").exists()
+        assert not (state / "read.json").exists()
+
+
+def test_an_unreadable_users_db_does_not_stop_queueing():
+    with tmpdir() as d:
+        state = d / "state"; state.mkdir()
+        _write_accounts(state, [PERSONAL])
+        (d / "users.db").write_bytes(b"this is not a sqlite database")
+        with _wuz(d):
+            assert _post(_event(), state) is True
+            assert _post(_event(is_from_me=True), state) is True
+        assert len(store.load_context(state, DM, "personal")) == 2
+
+
+def test_the_echo_of_an_older_send_does_not_delete_a_newer_unanswered_message():
+    # wa-reply marks the entry "pending" (superseded) when a message arrived
+    # mid-send; the echo of that send then lands. It is older than the entry
+    # and must not clear it.
+    with tmpdir() as d:
+        _write_accounts(d, [PERSONAL])
+        _post(_event(), d)
+        newer = _event(text="y otra cosa")
+        newer["event"]["Info"]["Timestamp"] = "2026-09-22T16:05:00Z"
+        _post(newer, d)
+        echo = _event(is_from_me=True, text="respuesta")
+        echo["event"]["Info"]["Timestamp"] = "2026-09-22T16:01:00Z"
+        _post(echo, d)
+        assert len(store.load_queue(d)) == 1
 
 
 # --- Task 2: account resolution ----------------------------------------

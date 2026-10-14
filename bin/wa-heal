@@ -119,6 +119,12 @@ except Exception:
     -H "Content-Type: application/json" \
     -d "{\"webhookurl\":\"$WEBHOOK_URL\",\"events\":[\"Message\",\"ReadReceipt\"]}" >/dev/null
 
+  # Keep wuzapi's message history on: the chat window reads it, and the
+  # setting is as easy to lose as the webhook.
+  curl -s -X POST "$API/session/history" -H "token: $token" \
+    -H "Content-Type: application/json" \
+    -d '{"history":100000}' >/dev/null
+
   # Verify by reading it back rather than trusting the POST's 200: the
   # whole point is that a re-assert can silently not stick.
   local got

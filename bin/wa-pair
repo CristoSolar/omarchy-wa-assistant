@@ -2,7 +2,7 @@
 # bin/wa-pair <account-id> <number> — create a wuzapi user for an account
 # and link it to a WhatsApp number by 8-digit code.
 # Pairing makes WhatsApp dump the account's history into wuzapi's SQLite;
-# days_to_sync_history cannot prevent it, so we purge right afterwards.
+# the chat window reads it, so it is kept.
 set -euo pipefail
 
 # --json is an additive, optional flag: it may appear anywhere in argv and
@@ -99,39 +99,6 @@ if [[ -z "${!TOKEN_VAR:-}" ]]; then
 else
   TOKEN_VALUE="${!TOKEN_VAR}"
 fi
-
-wait_for_history() {
-  # Prints "<count> <settled> <saw_rows>". Scoped to this account's own
-  # wuzapi id when it can be resolved (see the module docstring in
-  # sink/purge.py: a second account pairing while a first is already live
-  # would otherwise see the first account's ordinary, unrelated traffic as
-  # if it were part of the dump being waited on, and could wait the full
-  # timeout without ever detecting settlement). An id that cannot be
-  # resolved yet falls back to the old, unscoped, whole-table wait rather
-  # than block pairing on a lookup that failed for an unrelated reason.
-  python3 -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-from sink.purge import wait_until_stable, wuzapi_user_id
-uid = wuzapi_user_id(sys.argv[2], sys.argv[3]) or None
-count, settled, saw_rows = wait_until_stable(sys.argv[2], user_id=uid)
-print(count, settled, saw_rows)
-' "$ROOT" "$DB" "$WUZAPI_USER"
-}
-
-count_history() {
-  # Deliberately UNSCOPED: this checks the table after the sink's startup
-  # purge, which empties the whole shared table for every account, not
-  # just this one (see sink/server.py's purge_or_warn) — the same full
-  # count this script has always checked, and the right one to check
-  # here.
-  python3 -c '
-import sys
-sys.path.insert(0, sys.argv[1])
-from sink.purge import count_history
-print(count_history(sys.argv[2]))
-' "$ROOT" "$DB"
-}
 
 # The wuzapi user's NAME. Normally that is the account id itself (a new
 # account, e.g. "trabajo" -> wuzapi user "trabajo"), but store.
@@ -298,92 +265,14 @@ for _ in $(seq 1 40); do
     fi
     (( JSON_MODE )) || echo "webhook confirmed: $WEBHOOK_URL"
 
-    (( JSON_MODE )) || echo "waiting for WhatsApp to finish sending history..."
-    emit_json history_waiting
+    # Keep every message wuzapi sees in its own message_history, which the
+    # chat window reads. Set after login for the same reason as the webhook.
+    curl -s -X POST "$API/session/history" -H "token: $TOKEN_VALUE" \
+      -H "Content-Type: application/json" \
+      -d '{"history":100000}' >/dev/null
 
-    # loggedIn flips at the END of the pairing handshake, before whatsmeow
-    # starts streaming history-sync blobs. Wait for rows to appear and then
-    # stop growing; saw_rows tells us whether any ever appeared at all.
-    # `read < <(...)` reports the READ's status, not the subshell's, so a
-    # crashing wait_for_history would leave these empty and fall into the
-    # "no rows were ever observed" branch — reporting a crash to the user
-    # as uncertainty, with exit 0. Capture first, check, then split.
-    if ! WAIT_OUT=$(wait_for_history); then
-      echo "error: could not read wuzapi's history table while waiting for the" >&2
-      echo "  history dump. NOTHING was purged and nothing was verified." >&2
-      echo "  Check 'docker logs omarchy-wa-sink' and the database at:" >&2
-      echo "    $DB" >&2
-      emit_terminal error reason="could not read wuzapi's history table while waiting for the history dump; nothing was purged and nothing was verified" fatal=true
-      exit 1
-    fi
-    read -r PRE_PURGE SETTLED SAW_ROWS <<<"$WAIT_OUT"
-    if [[ -z "${SAW_ROWS:-}" ]]; then
-      echo "error: unexpected output from the history wait: ${WAIT_OUT@Q}" >&2
-      emit_terminal error reason="unexpected output from the history wait: ${WAIT_OUT@Q}" fatal=true
-      exit 1
-    fi
-
-    docker restart omarchy-wa-sink >/dev/null
-
-    # The sink purges on startup, and it purges the WHOLE shared table —
-    # every account's rows, not just this one — because that purge exists
-    # to keep WhatsApp history off disk at all, for every account, on
-    # every sink restart; scoping it to this account would leave another
-    # account's already-should-be-purged rows sitting there instead.
-    # Container start + Python + deleting rows + VACUUM does not fit in a
-    # fixed one-second sleep, and a sleep that is too short fires the
-    # warning on the happy path — which trains the user to ignore the one
-    # warning that protects their history. Poll instead, with a bound.
-    if ! POST_PURGE=$(count_history); then
-      echo "error: could not re-count wuzapi's history table after the purge." >&2
-      emit_terminal error reason="could not re-count wuzapi's history table after the purge" fatal=true
-      exit 1
-    fi
-    for _ in $(seq 1 45); do
-      [[ "$POST_PURGE" == "0" ]] && break
-      sleep 2
-      POST_PURGE=$(count_history) || POST_PURGE=""
-    done
-    if [[ -z "$POST_PURGE" ]]; then
-      echo "error: could not re-count wuzapi's history table after the purge." >&2
-      emit_terminal error reason="could not re-count wuzapi's history table after the purge (post-restart poll)" fatal=true
-      exit 1
-    fi
-
-    if [[ "$SAW_ROWS" != "True" ]]; then
-      # Honest uncertainty. We cannot tell "this account has no history"
-      # from "the dump has not started" by looking at the database, so we
-      # do not claim either. This is NOT a success message.
-      if (( JSON_MODE )); then
-        emit_json history_purged rows="$PRE_PURGE" verified=false seen=false
-      else
-        echo "history: no rows for $ACCOUNT_ID were ever observed in wuzapi's"
-        echo "  message_history table. That may mean this account has no"
-        echo "  history to sync, or it may mean WhatsApp had not started"
-        echo "  sending it yet. This run cannot tell which. Nothing was"
-        echo "  confirmed purged for this account, because nothing was ever seen."
-        echo "  If you want certainty, wait a few minutes and then run:"
-        echo "    docker restart omarchy-wa-sink"
-        echo "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line"
-      fi
-      emit_terminal done
-      exit 0
-    fi
-
-    if [[ "$SETTLED" == "True" && "$POST_PURGE" == "0" ]]; then
-      (( JSON_MODE )) || echo "history purged: $PRE_PURGE row(s) seen for $ACCOUNT_ID, table now empty."
-      emit_json history_purged rows="$PRE_PURGE" verified=true seen=true
-      emit_terminal done
-      exit 0
-    fi
-
-    echo "WARNING: history may NOT have been fully cleared." >&2
-    echo "  History was still arriving when purge ran: settled=$SETTLED" >&2
-    echo "  Rows seen for $ACCOUNT_ID before restart: $PRE_PURGE, rows remaining (all accounts): $POST_PURGE" >&2
-    echo "  Please run 'docker restart omarchy-wa-sink' in a minute and check again." >&2
-    emit_json history_purged rows="$PRE_PURGE" verified=false seen=true remaining="$POST_PURGE"
-    emit_terminal error reason="history may not have been fully cleared: settled=$SETTLED, rows seen for $ACCOUNT_ID before restart=$PRE_PURGE, rows remaining (all accounts)=$POST_PURGE" fatal=true
-    exit 1
+    emit_terminal done
+    exit 0
   fi
   sleep 5
 done

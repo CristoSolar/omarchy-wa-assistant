@@ -265,27 +265,6 @@ EXPECTED_HUMAN_ECHOES = [
     "      -d '{\\\"webhookurl\\\":\\\"$WEBHOOK_URL\\\",\\\"events\\\":[\\\"Message\\\",\\\"ReadReceipt\\\"]}'",
     "  then confirm with: curl -s $API/webhook -H 'token: \\$$TOKEN_VAR'",
     "webhook confirmed: $WEBHOOK_URL",
-    "waiting for WhatsApp to finish sending history...",
-    "error: could not read wuzapi's history table while waiting for the",
-    "  history dump. NOTHING was purged and nothing was verified.",
-    "  Check 'docker logs omarchy-wa-sink' and the database at:",
-    "    $DB",
-    "error: unexpected output from the history wait: ${WAIT_OUT@Q}",
-    "error: could not re-count wuzapi's history table after the purge.",
-    "error: could not re-count wuzapi's history table after the purge.",
-    "history: no rows for $ACCOUNT_ID were ever observed in wuzapi's",
-    "  message_history table. That may mean this account has no",
-    "  history to sync, or it may mean WhatsApp had not started",
-    "  sending it yet. This run cannot tell which. Nothing was",
-    "  confirmed purged for this account, because nothing was ever seen.",
-    "  If you want certainty, wait a few minutes and then run:",
-    "    docker restart omarchy-wa-sink",
-    "    docker logs omarchy-wa-sink   # look for the 'purged N history rows' line",
-    "history purged: $PRE_PURGE row(s) seen for $ACCOUNT_ID, table now empty.",
-    "WARNING: history may NOT have been fully cleared.",
-    "  History was still arriving when purge ran: settled=$SETTLED",
-    "  Rows seen for $ACCOUNT_ID before restart: $PRE_PURGE, rows remaining (all accounts): $POST_PURGE",
-    "  Please run 'docker restart omarchy-wa-sink' in a minute and check again.",
     "timed out waiting for the link",
 ]
 
@@ -316,15 +295,14 @@ def test_wa_pair_json_flag_is_stripped_before_positional_args_are_parsed():
 
 
 def test_wa_pair_json_vocabulary_matches_the_spec_exactly():
-    """Only these seven event names may appear as an `event=` literal —
+    """Only these five event names may appear as an `event=` literal —
     the spec's whole point is that the GUI parses a fixed vocabulary, not
     prose that gets reworded later."""
     code_lines = "\n".join(ln for ln in WA_PAIR.splitlines()
                             if not ln.strip().startswith("#"))
     emitted = set(re.findall(r'emit_(?:json|terminal) (\w+)', code_lines))
     assert emitted == {
-        "validating", "code", "linked", "history_waiting",
-        "history_purged", "done", "error",
+        "validating", "code", "linked", "done", "error",
     }, emitted
 
 
@@ -353,7 +331,7 @@ def test_every_wa_pair_exit_statement_emits_a_terminal_event_first():
     # Sanity: the script still has the exit statements this counts — a
     # rewrite that removed them all would make the loop above vacuously
     # pass.
-    assert checked >= 12, f"expected at least 12 bare exit statements, found {checked}"
+    assert checked >= 8, f"expected at least 8 bare exit statements, found {checked}"
 
 
 def test_wa_pair_exit_trap_is_the_backstop_for_set_dash_e():
@@ -398,31 +376,17 @@ def test_wa_pair_validation_refusal_emits_terminal_error_and_nothing_else():
         "between:\n" + block)
 
 
-def test_wa_pair_history_purged_event_distinguishes_all_three_outcomes():
-    """rows-purged-and-verified, rows-remaining/timed-out, and
-    never-saw-a-row must be distinguishable by the GUI — the spec calls the
-    last one uncertainty, not success, so it may not look identical to the
-    success case."""
-    never_saw = re.search(
-        r'emit_json history_purged rows="\$PRE_PURGE" verified=false seen=false',
-        WA_PAIR)
-    remains = re.search(
-        r'emit_json history_purged rows="\$PRE_PURGE" verified=false seen=true remaining="\$POST_PURGE"',
-        WA_PAIR)
-    success = re.search(
-        r'emit_json history_purged rows="\$PRE_PURGE" verified=true seen=true',
-        WA_PAIR)
-    assert never_saw and remains and success, (
-        "all three history outcomes must each emit a distinctly-shaped "
-        "history_purged event")
-    # The two failing outcomes must each be followed by a terminal event
-    # before the process exits — never-saw-a-row exits 0 ("done", it is
-    # not a failure, just uncertainty); rows-remaining/timed-out exits 1
-    # ("error").
-    after_never_saw = WA_PAIR[never_saw.end():never_saw.end() + 900]
-    assert re.search(r"emit_terminal done\s*\n\s*exit 0", after_never_saw), after_never_saw
-    after_remains = WA_PAIR[remains.end():remains.end() + 400]
-    assert re.search(r"emit_terminal error .*fatal=true\s*\n\s*exit 1", after_remains, re.S), after_remains
+def test_wa_pair_keeps_history_and_ends_with_done():
+    """No wait, no purge: after the webhook is confirmed it asks wuzapi to
+    keep history and finishes."""
+    after = WA_PAIR[WA_PAIR.index('echo "webhook confirmed'):]
+    assert '/session/history' in after and '"history":100000' in after
+    assert re.search(r"emit_terminal done\s*\n\s*exit 0", after)
+    assert "purge" not in after
+
+
+def test_wa_heal_reasserts_history_on_every_pass():
+    assert '/session/history' in WA_HEAL and '"history":100000' in WA_HEAL
 
 
 def _extract_emit_json_python_body():
@@ -445,10 +409,6 @@ def test_emit_json_body_produces_one_valid_json_line_per_event():
         ["validating", "account=trabajo"],
         ["code", "code=WNEH-WKK4"],
         ["linked"],
-        ["history_waiting"],
-        ["history_purged", "rows=15850", "verified=true", "seen=true"],
-        ["history_purged", "rows=0", "verified=false", "seen=false"],
-        ["history_purged", "rows=3", "verified=false", "seen=true", "remaining=3"],
         ["done"],
         ["error", 'reason=failed: HTTP 500 {"ok":false}', "fatal=true"],
     ]
@@ -670,12 +630,6 @@ def test_wa_unlink_removes_the_wuzapi_user_before_the_commit_point():
 # --- The settings screen must not dress a warning up as success -----------
 
 SETTINGS = (ROOT / "SettingsView.qml").read_text()
-
-
-def test_the_linked_and_ready_line_is_withheld_while_a_purge_warning_stands():
-    assert 'visible: root.linkStage === "done" && !root.linkPurgeWarn' in SETTINGS, (
-        '"Cuenta vinculada y lista." must not show beside an unresolved '
-        "history warning")
 
 
 def test_the_tone_editor_clears_the_box_and_gates_saving_on_a_real_read():

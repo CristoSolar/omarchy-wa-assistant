@@ -13,9 +13,8 @@ import qs.Commons
 // Embedded as a plain child of Panel.qml (not a Loader), so it is never
 // destroyed while a link or unlink is mid-flight — toggling the gear only
 // changes `visible`, the same technique the queue/detail split in Panel.qml
-// already uses. This is deliberate: a pairing run takes minutes, and the
-// person may close the panel to do something else while it waits on the
-// history dump. The Process instances below keep running regardless.
+// already uses. This is deliberate: a pairing run takes a while, and the
+// person may close the panel to do something else while it waits. The Process instances below keep running regardless.
 //
 // This view owns its OWN Processes for everything it does. It never calls
 // into Panel.qml's `run()`, `doSend()` or any of its Process ids — that is
@@ -342,20 +341,18 @@ ColumnLayout {
   // Linking — the centrepiece. `wa-pair --json` emits one JSON object per
   // line over several minutes; this reads it incrementally via SplitParser
   // (onRead fires per line, as it arrives) rather than collecting the
-  // whole stream and waiting for exit, which is what makes the code and
-  // the history-wait state show up while they are still happening instead
-  // of only once the process is long gone.
+  // whole stream and waiting for exit, which is what makes the code
+  // shows up while it is still happening instead of only once the process
+  // is long gone.
   // -------------------------------------------------------------------
 
   property string linkAccountId: ""
   property string linkNumber: ""
-  // form | validating | code | linked | history_waiting | history_purged
+  // form | validating | code | linked
   // | done | error | no_terminal
   property string linkStage: "form"
   property string linkCode: ""
   property string linkError: ""
-  property string linkPurgeMessage: ""
-  property bool linkPurgeWarn: false
   // Set the moment a "done" or "error" event is actually parsed. Checked
   // in pairProc's onExited: if the process ends and this is still false,
   // the stream ended with no terminal event — the script's own header
@@ -370,8 +367,6 @@ ColumnLayout {
     root.linkNumber = ""
     root.linkCode = ""
     root.linkError = ""
-    root.linkPurgeMessage = ""
-    root.linkPurgeWarn = false
   }
 
   function startLink() {
@@ -384,8 +379,6 @@ ColumnLayout {
     root.linkStage = "validating"
     root.linkCode = ""
     root.linkError = ""
-    root.linkPurgeMessage = ""
-    root.linkPurgeWarn = false
     root.linkTerminalSeen = false
     pairProc.command = [root.pluginDir + "bin/wa-pair", id, num, "--json"]
     pairProc.running = true
@@ -409,34 +402,6 @@ ColumnLayout {
       break
     case "linked":
       root.linkStage = "linked"
-      break
-    case "history_waiting":
-      root.linkStage = "history_waiting"
-      break
-    case "history_purged":
-      // Never claim success from `seen` alone. `verified` false means
-      // either nothing was ever seen (we cannot tell "no history" from
-      // "the dump had not arrived yet") or rows remained after the purge
-      // — both are honestly reported, neither is treated as done.
-      root.linkStage = "history_purged"
-      if (obj.seen === false) {
-        root.linkPurgeMessage = "No se vio ninguna fila de historial para "
-          + "esta cuenta. No se puede saber si no había historial o si "
-          + "WhatsApp todavía no había empezado a mandarlo. Nada se dio "
-          + "por purgado."
-        root.linkPurgeWarn = true
-      } else if (obj.verified === true) {
-        root.linkPurgeMessage = "Historial purgado: "
-          + (obj.rows !== undefined ? obj.rows : "?")
-          + " fila(s) vistas, confirmado que la tabla quedó vacía."
-        root.linkPurgeWarn = false
-      } else {
-        root.linkPurgeMessage = "El historial puede NO haberse borrado del "
-          + "todo. Filas vistas: " + (obj.rows !== undefined ? obj.rows : "?")
-          + (obj.remaining !== undefined
-             ? (", filas restantes: " + obj.remaining) : "") + "."
-        root.linkPurgeWarn = true
-      }
       break
     case "done":
       root.linkTerminalSeen = true
@@ -531,11 +496,9 @@ ColumnLayout {
       }
     }
 
-    // The code, the stage text and the purge warning can all be visible at
-    // once by the time linking reaches "done" (the code stays shown, the
-    // purge message appears, and the closing line stacks under it), and
-    // any one of the free-text pieces (the purge message, the error) comes
-    // from wa-pair rather than from a short fixed string — length is not
+    // The code, the stage text and the closing line can all be visible at
+    // once by the time linking reaches "done", and the error comes from
+    // wa-pair rather than from a short fixed string — length is not
     // guaranteed. Wrapped in ScrollView, same idiom as the composer.
     ScrollView {
       id: linkProgressScroll
@@ -589,58 +552,14 @@ ColumnLayout {
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
       }
-      // The minutes-long stretch. Named plainly so nobody mistakes it for
-      // a hang — see the module header for why this exact wording exists.
       Text {
         textFormat: Text.PlainText
-        visible: root.linkStage === "history_waiting"
-        text: "Esperando que WhatsApp termine de mandar el historial. Esto "
-          + "puede tardar varios minutos — es normal, no cierres esta pantalla."
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        wrapMode: Text.Wrap
-        Layout.fillWidth: true
-      }
-      Text {
-        textFormat: Text.PlainText
-        visible: root.linkStage === "history_purged" || root.linkStage === "done"
-        text: root.linkPurgeMessage
-        color: root.linkPurgeWarn ? root.urgent : Color.accent
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        wrapMode: Text.Wrap
-        Layout.fillWidth: true
-      }
-      // "Cuenta vinculada y lista." is only ever shown when nothing is
-      // outstanding. With an unresolved history warning above it (seen=false
-      // — nobody knows whether WhatsApp had started sending the history, so
-      // nothing was confirmed purged — or rows left over after the purge),
-      // a bold green "y lista." right beside the red text reads as the
-      // verdict on the whole operation and softens the one warning the
-      // person has to act on. The linking claim is still true and still
-      // made, in the plainer line below, which says exactly what is
-      // settled and what is not.
-      Text {
-        textFormat: Text.PlainText
-        visible: root.linkStage === "done" && !root.linkPurgeWarn
+        visible: root.linkStage === "done"
         text: "Cuenta vinculada y lista."
         color: Color.accent
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         font.bold: true
-      }
-      Text {
-        textFormat: Text.PlainText
-        visible: root.linkStage === "done" && root.linkPurgeWarn
-        text: "La cuenta quedó vinculada y puede recibir mensajes. Lo que no "
-          + "se puede dar por resuelto es el historial: leé la advertencia de "
-          + "arriba antes de darlo por borrado."
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        wrapMode: Text.Wrap
-        Layout.fillWidth: true
       }
       Text {
         textFormat: Text.PlainText
