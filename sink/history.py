@@ -141,6 +141,15 @@ def unread_ids(conn, uid, jid, after_id) -> list:
     return [(r[2], r[1]) for r in _unread(conn, uid, jid, after_id)]
 
 
+def read_ids_upto(conn, uid, jid, top, limit) -> list:
+    """(message_id, sender) of the newest `limit` incoming visible rows at or
+    below `top`: what a read the owner clicked covered, for a retry. Rows
+    that arrived after the click are never in it."""
+    rows = conn.execute(f"{_SELECT} WHERE user_id = ? AND chat_jid = ? AND id <= ? AND {_INCOMING}"
+                        " ORDER BY id DESC LIMIT ?", (uid, jid, top, limit)).fetchall()
+    return [(r[2], r[1]) for r in reversed(rows) if _decode(r) is not None]
+
+
 def last_id(conn, uid=None, jid=None) -> int:
     if uid is None:
         row = conn.execute("SELECT MAX(id) FROM message_history").fetchone()

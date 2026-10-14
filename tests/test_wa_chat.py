@@ -76,7 +76,7 @@ def test_read_in_a_group_posts_one_call_per_sender_and_marks():
         assert by["56911@s.whatsapp.net"]["Id"] == ["M1", "M3"] and by["56922@s.whatsapp.net"]["Id"] == ["M2"]
         assert all(c[1] == "/chat/markread" and c[2]["ChatPhone"] == GROUP for c in post.calls)
         st = readstate.load(d)
-        assert readstate.marker(st, "personal", GROUP) == 3 and st["pending"] == []
+        assert readstate.marker(st, "personal", GROUP) == 3 and st["pending"] == {}
 
 
 def test_group_sender_on_lid_keeps_its_server_and_loses_the_device_suffix():
@@ -155,7 +155,7 @@ def test_failed_post_is_pending_and_marker_still_rises_then_retried_on_next_list
         post = Post()
         _chats(d, post=post)
         assert len(post.calls) == 1 and post.calls[0][2]["Id"] == ["M1"]
-        assert readstate.load(d)["pending"] == []
+        assert readstate.load(d)["pending"] == {}
 
 
 def test_pending_stays_when_retry_fails():
@@ -215,6 +215,62 @@ def test_status_broadcast_is_not_listed_and_is_never_read():
         post = Post()
         out = wc.read_chat(d, d, "personal", "status@broadcast", post)
         assert out["ok"] is False and out["error"] and post.calls == []
+
+
+class Http4xx(Post):
+    def __call__(self, acc, path, body):
+        import urllib.error
+        from email.message import Message
+        self.calls.append((acc, path, body))
+        raise urllib.error.HTTPError("http://127.0.0.1:8080" + path, 400, "bad", Message(), None)
+
+
+def test_retry_acks_only_what_was_clicked_never_what_arrived_after():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "visto"); top = db.add(DM, "visto 2")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))
+        assert readstate.load(d)["pending"] == {"personal:" + DM: top}
+        db.add(DM, "llegó después")  # the user never saw this one
+        post = Post()
+        out = wc.list_chats(d, d, post, get=_get())
+        assert [c[2]["Id"] for c in post.calls] == [["M1", "M2"]]
+        assert out["offline"] is False and readstate.load(d)["pending"] == {}
+        assert out["chats"][0]["unread"] == 1
+
+
+def test_a_4xx_on_retry_drops_the_pending_read_and_is_not_offline():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))
+        post = Http4xx()
+        out = wc.list_chats(d, d, post, get=_get())
+        assert len(post.calls) == 1 and out["offline"] is False
+        assert readstate.load(d)["pending"] == {}
+        wc.list_chats(d, d, post, get=_get())
+        assert len(post.calls) == 1  # never re-acked
+
+
+def test_a_locked_db_during_retry_does_not_abort_the_listing():
+    import sqlite3
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))
+        real, n = wc.history.connect, []
+        def flaky(w):
+            n.append(1)
+            if len(n) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(w)
+        wc.history.connect = flaky
+        try:
+            out = wc.list_chats(d, d, Post(), get=_get())
+        finally:
+            wc.history.connect = real
+        assert [c["jid"] for c in out["chats"]] == [DM] and out["offline"] is False
+        assert len(readstate.load(d)["pending"]) == 1  # retried on the next list
 
 
 if __name__ == "__main__":

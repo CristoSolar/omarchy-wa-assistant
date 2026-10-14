@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from sink import accounts as accounts_mod, contacts, history, readstate, store  
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 GROUPS_TTL = 6 * 3600
-RETRY_WINDOW = 50
+RETRY_WINDOW = 50  # newest incoming rows re-acked per pending chat
 
 
 def _url(api, path):
@@ -119,26 +120,33 @@ def read_chat(d, wuzdata, acc_id, jid, post):
 
 
 def _retry_pending(d, wuzdata, post):
-    """True if wuzapi was unreachable (the first failure ends the pass)."""
-    for key in list(readstate.load(d)["pending"]):
+    """True if wuzapi was unreachable (the first failure ends the pass).
+
+    Acks only rows up to the top id the owner clicked: a message that
+    arrived after the click was never seen. wuzapi answering 4xx is a
+    definite no; retrying it forever would keep the window offline, so the
+    pending read is dropped (the local marker already rose).
+    """
+    for key, top in list(readstate.load(d)["pending"].items()):
         acc_id, jid = store.split_entry_id(key)
         try:
             acc = _account(d, acc_id)
             conn = history.connect(wuzdata)
             try:
                 uid = history.user_ids(conn)[acc["wuzapi_user"]]
-                # ponytail: the marker already rose, so the exact unread set is gone;
-                # re-ack the incoming rows of the last page instead.
-                page, _ = history.messages(conn, uid, jid, limit=RETRY_WINDOW)
+                pairs = history.read_ids_upto(conn, uid, jid, top, RETRY_WINDOW)
             finally:
                 conn.close()
-            _mark_read_on_wuzapi(post, acc_id, jid,
-                                 [(m["message_id"], m["sender"]) for m in page if not m["from_me"]])
-            readstate.mark(d, acc_id, jid, 0, pending=False)
-        except (KeyError, ValueError):
-            pass  # stays pending; next list retries
+        except (KeyError, ValueError, sqlite3.Error, history.SchemaError):
+            continue  # stays pending; next list retries
+        try:
+            _mark_read_on_wuzapi(post, acc_id, jid, pairs)
+        except urllib.error.HTTPError as exc:
+            if not 400 <= exc.code < 500:
+                return True
         except Exception:
             return True
+        readstate.mark(d, acc_id, jid, 0, pending=False)
     return False
 
 
