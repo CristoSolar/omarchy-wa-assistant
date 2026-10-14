@@ -283,5 +283,32 @@ def test_a_pairing_dump_below_the_account_baseline_is_not_unread():
         assert {c["jid"]: c["unread"] for c in _chats(d)}[DM] == 1
 
 
+def _queue(d, jid, status="pending"):
+    from sink import store
+    store.upsert_queue(d, {"id": store.entry_id("personal", jid), "jid": jid, "account": "personal",
+                           "push_name": "Ana", "text": "hola", "count": 1,
+                           "ts": "2026-10-13T22:05:39-03:00", "status": status})
+
+
+def test_reading_in_the_window_takes_the_chat_off_the_bar_counter():
+    from sink import store
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a"); db.add("5692@s.whatsapp.net", "b")
+        _queue(d, DM); _queue(d, "5692@s.whatsapp.net")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))  # even when the phone never hears
+        assert [e["jid"] for e in store.load_queue(d)] == ["5692@s.whatsapp.net"]
+
+
+def test_reading_keeps_an_entry_whose_send_outcome_is_unknown():
+    from sink import store
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        _queue(d, DM, status="unknown")
+        wc.read_chat(d, d, "personal", DM, Post())
+        assert [e["status"] for e in store.load_queue(d)] == ["unknown"]
+
+
 if __name__ == "__main__":
     run(dict(globals()))

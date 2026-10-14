@@ -113,10 +113,15 @@ In a conversation:
   the message will leave from, always the one the chat belongs to.
 - A strip appears when the bridge is offline. The gear opens settings.
 
-**When a chat is marked read.** Only when you click it in the list: that
-sends the read receipt to the phone. Chats the window restores or remembers
-from last time, and chats opened by clicking a notification, are shown but
-**not** marked read. Read markers are kept in `state/read.json`.
+**When a chat is marked read.** When you click it in the list: that sends
+the read receipt to the phone. After that, while that chat stays open, new
+messages arriving in it are marked read too, but only while the window is
+the active window and settings are closed, as WhatsApp does with the chat
+on screen. Chats the window restores or remembers from last time, and
+chats opened by clicking a notification, are shown but **not** marked read
+until you click their row. Read markers are kept in `state/read.json`.
+Marking a chat read also takes it off the bar counter (see "What takes a
+chat out of the queue").
 
 If a send's outcome is unknown (timeout, connection dropped, or the window
 closed while the send was in flight), the window refuses to send again in
@@ -131,7 +136,11 @@ service (`bin/wa-notify`) that raises a desktop notification per incoming
 message — one per chat, replaced by the next message in it. Clicking it opens
 that chat in the window (without marking it read). There is no notification
 for your own messages, for groups you have not enabled unless they mention
-you, or for the chat that is open and focused in the window. The service
+you, for the chat that is open and focused in the window, or for messages
+more than ten minutes old, so the history WhatsApp dumps when you link an
+account does not notify. Whatever of that dump is already stored when
+linking finishes does not show as unread either; anything that lands
+later does, until you open it. The service
 only reads; it never sends.
 
 ## What is not in v1
@@ -834,11 +843,15 @@ The mark is durable, and the protection is enforced by `chat-send` itself:
 ## What takes a chat out of the queue
 
 This section is about the **bar counter** and `queue.json`, not about the
-window's chat list. The window shows every chat, and marks one read on the
-phone only when you click it (`state/read.json`); nothing below removes a
-chat from the window.
+window's chat list. The window shows every chat and marks one read as
+described under "When a chat is marked read" (`state/read.json`); nothing
+below removes a chat from the window.
 
-A chat leaves the counter's queue in three ways:
+A chat leaves the counter's queue in four ways:
+
+- **You read it in the chat window.** The window marking a chat read
+  removes its entry by the same rule as a read on another device, below,
+  even if the phone did not get the receipt yet.
 
 - **You answer it from the chat window** (or any other device) and the
   send is confirmed.

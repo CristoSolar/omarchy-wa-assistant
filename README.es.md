@@ -122,11 +122,16 @@ En una conversación:
 - Aparece una franja cuando el puente está desconectado. El engranaje abre
   la configuración.
 
-**Cuándo se marca un chat como leído.** Solo cuando lo tocás en la lista:
-eso manda el acuse de lectura al teléfono. Los chats que la ventana
-restaura o recuerda de la vez anterior, y los que abrís tocando una
-notificación, se muestran pero **no** se marcan como leídos. Los marcadores
-de lectura se guardan en `state/read.json`.
+**Cuándo se marca un chat como leído.** Cuando lo tocás en la lista: eso
+manda el acuse de lectura al teléfono. Desde ahí, mientras ese chat siga
+abierto, los mensajes nuevos que lleguen también se marcan como leídos,
+pero solo mientras la ventana sea la ventana activa y la configuración esté
+cerrada, como hace WhatsApp con el chat que tenés en pantalla. Los chats
+que la ventana restaura o recuerda de la vez anterior, y los que abrís
+tocando una notificación, se muestran pero **no** se marcan como leídos
+hasta que tocás su fila. Los marcadores de lectura se guardan en
+`state/read.json`. Marcar un chat como leído también lo saca del contador
+de la barra (ver "Qué saca un chat de la cola").
 
 Si el resultado de un envío es desconocido (timeout, conexión cortada, o
 cerraste la ventana con el envío en curso), la ventana se niega a volver a
@@ -142,7 +147,11 @@ cada mensaje entrante — una por chat, reemplazada por el siguiente mensaje
 de ese chat. Al tocarla se abre ese chat en la ventana (sin marcarlo como
 leído). No hay notificación para tus propios mensajes, para grupos que no
 habilitaste salvo que te mencionen, ni para el chat que está abierto y con
-foco en la ventana. El servicio solo lee; nunca envía.
+foco en la ventana, ni para mensajes de hace más de diez minutos, así que
+el historial que WhatsApp vuelca al vincular una cuenta no avisa. Lo que
+de ese volcado ya está guardado cuando termina la vinculación tampoco
+aparece como no leído; lo que llegue después sí, hasta que lo abras. El
+servicio solo lee; nunca envía.
 
 ## Qué no está en v1
 
@@ -889,11 +898,16 @@ La marca es durable, y la protección la aplica el propio `chat-send`:
 ## Qué saca un chat de la cola
 
 Esta sección trata del **contador de la barra** y de `queue.json`, no de la
-lista de chats de la ventana. La ventana muestra todos los chats, y marca
-uno como leído en el teléfono solo cuando lo tocás (`state/read.json`);
-nada de lo que sigue saca un chat de la ventana.
+lista de chats de la ventana. La ventana muestra todos los chats y marca
+uno como leído como se explica en "Cuándo se marca un chat como leído"
+(`state/read.json`); nada de lo que sigue saca un chat de la ventana.
 
-Un chat sale de la cola del contador de tres formas:
+Un chat sale de la cola del contador de cuatro formas:
+
+- **Lo leés en la ventana de chat.** Cuando la ventana marca un chat como
+  leído, saca su entrada con la misma regla que una lectura en otro
+  dispositivo, más abajo, aunque el teléfono todavía no haya recibido el
+  acuse.
 
 - **Lo contestás desde la ventana de chat** (o desde otro dispositivo) y el
   envío se confirma.

@@ -6,7 +6,8 @@ Always prints one JSON object on stdout and exits 0, so the QML caller can
 show an error instead of losing it in a non-zero exit. It reads history
 through sink/history.py and talks to wuzapi for exactly two things:
 POST /chat/markread and GET /group/list. It never sends a message; only
-bin/wa-reply does.
+bin/wa-reply does. A read here also takes the chat off the bar counter
+(queue.json), by the sink's own rule for a read on the phone.
 
 Usage: wa-chat chats | messages ACC JID [--before ID] | read ACC JID
 """
@@ -21,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sink import accounts as accounts_mod, contacts, history, readstate, store  # noqa: E402
+from sink.server import _remove_unless_ambiguous  # noqa: E402
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 GROUPS_TTL = 6 * 3600
@@ -116,6 +118,8 @@ def read_chat(d, wuzdata, acc_id, jid, post):
     # is an atomic replace but load-modify-save, so two simultaneous writers can
     # lose one update. Accepted: the marker only rises and the next write fixes it.
     readstate.mark(d, acc_id, jid, top, pending=not ok)
+    # The bar counts queue.json: the same rule as reading on the phone.
+    _remove_unless_ambiguous(d, acc_id, jid)
     return {"ok": True} if ok else {"ok": False, "pending": True}
 
 
