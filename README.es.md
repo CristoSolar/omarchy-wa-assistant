@@ -112,6 +112,13 @@ WhatsApp (`/user/check`): un número que no está en WhatsApp se rechaza, y
 uno con el que ya tenés chat abre ese chat en vez de duplicarlo. La cuenta
 la elegís con la fila que tocás; desde acá no se crean grupos.
 
+**Fotos de perfil.** Las filas y la cabecera de la conversación muestran
+la foto de cada chat o contacto (su inicial si no tiene). Solo las filas
+que están en pantalla la piden, de a pocas, vía wuzapi (`/user/avatar`) y
+la CDN de WhatsApp; se guardan una semana en `avatars/`, al lado de
+`state/`, y lo mismo "no tiene foto", así que recorrer la agenda no
+repite consultas.
+
 El atajo vive en tu propio `~/.config/hypr/bindings.lua`; `install.sh` no
 lo agrega. Agregalo así:
 

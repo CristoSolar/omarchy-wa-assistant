@@ -106,6 +106,13 @@ refused, and one you already have a chat with opens that chat instead of
 a duplicate. You pick the account by the row you click; groups cannot be
 started from here.
 
+**Profile pictures.** Rows and the conversation header show each chat's
+or contact's picture (its initial when there is none). Only rows on screen
+ask for one, a few at a time, through wuzapi (`/user/avatar`) and
+WhatsApp's CDN; they are kept for a week in `avatars/` next to `state/`,
+and so is "has no picture", so scrolling the address book does not repeat
+lookups.
+
 The shortcut lives in your own `~/.config/hypr/bindings.lua`; `install.sh`
 does not add it. Add:
 

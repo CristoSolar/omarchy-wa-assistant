@@ -365,5 +365,57 @@ def test_reading_keeps_an_entry_whose_send_outcome_is_unknown():
         assert [e["status"] for e in store.load_queue(d)] == ["unknown"]
 
 
+
+def _avatar_env(d):
+    import os
+    os.environ["WA_STATE_ROOT"] = str(d)
+
+
+def test_avatars_fetch_once_cache_none_and_space_out_the_asks():
+    import os, urllib.error
+    with tmpdir() as d:
+        old = os.environ.get("WA_STATE_ROOT")
+        _avatar_env(d)
+        try:
+            asks, sleeps = [], []
+
+            def post(acc, path, body):
+                asks.append((acc, path, body))
+                if body["Phone"] == "sinfoto@lid":
+                    raise urllib.error.HTTPError("u", 500, "no picture", {}, None)
+                return {"data": {"url": "https://pps.whatsapp.net/v/x.jpg"}}
+            keys = ["personal|56911@s.whatsapp.net", "personal|sinfoto@lid", "trabajo|569222"]
+            out = wc.avatars(keys, post, download=lambda u: b"JPG", sleep=sleeps.append)
+            assert out == {"fetched": ["personal|56911@s.whatsapp.net", "trabajo|569222"], "offline": False}
+            assert asks[0] == ("personal", "/user/avatar", {"Phone": "56911@s.whatsapp.net", "Preview": True})
+            assert sleeps == [wc.AVATAR_GAP] * 2
+            assert wc.avatar_path("personal", "56911@s.whatsapp.net").read_bytes() == b"JPG"
+            assert wc.avatar_path("personal", "sinfoto@lid").read_bytes() == b""
+            asks.clear()
+            assert wc.avatars(keys, post, download=lambda u: b"JPG", sleep=sleeps.append)["fetched"] == []
+            assert asks == []  # all cached, the empty one too
+            later = lambda: __import__("time").time() + wc.AVATAR_TTL + 1
+            wc.avatars(keys[:1], post, download=lambda u: b"NEW", sleep=sleeps.append, now=later)
+            assert wc.avatar_path("personal", "56911@s.whatsapp.net").read_bytes() == b"NEW"
+        finally:
+            os.environ.pop("WA_STATE_ROOT") if old is None else os.environ.__setitem__("WA_STATE_ROOT", old)
+
+
+def test_avatars_stop_offline_refuse_other_hosts_and_bad_names():
+    import os
+    with tmpdir() as d:
+        old = os.environ.get("WA_STATE_ROOT")
+        _avatar_env(d)
+        try:
+            out = wc.avatars(["personal|a@lid", "personal|b@lid"], lambda *a: 1 / 0, sleep=lambda s: None)
+            assert out == {"fetched": [], "offline": True}
+            evil = lambda *a: {"data": {"url": "https://evil.example/x.jpg"}}
+            assert wc.avatars(["personal|a@lid"], evil, sleep=lambda s: None)["offline"] is True
+            assert not wc.avatar_path("personal", "a@lid").exists()
+            assert wc.avatars(["../x|a@lid", "personal|..", "personal|/"], evil)["fetched"] == []
+        finally:
+            os.environ.pop("WA_STATE_ROOT") if old is None else os.environ.__setitem__("WA_STATE_ROOT", old)
+
+
 if __name__ == "__main__":
     run(dict(globals()))

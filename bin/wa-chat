@@ -6,12 +6,13 @@ Always prints one JSON object on stdout and exits 0, so the QML caller can
 show an error instead of losing it in a non-zero exit. It reads history
 through sink/history.py and talks to wuzapi for exactly two things:
 POST /chat/markread and GET /group/list, plus POST /user/check to
-confirm a number before the owner starts a chat. It never sends a message; only
+confirm a number before the owner starts a chat and POST /user/avatar for
+profile pictures (downloaded from WhatsApp's own CDN). It never sends a message; only
 bin/wa-reply does. A read here also takes the chat off the bar counter
 (queue.json), by the sink's own rule for a read on the phone.
 
 Usage: wa-chat chats | messages ACC JID [--before ID] | read ACC JID
-              | contacts | resolve ACC PHONE
+              | contacts | resolve ACC PHONE | avatars ACC|TARGET...
 """
 import json
 import os
@@ -29,6 +30,10 @@ from sink.server import _remove_unless_ambiguous  # noqa: E402
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 GROUPS_TTL = 6 * 3600
 RETRY_WINDOW = 50  # newest incoming rows re-acked per pending chat
+AVATAR_TTL = 7 * 86400  # a picture, or "has none", is asked again after a week
+AVATAR_GAP = 0.3  # seconds between asks: a burst of lookups looks like a bot
+AVATAR_MAX = 512 * 1024
+AVATAR_CDN = "https://pps.whatsapp.net/"
 
 
 def _url(api, path):
@@ -262,6 +267,67 @@ def resolve(d, wuzdata, acc_id, phone, post):
     return {"jid": jid, "name": contacts.display_name(wuzdata, acc["wuzapi_user"], jid, "")}
 
 
+def avatar_path(acc_id, target) -> Path:
+    """Where a chat's (jid) or a contact's (phone) picture lives; the window
+    builds the same path from avatar_root() + the same safe name."""
+    accounts_mod.validate_id(acc_id)
+    safe = "".join(ch for ch in target if ch.isalnum() or ch in "@.-_").lstrip(".")
+    if not safe:
+        raise ValueError(f"no usable avatar name in {target!r}")
+    return store.state_root() / "avatars" / acc_id / f"{safe}.jpg"
+
+
+def _download(url):
+    if not url.startswith(AVATAR_CDN):
+        raise ValueError(f"refusing an avatar url off WhatsApp's CDN: {url[:60]}")
+    with urllib.request.urlopen(url, timeout=5) as r:
+        data = r.read(AVATAR_MAX + 1)
+    if len(data) > AVATAR_MAX:
+        raise ValueError("avatar too large")
+    return data
+
+
+def avatars(keys, post, download=_download, sleep=time.sleep, now=time.time):
+    """Fetch missing or week-old pictures for "acc|target" keys, one at a time.
+
+    A target with no picture leaves an empty file, so it is not asked again
+    for a week. The first network failure ends the pass (offline).
+    """
+    fetched, asked = [], False
+    for key in keys:
+        acc_id, _, target = key.partition("|")
+        try:
+            path = avatar_path(acc_id, target)
+        except ValueError:
+            continue
+        try:
+            if now() - path.stat().st_mtime < AVATAR_TTL:
+                continue
+        except OSError:
+            pass
+        if asked:
+            sleep(AVATAR_GAP)
+        asked = True
+        try:
+            url = (post(acc_id, "/user/avatar", {"Phone": target, "Preview": True}).get("data") or {}).get("url", "")
+            data = download(url) if url else b""
+        except urllib.error.HTTPError as exc:
+            if exc.code != 500:  # wuzapi answers 500 for "has no profile picture"
+                return {"fetched": fetched, "offline": True}
+            data = b""
+        except Exception:
+            return {"fetched": fetched, "offline": True}
+        for folder in (path.parent.parent, path.parent):  # contacts' faces: owner only
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(folder, 0o700)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        if data:
+            fetched.append(key)
+    return {"fetched": fetched, "offline": False}
+
+
 def run_cli(argv, d, wuzdata):
     try:
         cmd = argv[0]
@@ -276,6 +342,8 @@ def run_cli(argv, d, wuzdata):
             return list_contacts(d, wuzdata)
         if cmd == "resolve":
             return resolve(d, wuzdata, argv[1], argv[2], http_post)
+        if cmd == "avatars":
+            return avatars(argv[1:], http_post)
         return {"error": f"comando desconocido: {cmd}"}
     except history.SchemaError:
         return {"error": "esquema"}

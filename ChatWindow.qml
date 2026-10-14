@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Effects
 import QtMultimedia
 import Quickshell
 import Quickshell.Io
@@ -154,6 +155,87 @@ Item {
       }
     }
     return out
+  }
+
+  // ---- profile pictures -------------------------------------------------
+  // `wa-chat avatars` caches them under avatars/<acc>/<name>.jpg (an empty
+  // file = no picture). Only rows that get drawn ask, in batches; the
+  // backend skips anything cached in the last week.
+  property int avatarRev: 0
+  property var avatarAsked: ({})
+  property var avatarQueue: []
+
+  function avatarUrl(acc, target) {
+    var safe = String(target).replace(/[^A-Za-z0-9@._-]/g, "").replace(/^\.+/, "")
+    return "file://" + root.stateRoot + "/avatars/" + acc + "/" + safe + ".jpg?" + root.avatarRev
+  }
+  function wantAvatar(acc, target) {
+    var key = acc + "|" + target
+    if (!acc || !target || root.avatarAsked[key]) return
+    root.avatarAsked[key] = true
+    root.avatarQueue.push(key)
+    avatarTimer.restart()
+  }
+  Timer {
+    id: avatarTimer; interval: 400
+    onTriggered: {
+      if (avatarProc.running || root.avatarQueue.length === 0) return
+      avatarProc.command = [root.pluginDir + "bin/wa-chat", "avatars"].concat(root.avatarQueue.splice(0, 20))
+      avatarProc.running = true
+    }
+  }
+  Process {
+    id: avatarProc
+    onExited: {
+      root.avatarRev++
+      if (root.avatarQueue.length > 0) avatarTimer.restart()
+    }
+  }
+
+  component Avatar: Item {
+    id: av
+    property string acc: ""
+    property string target: ""
+    property string name: ""
+    property int size: 36
+    implicitWidth: av.size
+    implicitHeight: av.size
+    onTargetChanged: root.wantAvatar(av.acc, av.target)
+    Component.onCompleted: root.wantAvatar(av.acc, av.target)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: width / 2
+      visible: avImg.status !== Image.Ready
+      color: Style.normalFillFor(root.fg, root.accent)
+      Text {
+        anchors.centerIn: parent
+        text: { var m = String(av.name).match(/[A-Za-zÀ-ÿ0-9]/); return m ? m[0].toUpperCase() : "?" }
+        color: root.fg
+        font.family: root.fontFamily
+        font.pixelSize: av.size * 0.42
+        font.bold: true
+      }
+    }
+    Image {
+      id: avImg
+      anchors.fill: parent
+      visible: false
+      source: av.target ? root.avatarUrl(av.acc, av.target) : ""
+      cache: false
+      asynchronous: true
+      sourceSize: Qt.size(av.size * 2, av.size * 2)
+    }
+    Rectangle { id: avMask; anchors.fill: parent; radius: width / 2; visible: false; layer.enabled: true }
+    MultiEffect {
+      anchors.fill: parent
+      visible: avImg.status === Image.Ready
+      source: avImg
+      maskEnabled: true
+      maskSource: avMask
+      maskThresholdMin: 0.5
+      maskSpreadAtMin: 1.0
+    }
   }
 
   // ---- starting a chat ---------------------------------------------------
@@ -865,14 +947,25 @@ Item {
                 readonly property bool isCurrent: chatRow.modelData.account === root.curAcc
                                                   && chatRow.modelData.jid === root.curJid
                 width: ListView.view.width
-                height: chatCol.implicitHeight + Style.spacing.md * 2
+                height: Math.max(chatCol.implicitHeight, rowAvatar.size) + Style.spacing.md * 2
                 radius: Style.cornerRadius
                 color: chatRow.isCurrent ? Style.selectedFillFor(root.fg, root.accent)
                        : (rowMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
 
+                Avatar {
+                  id: rowAvatar
+                  anchors.left: parent.left; anchors.leftMargin: Style.spacing.md
+                  anchors.verticalCenter: parent.verticalCenter
+                  acc: chatRow.modelData.account
+                  // A typed number gets no lookup: asking while you type is noise.
+                  target: chatRow.modelData.kind === "number" ? ""
+                          : (chatRow.modelData.kind === "contact" ? chatRow.modelData.phone : chatRow.modelData.jid)
+                  name: chatRow.modelData.name || ""
+                }
+
                 ColumnLayout {
                   id: chatCol
-                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.left: rowAvatar.right; anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.md
                   spacing: Style.spacing.xxs
@@ -988,6 +1081,12 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.spacing.md
+                Avatar {
+                  acc: root.curAcc
+                  target: root.curJid
+                  name: root.curName
+                  size: 32
+                }
                 Text {
                   textFormat: Text.PlainText
                   text: root.curName
