@@ -90,7 +90,10 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
 ## The chat window
 
 Open it with **SUPER+ALT+W** or by clicking the counter in the bar (which
-opens it on **No leídos**). It is an overlay window with a chat list on the
+opens it on **No leídos**). It is a normal app window ("Omarchy WhatsApp"):
+Hyprland tiles it, you can move it to any workspace or keep it next to
+another app, and SUPER+W closes it. Opening it again while it is open just
+focuses it. It has a chat list on the
 left (search box, and the tabs **Todos / No leídos / Trabajo / Personal /
 Contactos**) and the conversation on the right.
 
@@ -107,7 +110,7 @@ The shortcut lives in your own `~/.config/hypr/bindings.lua`; `install.sh`
 does not add it. Add:
 
 ```lua
-o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell toggle io.github.cristosolar.waassistant '{}'")
+o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell summon io.github.cristosolar.waassistant '{}'")
 ```
 
 In a conversation:
@@ -836,7 +839,7 @@ can take up to 20 seconds, so this window is real.
 out and cleared only when the outcome is definite: wuzapi confirmed the
 send, answered with an error, or refused the connection (nothing was
 listening, so nothing left). A timeout or a dropped connection leaves it,
-and so does closing the window mid-send (Esc, ✕ or the bar button), which
+and so does closing the window mid-send (SUPER+W or ✕), which
 kills `wa-reply` before it can write anything. A chat that also has a
 queue entry keeps the same guard on that entry's status instead. The chat
 window shows:

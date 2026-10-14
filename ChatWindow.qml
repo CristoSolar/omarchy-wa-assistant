@@ -6,7 +6,6 @@ import QtQuick.Layouts
 import QtMultimedia
 import Quickshell
 import Quickshell.Io
-import Quickshell.Wayland
 import qs.Ui
 import qs.Commons
 
@@ -55,6 +54,10 @@ Item {
     if (p && typeof p.filter === "string"
         && ["all", "unread", "trabajo", "personal", "contacts"].indexOf(p.filter) !== -1)
       root.filter = p.filter
+    // Summoned while open (shortcut, bar, notification): bring it forward,
+    // wherever it is, instead of closing it.
+    if (root.opened)
+      Quickshell.execDetached(["hyprctl", "dispatch", 'hl.dsp.focus({ window = "title:^Omarchy WhatsApp$" })'])
     root.opened = true
     root.loadChats()
     root.loadContacts()
@@ -684,27 +687,24 @@ Item {
   }
 
   // ---- the window ------------------------------------------------------
-  PanelWindow {
+  // A normal app window: Hyprland tiles it, it moves between workspaces and
+  // sits next to other apps. Closing it (SUPER+W, ✕) unloads the plugin.
+  FloatingWindow {
     id: window
+    title: "Omarchy WhatsApp"  // unique: open() focuses it by this title
     visible: root.opened
     implicitWidth: 1040
     implicitHeight: 760
-    color: "transparent"
-    WlrLayershell.namespace: "omarchy-wa-chat"
-    WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
-    exclusionMode: ExclusionMode.Ignore
+    minimumSize: Qt.size(640, 480)
+    color: root.bg
+
+    onVisibleChanged: if (!visible && root.opened) root.requestClose()
 
     Rectangle {
       id: content
       anchors.fill: parent
       color: root.bg
-      radius: Style.cornerRadius
-      border.width: Math.max(1, Style.space(2))
-      border.color: Color.popups.border
       focus: true
-
-      Keys.onEscapePressed: root.requestClose()
 
       ColumnLayout {
         anchors.fill: parent
@@ -794,7 +794,7 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               onTextChanged: root.search = text
-              Keys.onEscapePressed: root.requestClose()
+              Keys.onEscapePressed: text = ""
             }
 
             Flow {
@@ -1268,7 +1268,6 @@ Item {
                     selectByMouse: true
                     readOnly: root.sending || root.drafting
                     background: null
-                    Keys.onEscapePressed: root.requestClose()
                     Keys.onPressed: function(event) {
                       if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
                       if (event.modifiers & Qt.ShiftModifier) return  // newline

@@ -96,7 +96,10 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
 ## La ventana de chat
 
 Se abre con **SUPER+ALT+W** o tocando el contador de la barra (que la abre
-en **No leídos**). Es una ventana superpuesta con la lista de chats a la
+en **No leídos**). Es una ventana de app normal ("Omarchy WhatsApp"):
+Hyprland la acomoda en mosaico, la podés mover a cualquier escritorio o
+dejarla al lado de otra app, y SUPER+W la cierra. Si ya está abierta,
+abrirla de nuevo solo la enfoca. Tiene la lista de chats a la
 izquierda (caja de búsqueda y las pestañas **Todos / No leídos / Trabajo /
 Personal / Contactos**) y la conversación a la derecha.
 
@@ -113,7 +116,7 @@ El atajo vive en tu propio `~/.config/hypr/bindings.lua`; `install.sh` no
 lo agrega. Agregalo así:
 
 ```lua
-o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell toggle io.github.cristosolar.waassistant '{}'")
+o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell summon io.github.cristosolar.waassistant '{}'")
 ```
 
 En una conversación:
@@ -892,8 +895,8 @@ hasta 20 segundos, así que esa ventana es real.
 petición y se borra solo cuando el resultado es seguro: wuzapi confirmó el
 envío, respondió con un error, o rechazó la conexión (no había nadie
 escuchando, así que no salió nada). Un timeout o una conexión cortada la
-dejan puesta, y también cerrar la ventana a mitad del envío (Esc, ✕ o el
-botón de la barra), que mata a `wa-reply` antes de que pueda escribir
+dejan puesta, y también cerrar la ventana a mitad del envío (SUPER+W o
+✕), que mata a `wa-reply` antes de que pueda escribir
 nada. Un chat que además tiene entrada en la cola guarda la misma
 protección en el estado de esa entrada. La ventana de chat muestra:
 

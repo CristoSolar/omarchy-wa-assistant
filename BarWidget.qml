@@ -53,7 +53,7 @@ BarWidget {
     text: root.bridgeOk ? "WA " + root.pending : "WA ✕"
     active: !root.bridgeOk
     onPressed: function(b) {
-      Quickshell.execDetached(["omarchy-shell", "shell", "toggle", root.moduleName,
+      Quickshell.execDetached(["omarchy-shell", "shell", "summon", root.moduleName,
                                '{"filter":"unread"}'])
     }
   }
