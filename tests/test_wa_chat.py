@@ -273,5 +273,15 @@ def test_a_locked_db_during_retry_does_not_abort_the_listing():
         assert len(readstate.load(d)["pending"]) == 1  # retried on the next list
 
 
+def test_a_pairing_dump_below_the_account_baseline_is_not_unread():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "dump"); db.add("5692@s.whatsapp.net", "dump")
+        readstate.baseline_account(d, d, "personal", "omarchy")
+        assert [c["unread"] for c in _chats(d)] == [0, 0]
+        db.add(DM, "nuevo")
+        assert {c["jid"]: c["unread"] for c in _chats(d)}[DM] == 1
+
+
 if __name__ == "__main__":
     run(dict(globals()))

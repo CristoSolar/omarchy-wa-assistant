@@ -21,16 +21,22 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sink import accounts as accounts_mod, contacts, history, store  # noqa: E402
+from sink.events import PLACEHOLDERS  # noqa: E402
 
 PLUGIN_ID = "io.github.cristosolar.waassistant"
 BODY_MAX = 80
 RETRY_SECONDS = 30
+# A row whose own time is older than this is not news: a pairing dumps the
+# whole history with ids above the cursor and IsFromMe=false.
+MAX_AGE = 600
 ATTACHMENTS = {"image": "📷 Foto", "audio": "🎤 Audio", "video": "🎥 Video",
-               "sticker": "Sticker", "document": "📎 Archivo"}
+               "sticker": "Sticker", "document": "📎 Archivo",
+               "ubicación": "📍 Ubicación", "contacto": "👤 Contacto"}
 
 
 def _bare(jid):
@@ -47,8 +53,19 @@ def should_notify(msg, account, jid, *, enabled_groups, focused, our_ids):
     return any(_bare(m) in our_ids for m in msg.get("mentions") or [])
 
 
+def fresh(msg, now) -> bool:
+    """False only for a row provably older than MAX_AGE (Info.Timestamp)."""
+    try:
+        return now - datetime.fromisoformat(msg["ts"]).timestamp() <= MAX_AGE
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
 def body(msg):
-    text = msg["text"] or ATTACHMENTS.get((msg.get("attachment") or {}).get("type"), "")
+    label = ATTACHMENTS.get((msg.get("attachment") or {}).get("type"), "")
+    text = msg["text"]
+    if label and (not text or text in PLACEHOLDERS.values()):
+        text = label
     return text if len(text) <= BODY_MAX else text[:BODY_MAX - 1] + "…"
 
 
@@ -97,7 +114,7 @@ def _title(d, wuzdata, acc, jid, msg):
     return contacts.display_name(wuzdata, acc["wuzapi_user"], jid, msg["push_name"])
 
 
-def process(d, wuzdata, cursor, notifier):
+def process(d, wuzdata, cursor, notifier, now=None):
     """Notify for rows after cursor["id"], advancing it as each row is consumed.
 
     A row that blows up is skipped (the cursor already passed it) and a
@@ -118,7 +135,7 @@ def process(d, wuzdata, cursor, notifier):
         cursor["id"] = max(cursor["id"], msg["id"])
         try:
             acc = next((a for a in accts if uids.get(a["wuzapi_user"]) == uid), None)
-            if acc is None:
+            if acc is None or not fresh(msg, now):
                 continue
             if acc["id"] not in ours:
                 ours[acc["id"]] = contacts.our_ids(wuzdata, acc["wuzapi_user"])

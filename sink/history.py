@@ -153,6 +153,8 @@ def read_ids_upto(conn, uid, jid, top, limit) -> list:
 def last_id(conn, uid=None, jid=None) -> int:
     if uid is None:
         row = conn.execute("SELECT MAX(id) FROM message_history").fetchone()
+    elif jid is None:
+        row = conn.execute("SELECT MAX(id) FROM message_history WHERE user_id = ?", (uid,)).fetchone()
     else:
         row = conn.execute("SELECT MAX(id) FROM message_history WHERE user_id = ? AND chat_jid = ?",
                            (uid, jid)).fetchone()

@@ -201,6 +201,8 @@ def _extract_echo_literals(text):
 #     terminal by flowing through this script's own stderr and is now
 #     captured (once, instead of the two runs the --json path used to do)
 #     and re-printed verbatim.
+# A third came with the read baseline a finished pairing raises: the
+# warning when it could not be raised (new output, nothing reworded).
 EXPECTED_HUMAN_ECHOES = [
     "error: could not load $WA_COMMON — wa-pair cannot run without it.",
     "$TOKEN_VAR_ERR",
@@ -224,6 +226,7 @@ EXPECTED_HUMAN_ECHOES = [
     "      -d '{\\\"webhookurl\\\":\\\"$WEBHOOK_URL\\\",\\\"events\\\":[\\\"Message\\\",\\\"ReadReceipt\\\"]}'",
     "  then confirm with: curl -s $API/webhook -H 'token: \\$$TOKEN_VAR'",
     "webhook confirmed: $WEBHOOK_URL",
+    "warning: read baseline not raised for $ACCOUNT_ID: $BASELINE_ERR",
     "timed out waiting for the link",
 ]
 
@@ -640,6 +643,17 @@ def test_wa_heal_rewrites_the_subscription_not_just_the_url():
     assert '\\"events\\":[\\"Message\\",\\"ReadReceipt\\"]' in WA_HEAL, (
         "wa-heal must re-assert ReadReceipt too, not just the webhook URL"
     )
+
+
+def test_wa_pair_raises_the_read_baseline_before_done_and_never_fails_on_it():
+    """A pairing dumps the account's history with IsFromMe=false and ids
+    above `since`; without a baseline every dumped chat shows unread."""
+    after = WA_PAIR[WA_PAIR.index('"history":100000'):]
+    call = after[:after.index("emit_terminal done")]
+    assert "readstate.baseline_account(" in call
+    # Under set -e a bare failing python3 would abort with the account
+    # already linked; `if !` keeps it a warning.
+    assert re.search(r"if ! \w+=\$\(python3 -c '[^']*readstate\.baseline_account\(", call), call
 
 
 if __name__ == "__main__":

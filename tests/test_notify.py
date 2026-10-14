@@ -73,6 +73,14 @@ def test_body_attachments():
     assert wn.body(_msg(text="", attachment={"type": "audio", "downloadable": True})) == "🎤 Audio"
     assert wn.body(_msg(text="", attachment={"type": "document", "downloadable": True})) == "📎 Archivo"
     assert wn.body(_msg(text="mira", attachment={"type": "image", "downloadable": True})) == "mira"
+    assert wn.body(_msg(text="", attachment={"type": "ubicación", "downloadable": False})) == "📍 Ubicación"
+    assert wn.body(_msg(text="", attachment={"type": "contacto", "downloadable": False})) == "👤 Contacto"
+
+
+def test_body_of_a_real_attachment_row_uses_the_label_not_the_placeholder():
+    # history gives an uncaptioned image the text "[imagen]"
+    assert wn.body(_msg(text="[imagen]", attachment={"type": "image", "downloadable": True})) == "📷 Foto"
+    assert wn.body(_msg(text="[ubicación]", attachment={"type": "ubicación", "downloadable": False})) == "📍 Ubicación"
 
 
 class Fake:
@@ -83,6 +91,9 @@ class Fake:
         if text == self.fail_on:
             raise OSError("notify-send gone")
         self.shown.append((key, text))
+
+
+NOW = 1791939939.0  # tests.test_history's default Info.Timestamp, 2026-10-13T22:05:39-03:00
 
 
 def _setup(d):
@@ -104,7 +115,7 @@ def test_a_row_that_raises_does_not_stall_later_rows_and_cursor_passes_it():
         wn.should_notify = flaky
         try:
             cur, n = {"id": 0}, Fake()
-            wn.process(d, d, cur, n)
+            wn.process(d, d, cur, n, now=NOW)
         finally:
             wn.should_notify = real
         assert [t for _, t in n.shown] == ["uno", "tres"]
@@ -116,9 +127,9 @@ def test_a_failing_show_does_not_repeat_or_block_other_chats():
         db = _setup(d)
         db.add(DM, "uno"); last = db.add("5692@s.whatsapp.net", "dos")
         cur, n = {"id": 0}, Fake(fail_on="uno")
-        wn.process(d, d, cur, n)
+        wn.process(d, d, cur, n, now=NOW)
         assert [t for _, t in n.shown] == ["dos"] and cur["id"] == last
-        wn.process(d, d, cur, n)
+        wn.process(d, d, cur, n, now=NOW)
         assert len(n.shown) == 1
 
 
@@ -128,8 +139,21 @@ def test_a_status_post_never_notifies():
         db.add("status@broadcast", "mi estado", sender="56933@s.whatsapp.net")
         last = db.add(DM, "hola")
         cur, n = {"id": 0}, Fake()
-        wn.process(d, d, cur, n)
+        wn.process(d, d, cur, n, now=NOW)
         assert [(k[1], t) for k, t in n.shown] == [(DM, "hola")] and cur["id"] == last
+
+
+def test_rows_older_than_ten_minutes_never_notify_and_the_cursor_passes_them():
+    # A pairing dumps the whole history with IsFromMe=false and ids above
+    # the cursor; none of it is news.
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "viejo", ts="2026-10-13T21:55:38-03:00")      # 10 min 1 s
+        db.add("5692@s.whatsapp.net", "reciente", ts="2026-10-13T21:56:39-03:00")
+        last = db.add("5693@s.whatsapp.net", "rara", ts="no es una fecha")
+        cur, n = {"id": 0}, Fake()
+        wn.process(d, d, cur, n, now=NOW)
+        assert sorted(t for _, t in n.shown) == ["rara", "reciente"] and cur["id"] == last
 
 
 if __name__ == "__main__":

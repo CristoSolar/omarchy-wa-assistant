@@ -271,6 +271,19 @@ for _ in $(seq 1 40); do
       -H "Content-Type: application/json" \
       -d '{"history":100000}' >/dev/null
 
+    # The history WhatsApp dumps into a linked account arrives with
+    # IsFromMe=false and ids above read.json's `since`; without this floor
+    # every dumped chat would show as unread. A failure here is a warning:
+    # the account is linked either way.
+    if ! BASELINE_ERR=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from sink import readstate, store
+readstate.baseline_account(sys.argv[2], store.wuzdata_dir(), sys.argv[3], sys.argv[4])
+' "$ROOT" "$DATA" "$ACCOUNT_ID" "$WUZAPI_USER" 2>&1); then
+      echo "warning: read baseline not raised for $ACCOUNT_ID: $BASELINE_ERR" >&2
+    fi
+
     emit_terminal done
     exit 0
   fi
