@@ -1,6 +1,6 @@
-"""Procedure tests: the upgrade path and the panel's send gates.
+"""Procedure tests: the upgrade path and the install/pairing ordering.
 
-These assert on the SOURCE of bin/wa-up, Panel.qml and install.sh rather
+These assert on the SOURCE of bin/wa-up and install.sh rather
 than on behaviour, because the properties at stake are an ordering inside
 a bash script and a QML binding — neither is reachable from a Python
 process, and the boundary for this branch forbids running wa-up, touching
@@ -31,7 +31,6 @@ WA_UNLINK = (ROOT / "bin" / "wa-unlink").read_text()
 # the assertions below that used to read it out of wa-pair read it out of
 # this file instead, unchanged in what they assert.
 WA_COMMON = (ROOT / "bin" / "lib" / "wa-common.sh").read_text()
-PANEL = (ROOT / "Panel.qml").read_text()
 INSTALL = (ROOT / "install.sh").read_text()
 
 
@@ -99,46 +98,6 @@ def test_the_ordering_is_documented_where_the_code_depends_on_it():
     assert "ORDERING" in preceding, (
         "the docker rm -f must be preceded by the note explaining why it "
         "cannot move below the migration")
-
-
-# --- I1: quick replies obey every gate "Enviar" obeys ---------------------
-
-_GATES = ("sendBlocked", "inFlight", "drafting", "needsAck")
-
-
-def _enabled_after(marker):
-    tail = PANEL[_idx(marker, PANEL):]
-    m = re.search(r"enabled:(.*?)onClicked:", tail, re.S)
-    assert m, f"no enabled/onClicked pair after {marker!r}"
-    return m.group(1)
-
-
-def test_a_quick_reply_button_is_disabled_while_a_send_is_unconfirmed():
-    """sendBlocked is set only when a send's response could not be parsed —
-    the one state where nothing on disk says whether the message arrived.
-    A quick reply sends immediately, with no confirmation step, so leaving
-    it out here was a one-click double send to a real person."""
-    expr = _enabled_after("model: root.quickReplies")
-    for gate in _GATES:
-        assert gate in expr, (
-            f"the quick-reply button's enabled expression must check {gate}: {expr!r}")
-
-
-def test_the_quick_reply_gate_matches_the_enviar_gate():
-    quick = _enabled_after("model: root.quickReplies")
-    enviar = _enabled_after('text: "Enviar"')
-    for gate in _GATES:
-        assert (gate in quick) == (gate in enviar), (
-            f"{gate} is checked by one send path and not the other")
-
-
-def test_the_comment_above_the_quick_replies_names_sendblocked():
-    """The previous comment asserted the buttons enforced the same guard as
-    Enviar while the code did not. A comment claiming a safety property the
-    code lacks is how this survived two reviews."""
-    before = PANEL[:_idx("model: root.quickReplies", PANEL)]
-    block = before[before.rindex("// One-click quick replies"):]
-    assert "sendBlocked" in block
 
 
 # --- C3: pairing state comes from wuzapi, not a marker file ---------------

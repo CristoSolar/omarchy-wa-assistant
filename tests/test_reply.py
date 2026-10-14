@@ -715,7 +715,7 @@ def _run_cmd_accounts(d):
 
 
 def test_accounts_prints_id_and_label_for_every_configured_account():
-    # Panel.qml labels each queue entry's `account` id (list badge, and the
+    # ChatWindow.qml labels each queue entry's `account` id (list badge, and the
     # "sale desde" line) by asking this, rather than the entry carrying a
     # denormalised copy of the label that a later rename could disagree
     # with.

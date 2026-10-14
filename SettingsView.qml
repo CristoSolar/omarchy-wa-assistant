@@ -10,9 +10,9 @@ import qs.Commons
 // The settings screen: list accounts, link a new one, unlink one behind a
 // typed confirmation, and edit each account's tone and quick replies.
 //
-// Embedded as a plain child of Panel.qml (not a Loader), so it is never
+// Embedded as a plain child of ChatWindow.qml (not a Loader), so it is never
 // destroyed while a link or unlink is mid-flight — toggling the gear only
-// changes `visible`, the same technique the queue/detail split in Panel.qml
+// changes `visible`, the same technique the queue/detail split in ChatWindow.qml
 // already uses. This is deliberate: a pairing run takes a while, and the
 // person may close the panel to do something else while it waits. The Process instances below keep running regardless.
 //

@@ -2,10 +2,10 @@
 
 *[Leer en español](README.es.md)*
 
-An Omarchy bar widget that queues incoming WhatsApp messages and drafts
-replies with Claude. You give the idea in one line ("tell them I'm running
+An Omarchy bar widget and chat window for WhatsApp: it shows your chats and
+their full history, and drafts replies with Claude. You give the idea in one line ("tell them I'm running
 late"), Claude writes the message in the chat's own context, and nothing is
-sent until you press **Enviar** — the panel starts every install in a
+sent until you press **Enviar** — the plugin starts every install in a
 dry-run mode that never touches the network.
 
 ## Read this before you pair anything
@@ -31,22 +31,24 @@ is not. Decide account by account whether the convenience is worth it, with
 this in mind for each one you add — the tool will let you pair as many
 numbers as you want, but it will not tell you which ones are worth the risk.
 
-There's a second thing to know before you pair: linking a device makes
-WhatsApp dump the account's *entire* message history into wuzapi's local
-SQLite database, unencrypted. In an earlier test that was on the order of
-15,000 messages. The setting that looks like it should stop this,
-`days_to_sync_history`, does not — set to `0` it means "WhatsApp's default,"
-not "none." `wa-pair` handles this for you (see "Pairing" below), but you
-should understand that it's happening and why it takes a minute.
+There's a second thing to know before you pair, and it changed: this plugin
+now **keeps** your WhatsApp history. wuzapi stores every message it sees in
+its local SQLite database (`users.db`), and the chat window reads from it.
+Earlier versions purged that table on purpose; this one does the opposite
+(the owner's decision, made knowing the cost). **That history is stored on
+disk unencrypted**, for every account you link, including what third parties
+wrote to you, up to 100,000 messages per account. If you don't want that,
+this plugin is not for you. History starts from the moment this was turned
+on: older messages are not there (see "What is not in v1" below).
 
 ## What it does, in short
 
 ```
 WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docker, private network)
                                                               │ writes queue.json, per-chat
-                                                              │ context, purges history
+                                                              │ context, pokes state/changed
                                                               ▼
-                                              Bar widget ──> Panel: idea → claude -p → draft → Enviar
+                              Bar widget ──> Chat window: read history, reply, or idea → claude -p → draft
 ```
 
 - **wuzapi** is the only piece that speaks to WhatsApp. It's published on
@@ -71,26 +73,72 @@ WhatsApp ──> wuzapi (Docker, loopback only) ──webhook──> sink (Docke
   guarantee, not a limitation: answering a client from your personal number
   because something defaulted wrong is exactly the failure this closes by
   construction.
-- **The bar widget and panel** (`BarWidget.qml`, `Panel.qml`) show pending
-  chats, let you type the idea, call `claude -p` to draft a reply against
+- **The bar widget and chat window** (`BarWidget.qml`, `ChatWindow.qml`) show
+  your chats and let you type the idea, call `claude -p` to draft a reply against
   that chat's own account's tone file (see "Multiple accounts" below), and
-  send it. Picking a chat first opens a short extract of the conversation,
-  with any attachment the pending message carries (a photo shown inline, a
-  voice note playable in place), and only **Responder** moves on to
-  writing — see "The conversation extract" and "Attachments" below. There
-  is one text box: type the idea and press **Redactar** (or
-  Enter) to draft it, then the same box switches to holding the drafted
-  message — editable, with the idea it came from shown above it — and only
-  then does **Enviar** turn on. Each queued chat shows a badge naming which
-  account it belongs to, and once you open one the detail view states
-  plainly which number the reply will go out from.
+  send it. See "The chat window" below for how it works.
+  Every chat names the account it belongs to, and the conversation view
+  states plainly which number a reply will go out from.
 - **`bin/wa-media`** downloads an attachment when you ask to see it, with
   the token of the account the message arrived on, into a local cache —
   **unencrypted**, see "Attachments" below. It has no send path.
-- **The gear (⚙)** opens a settings screen embedded in the same panel: the
+- **The gear (⚙)** opens a settings screen embedded in the chat window: the
   list of configured accounts, linking a new one, unlinking one, editing
   each account's tone and quick replies, and emptying the attachment
   cache — see "Settings screen" below.
+
+## The chat window
+
+Open it with **SUPER+ALT+W** or by clicking the counter in the bar (which
+opens it on **No leídos**). It is an overlay window with a chat list on the
+left (search box, and the tabs **Todos / No leídos / Trabajo / Personal**)
+and the conversation on the right.
+
+The shortcut lives in your own `~/.config/hypr/bindings.lua`; `install.sh`
+does not add it. Add:
+
+```lua
+o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell toggle io.github.cristosolar.waassistant '{}'")
+```
+
+In a conversation:
+
+- History pages in as you scroll up; photos, voice notes and documents work
+  as described under "Attachments".
+- **Enter sends** what you typed — one click, no confirmation step, still
+  subject to dry-run (see "Turning off dry-run").
+- **Ctrl+Enter drafts with Claude**: what you typed is taken as the idea, and
+  the draft lands in the box for you to edit. Drafting never sends.
+- Quick-reply chips sit above the box; "Sale por: <cuenta>" says which number
+  the message will leave from, always the one the chat belongs to.
+- A strip appears when the bridge is offline. The gear opens settings.
+
+**When a chat is marked read.** Only when you click it in the list: that
+sends the read receipt to the phone. Chats the window restores or remembers
+from last time, and chats opened by clicking a notification, are shown but
+**not** marked read. Read markers are kept in `state/read.json`.
+
+If a send's outcome is unknown (timeout, killed mid-request), the window
+refuses to send again in that chat until you confirm you checked WhatsApp;
+see "Sends whose outcome nobody knows".
+
+## Notifications
+
+`install.sh` installs and enables `systemd/wa-notify.service`, a user
+service (`bin/wa-notify`) that raises a desktop notification per incoming
+message — one per chat, replaced by the next message in it. Clicking it opens
+that chat in the window (without marking it read). There is no notification
+for your own messages, for groups you have not enabled unless they mention
+you, or for the chat that is open and focused in the window. The service
+only reads; it never sends.
+
+## What is not in v1
+
+- **Messages older than the moment history was turned on.** Asking the
+  phone for older history did not work. The workaround is to unlink and
+  re-pair the account with `days_to_sync_history` set, which makes WhatsApp
+  dump what it has again.
+- Sending attachments, reactions, editing or deleting messages.
 
 ## Requirements
 
@@ -242,7 +290,7 @@ something this plugin does.
 
 ## Pairing
 
-This can be done from the terminal, exactly as below, or from the panel's
+This can be done from the terminal, exactly as below, or from the chat window's
 settings screen (the gear, ⚙ — "+ Vincular cuenta nueva"), which drives
 this same script under the hood. See "Settings screen" below for what the
 UI path looks like; nothing about the underlying behaviour differs between
@@ -255,7 +303,7 @@ the two.
 `<account-id>` names the account you're pairing — this is what
 `accounts.json` will call this number for the rest of the system: it becomes
 the wuzapi user, the default tone-file name, and the label shown on the
-panel's badges (see "Multiple accounts" below). On a fresh install, pick
+chat window's badges (see "Multiple accounts" below). On a fresh install, pick
 whatever id you like for your first number, e.g.:
 
 ```sh
@@ -278,62 +326,11 @@ rejected id never leaves a half-made account behind.
 
 This prints an 8-digit linking code and tells you where to enter it:
 **WhatsApp > Linked devices > Link device > Link with phone number**. Once
-WhatsApp reports the session as logged in, `wa-pair` does *not* stop there:
-it watches the row count in wuzapi's history table until rows have
-actually appeared and then stopped growing, restarts the sink container
-(which purges that table on startup), polls until the purge finishes, and
-then checks that the table is really empty. Expect this whole step to take
-a couple of minutes after you enter the code — that's the history dump
-arriving and being cleared, not a hang.
-
-There are exactly three things it can tell you, and they mean different
-things.
-
-**1. It worked.**
-
-```
-linked.
-waiting for WhatsApp to finish sending history...
-history purged: 14832 row(s) seen for trabajo, table now empty.
-```
-
-**2. It did not work.**
-
-```
-WARNING: history may NOT have been fully cleared.
-  History was still arriving when purge ran: settled=False
-  Rows seen for trabajo before restart: 9021, rows remaining (all accounts): 342
-  Please run 'docker restart omarchy-wa-sink' in a minute and check again.
-```
-
-Do exactly that: wait a minute, run `docker restart omarchy-wa-sink`
-yourself, and re-check. The sink purges the history table every time it
-starts, so a second restart after the dump has actually finished should
-leave the table empty. Don't consider pairing done until you've confirmed
-that. Note that the row count remaining is across **every** account's
-history, not just the one you just paired — the purge itself always empties
-the whole shared table.
-
-**3. It cannot tell.**
-
-```
-history: no rows for trabajo were ever observed in wuzapi's
-  message_history table. That may mean this account has no
-  history to sync, or it may mean WhatsApp had not started
-  sending it yet. This run cannot tell which. Nothing was
-  confirmed purged for this account, because nothing was ever seen.
-```
-
-This is **not** a success message, even though the command exits 0.
-`loggedIn` flips at the end of the pairing handshake, *before* whatsmeow
-starts streaming history, so an empty table is genuinely ambiguous and
-nothing in the database can resolve it. If you want certainty, wait a few
-minutes and then:
-
-```sh
-docker restart omarchy-wa-sink
-docker logs omarchy-wa-sink   # look for the "purged N history rows" line
-```
+WhatsApp reports the session as logged in, `wa-pair` confirms the webhook
+stuck and sets wuzapi's history to keep up to 100,000 messages for the
+account (`wa-heal` re-asserts the same setting on its timer). It does
+**not** purge anything: whatever WhatsApp sends of the history during
+linking stays in `users.db`, unencrypted, and is what the chat window shows.
 
 ## Multiple accounts
 
@@ -355,7 +352,7 @@ in `~/.local/share/omarchy-wa/state/accounts.json`, a JSON list. Each entry
 has:
 
 - `id` — the account id you gave `wa-pair`.
-- `label` — shown on the panel's badges and in the "sale desde" line;
+- `label` — shown on the chat window's badges and in the "sale desde" line;
   defaults to the id with underscores turned into spaces and title-cased
   (`trabajo` → `Trabajo`), and you can edit it to anything you like.
 - `wuzapi_user` — the name of the wuzapi user this account maps to; this is
@@ -365,15 +362,15 @@ has:
   the instructions `claude -p` is given when drafting a reply for this
   account. Edit `agents/<that file>` to change how this account replies.
 - `quick_replies` — this account's own one-click reply texts, a plain list
-  of strings shown as buttons in the panel when a chat from this account is
+  of strings shown as buttons in the chat window when a chat from this account is
   open. Edit this array by hand to add, change or remove one; no restart
-  needed, the panel re-reads it (via `wa-reply quick`) every time you open a
+  needed, the chat window re-reads it (via `wa-reply quick`) every time you open a
   chat.
 
 To rename an account's label, edit its entry in `accounts.json` directly and
 save — there's no command for this today. Its tone and quick replies can
 also be hand-edited the same way (the file named in its `agent` field, and
-its `quick_replies` array respectively), or edited through the panel's
+its `quick_replies` array respectively), or edited through the chat window's
 settings screen (the gear, ⚙ — see "Settings screen" below), which reads and
 writes the exact same files via `wa-reply tone-get`/`tone-set` and
 `quick-get`/`quick-set`. Neither is a separate storage layer; the screen is
@@ -388,7 +385,7 @@ scenario where the same JID needs different enablement per account, so
 splitting this setting per account would only add a place for the same
 JID to disagree with itself.
 
-**In the panel:** each queued chat in the list carries a small badge naming
+**In the chat window:** each queued chat in the list carries a small badge naming
 the account it arrived on, and once you open a chat, the detail view states
 plainly which number the reply will go out on ("La respuesta va a salir
 desde: …") — never a choice, since a reply always leaves by the number it
@@ -440,15 +437,15 @@ redoing finished steps or losing anything.
 
 ## Settings screen
 
-The gear (⚙) in the panel's top-right corner opens a settings screen
-embedded in the same panel; the same button, now labelled "Volver", closes
+The gear (⚙) in the chat window's top-right corner opens a settings screen
+embedded in the chat window; the same button, now labelled "Volver", closes
 it and returns to the message queue exactly where you left it. It lists
 every configured account, and from there you can link a new one, edit an
 existing account's tone or quick replies, or unlink it. It never sends a
 message — there is no send path in the settings screen at all, only
 `wa-pair`/`wa-unlink`/`wa-reply`'s read and write subcommands for tone and
 quick replies — and it keeps running a link or an unlink in the background
-even if you close the settings screen or the whole panel while one is
+even if you close the settings screen or the whole chat window while one is
 mid-flight.
 
 Above the account list, a "Caché de adjuntos" box shows how much disk the
@@ -466,25 +463,10 @@ mode and shows its progress one stage at a time:
 2. **The code** — the same 8-digit linking code `wa-pair` prints on the
    terminal, shown large, with the same instructions: WhatsApp > Linked
    devices > Link device > Link with phone number.
-3. **Linked. Confirming the webhook…**
-4. **Waiting for WhatsApp to finish sending the history** — the
-   history-dump wait described under "Pairing" above. This can take
-   several minutes; the screen says so and stays open. Nothing is wrong if
-   it sits here a while.
-5. One of the same three history outcomes `wa-pair` always reports (see
-   "Pairing" above), shown as plain text rather than something you have to
-   parse from a terminal:
-   - **purged and verified** — history was seen and confirmed cleared;
-   - **rows remaining** — history may not be fully cleared, shown as a
-     warning, with the same "restart the sink and check again" guidance;
-   - **never saw a row** — also shown as a warning, never as success. This
-     is honest uncertainty, not a confirmed empty result: it can mean this
-     account has no history, or that WhatsApp simply hadn't started
-     sending it yet, and the screen says exactly that rather than picking
-     one.
+3. **Linked. Confirming the webhook…**, then the screen reports done.
 
 If `wa-pair` is killed mid-run (a bar restart, a crash) before it reports
-any of the three, the screen says so plainly instead of guessing — it does
+its final result, the screen says so plainly instead of guessing — it does
 not know whether the account ended up linked, and tells you to check by
 hand (the account list, or `docker logs omarchy-wa-sink`) before retrying.
 
@@ -637,7 +619,7 @@ message. Copy the JID into the array above.
 
 ## Quick replies
 
-The panel's chat detail view shows a row of quick-reply buttons above the
+The chat window's chat detail view shows a row of quick-reply buttons above the
 composer. **Clicking one sends that exact text immediately — there is no
 confirmation step, no undo, and no draft to review first.** It is not a
 shortcut for filling the composer; the message goes out on that click.
@@ -667,69 +649,39 @@ migrated single-account install has its old `quick_replies` (formerly in
 
 To add, edit or remove a quick reply for a given account: edit that
 account's `quick_replies` array in `accounts.json` by hand (add a string,
-change one, or delete one) and save. There's no restart needed — the panel
+change one, or delete one) and save. There's no restart needed — the chat window
 re-reads it from `wa-reply quick` every time you open a chat that belongs
 to that account.
 
-## The conversation extract
+## The per-chat context ring
 
-Picking a chat in the queue does not go straight to the composer. It opens
-an intermediate screen, "Extracto de la conversación", that shows the
-chat's recent messages oldest first: theirs on the left under the
-contact's name, yours on the right under "Vos". **Responder** is the only
-way from there into the composer, and **Volver** goes back to the list;
-the composer's own Volver (or Escape) steps back to the extract, not to
-the list, so leaving mid-draft doesn't lose which chat you had open.
-Reading and writing are separate steps on purpose.
-
-The extract is the same per-chat context ring that drafting uses — at most
-the last 10 messages, per chat, per account (`state/ctx/<account-id>/`,
-see "Where state lives" below) — read through `wa-reply thread <entry-id>`,
-which hands the panel only each message's direction and text. Which side
-a message is on comes from an explicit `direction` mark stored with it,
-never from comparing names: a contact can be called the same as you.
-
-Your side of the conversation gets there one way only: the sink records
-every message WhatsApp reports as sent **by you**, whichever device sent
-it — the phone, WhatsApp Web, ZapZap, or this plugin (whose own sends come
-back to the sink as that same echo; `wa-reply` itself no longer writes to
-the ring). So a dry run never shows up as sent, because nothing was. The
-drafting prompt sees both sides too, labelled "Yo" for yours, so Claude
-writes against the real conversation instead of guessing what you said.
-
-Two things to expect:
-
-- **The ring only holds what happened since the plugin was running.** For
-  a conversation older than that, the extract is empty or nearly so, and
-  the panel says so in place of a blank screen — it is the normal case, not
-  a failure. Nothing is reconstructed from WhatsApp's history (that history
-  is what `wa-pair` and the sink purge, see "Pairing").
-- **What you send is now stored locally**, alongside what you receive: the
-  ring holds up to 10 messages of each chat in both directions, in plain
-  JSON under `state/ctx/`. Unlinking an account removes its ring.
-
-If the chat's last send is unconfirmed (`unknown`/`sending`, see "Sends
-whose outcome nobody knows" below), the warning and its *"Revisé WhatsApp,
-quiero reenviar"* button live on the extract, and **Responder** stays
-disabled until you press it.
+Drafting reads a small per-chat context ring, written by the sink: at most
+the last 10 messages per chat, per account (`state/ctx/<account-id>/`, see
+"Where state lives"), in both directions. Which side a message is on comes
+from an explicit `direction` mark, never from comparing names. Your side of
+it is whatever WhatsApp reports as sent **by you**, from any device,
+including this plugin (whose sends come back as that echo). The drafting
+prompt sees both sides, labelled "Yo" for yours. The chat window itself
+reads the full history from `users.db`, not this ring. Unlinking an account
+removes its ring.
 
 ## Attachments
 
 When someone sends a photo, a voice note, a video, a sticker or a
 document, the queue still shows the placeholder (`[imagen]`, `[audio]`,
-...), and the extract shows an "Adjunto" block for it with a button:
+...), and the conversation shows an "Adjunto" block for it with a button:
 
 - **Images and stickers** — **Ver imagen** downloads it and shows it
-  inline, scaled to the panel's width (and capped in height); it is decoded
+  inline, scaled to the chat window's width (and capped in height); it is decoded
   at roughly the size it's shown, not at full resolution.
 - **Voice notes and audio** — **Reproducir** downloads it and plays it in
-  the panel itself, with play/pause, elapsed/total time and a seek bar.
+  the chat window itself, with play/pause, elapsed/total time and a seek bar.
 - **Video and documents** — **Abrir** downloads it and hands the file to
-  your system viewer with `xdg-open`. The panel waits for `xdg-open`'s exit
+  your system viewer with `xdg-open`. The chat window waits for `xdg-open`'s exit
   code before saying "Se abrió con el visor del sistema."; if it fails,
   it says so and offers the button again.
 - **Locations and contacts** — there is nothing to download (wuzapi has no
-  endpoint for them), and the panel says that instead of showing a button
+  endpoint for them), and the chat window says that instead of showing a button
   that could never work. Same for an attachment whose event arrived missing
   a field the download needs.
 
@@ -737,8 +689,8 @@ A download that fails says why and turns the button into **Reintentar**.
 A file that was in the cache but has since been pruned is reported the
 same way, never as a broken image. Only the attachment on the queue
 entry itself — the latest message in that chat — can be opened; older
-messages in the extract show as their placeholder text. Viewing is the
-whole feature: there is no way to *send* an attachment from the panel.
+messages in the conversation show as their placeholder text. Viewing is the
+whole feature: there is no way to *send* an attachment from the chat window.
 
 **Who downloads.** `bin/wa-media` does, never the sink: the sink still
 holds no credentials. Like `wa-reply`, it takes the account from the queue
@@ -768,9 +720,9 @@ any container.
 
 **These files are stored unencrypted on disk.** That includes photos,
 voice notes and documents sent by third parties who have no idea this
-plugin exists. This project goes out of its way to purge WhatsApp's text
-history; the media cache goes the other way, and that was the owner's
-deliberate choice, made after seeing this exact cost — not an oversight.
+plugin exists. The text history is stored unencrypted too (see the top of this
+README), and that was the owner's deliberate choice, made after seeing this
+exact cost — not an oversight.
 If you don't want it, empty the cache and don't press the buttons.
 
 The cache is bounded:
@@ -798,9 +750,8 @@ that account's media; run `./bin/wa-media clear --account <id>` for that.
 `bin/wa-up` starts wuzapi with `LOG_LEVEL=warn`. Left unset, wuzapi defaults
 to its most verbose level and writes the full text of every message —
 yours and the other party's — into `docker logs omarchy-wuzapi` in
-plaintext. That directly undermines the history purge above: there is
-little point deleting 15,000 rows from SQLite if the same content is
-sitting in the Docker journal instead. `warn` keeps connection problems
+plaintext. Message content in a Docker journal is a second, less visible copy of
+the history, with no paging or cleanup. `warn` keeps connection problems
 visible (failed logins, dropped sessions, the "No webhook set for user"
 warning) while dropping the per-message debug lines that contain content.
 
@@ -829,7 +780,7 @@ docker rm -f omarchy-wuzapi
 
 Every send goes through `bin/wa-reply`, and by default it does nothing but
 report what it *would* have sent. No request ever reaches wuzapi, and
-nothing in the queue changes: the panel shows "DRY RUN — no se envió nada.
+nothing in the queue changes: the chat window shows "DRY RUN — no se envió nada.
 La entrada sigue pendiente en la cola.", the entry stays open, and its
 stored status is left exactly as it was — including an `unknown` or
 `sending` guard, which a dry run must never clear — so you can keep
@@ -860,7 +811,7 @@ reached WhatsApp and nothing recorded the answer:
   can take up to 20 seconds, so this window is real.
 
 Both get the same treatment, because both have the same consequence.
-`wa-reply` records the status on that entry in `queue.json` and the panel
+`wa-reply` records the status on that entry in `queue.json` and the chat window
 shows (wording adjusted for which of the two it was):
 
 > sin confirmación: puede que el mensaje ya se haya enviado — revisá
@@ -872,7 +823,7 @@ That record is durable, and it is what both halves of the protection read:
   `unknown` or `sending` and returns
   `{"ok": false, "needs_ack": true, "status": "...", ...}` unless it is
   called with `--acknowledged`.
-- The panel marks the entry in the queue list itself ("⚠ sin confirmar" or
+- The chat window marks the entry in the queue list itself ("⚠ sin confirmar" or
   "⚠ envío interrumpido"), not just once you open it, and keeps **Enviar**
   disabled until you press *"Revisé WhatsApp, quiero reenviar"*. Pressing
   that is what passes `--acknowledged`.
@@ -880,7 +831,7 @@ That record is durable, and it is what both halves of the protection read:
 
 Closing the popup, restarting the bar, letting the queue refresh, or doing
 a dry run does **not** clear the block — the warning is recomputed from
-what is on disk every time, so it cannot be lost by reopening the panel or
+what is on disk every time, so it cannot be lost by reopening the chat window or
 by pressing Enviar while dry-run is still on. Check WhatsApp yourself to
 see whether the message went out before you acknowledge.
 
@@ -888,7 +839,7 @@ see whether the message went out before you acknowledge.
 
 If someone writes again in the same chat between the moment you open an
 entry and the moment the send is confirmed, the entry is **not** removed —
-it stays in the queue carrying the newer message, and the panel says so:
+it stays in the queue carrying the newer message, and the chat window says so:
 
 > enviado. Llegó un mensaje nuevo en este chat mientras redactabas, así que
 > la entrada sigue en la cola.
@@ -901,11 +852,11 @@ see the last point of the next section.)
 
 A chat leaves the queue in three ways, not just one:
 
-- **You answer it from the panel** and the send is confirmed (with the
+- **You answer it from the chat window** and the send is confirmed (with the
   exception described in the previous section).
 - **You answer it from another device** — the phone, WhatsApp Web,
   ZapZap. WhatsApp reports your own message to every linked device; the
-  sink records it in the extract as yours and removes that chat's entry.
+  sink records it in the context ring as yours and removes that chat's entry.
 - **You read it on another device.** When one of your other devices marks
   the chat as read, WhatsApp sends a read receipt and the sink removes that
   chat's entry — **even if you didn't answer it**. This is deliberate: the
@@ -923,7 +874,7 @@ What is **never** cleared automatically: an entry whose last send is
 `unknown` or `sending` (see "Sends whose outcome nobody knows" above). That
 entry is the only record that a message may already have gone out
 unconfirmed; it stays, untouched, through a read receipt and through a
-message of yours, until you deal with it in the panel.
+message of yours, until you deal with it in the chat window.
 
 A read receipt or own message for a chat with no entry does nothing, and
 one arriving on a number not in `accounts.json` is dropped and logged once.
@@ -967,13 +918,12 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
   receives whatever arrives from the internet, and it has no business
   holding a credential that can send messages as you. It is not
   bind-mounted anywhere.
-- `state/queue.json` — pending messages shown in the panel, each carrying
+- `state/queue.json` — pending messages shown in the chat window, each carrying
   which account it arrived on.
 - `state/accounts.json` — the configured accounts: one entry per number,
   see "Multiple accounts" above.
 - `state/ctx/<account-id>/` — one small JSON file per chat, per account:
-  the last 10 messages in both directions, used when drafting and shown in
-  the extract (see "The conversation extract" above).
+  the last 10 messages in both directions, used when drafting (see "The per-chat context ring" above).
 - `state/config.json` — `groups_enabled` (shared by every account),
   the optional media cache limits `media_cache_max_bytes` and
   `media_cache_max_age_days`, and any other hand-edited, install-wide
@@ -984,8 +934,14 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
   host; emptied with `./bin/wa-media clear` or the settings screen's
   **Vaciar caché** (see "Attachments" above).
 - `wuzdata/` — wuzapi's own SQLite database and session data, bind-mounted
-  into both containers. This is where the history dump lands before
-  `wa-pair`/the sink purge it.
+  into both containers. Its `users.db` holds the full message history
+  (up to 100,000 per account), **unencrypted** and no longer purged: the chat
+  window reads it. It also holds each session's login.
+- `state/read.json` — read markers (row ids) per chat; `state/changed` is
+  touched by the sink on each event so the window and `wa-notify` refresh;
+  `state/focused` is written by the window so `wa-notify` knows which chat
+  you are looking at; `state/chat_unknown.json` records chat sends whose
+  outcome is unknown (see "Sends whose outcome nobody knows").
 
 Three environment variables override these independently, which is the
 point of splitting them: `WA_STATE_ROOT` (the root above), `WA_DATA_DIR`
@@ -1000,7 +956,7 @@ The sink runs as **your** user (`--user "$(id -u):$(id -g)"`), not root, so
 whatever it writes under `state/` is readable by you. Earlier versions ran
 the sink as root, which left `queue.json` and friends root-owned and
 unreadable by you — the queue was full but `wa-reply list`, `wa-status`
-and the panel all reported it as empty, because a permission error and an
+and the chat window all reported it as empty, because a permission error and an
 empty queue looked identical. `wa-up` now detects state files it can't
 read as your user and repairs their ownership automatically before
 (re)starting anything; if it can't (e.g. Docker itself isn't reachable),
@@ -1009,7 +965,7 @@ than leave a broken install running. If you ever see this again, unreadable
 or corrupt state now says so loudly instead of quietly reporting zero:
 `wa-reply list` prints `{"error": "..."}` (never a bare `[]`) and exits
 non-zero, `wa-status` reports `ok: false` (which the bar widget shows as
-`WA ✕`), and the panel shows a red banner instead of an empty list.
+`WA ✕`), and the chat window shows a red banner instead of an empty list.
 
 To wipe everything and start clean:
 

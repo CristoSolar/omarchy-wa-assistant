@@ -2,10 +2,10 @@
 
 *[Read in English](README.md)*
 
-Un widget de barra para Omarchy que encola los mensajes de WhatsApp que
-llegan y redacta respuestas con Claude. Vos das la idea en una línea ("decile
+Un widget de barra y una ventana de chat para Omarchy: muestra tus chats con
+su historial completo y redacta respuestas con Claude. Vos das la idea en una línea ("decile
 que voy a llegar tarde"), Claude escribe el mensaje usando el contexto de ese
-chat, y no se envía nada hasta que apretás **Enviar** — el panel arranca
+chat, y no se envía nada hasta que apretás **Enviar** — el plugin arranca
 cada instalación en modo dry-run, que nunca toca la red.
 
 ## Leé esto antes de emparejar nada
@@ -33,23 +33,25 @@ por cuenta si la comodidad vale el riesgo, teniendo esto en cuenta para
 cada una que agregues — la herramienta te va a dejar emparejar tantos
 números como quieras, pero no te va a decir cuáles valen la pena.
 
-Hay una segunda cosa que hay que saber antes de emparejar: vincular un
-dispositivo hace que WhatsApp vuelque *todo* el historial de mensajes de la
-cuenta en la base SQLite local de wuzapi, sin cifrar. En una prueba
-anterior eso fueron del orden de 15.000 mensajes. La configuración que
-parece que debería evitar esto, `days_to_sync_history`, no lo hace — puesta
-en `0` significa "el valor por defecto de WhatsApp", no "ninguno".
-`wa-pair` se encarga de esto por vos (ver "Emparejar" más abajo), pero
-conviene entender que está pasando y por qué tarda un minuto.
+Hay una segunda cosa que hay que saber antes de emparejar, y cambió: este
+plugin ahora **guarda** tu historial de WhatsApp. wuzapi almacena cada
+mensaje que ve en su base SQLite local (`users.db`) y la ventana de chat
+lee de ahí. Las versiones anteriores purgaban esa tabla a propósito; esta
+hace lo contrario (decisión del dueño, tomada sabiendo el costo). **Ese
+historial queda en disco sin cifrar**, de cada cuenta que vincules,
+incluido lo que te escribieron terceros, hasta 100.000 mensajes por
+cuenta. Si no lo querés, este plugin no es para vos. El historial empieza
+desde el momento en que se activó esto: los mensajes más viejos no están
+(ver "Qué no está en v1" más abajo).
 
 ## Qué hace, en resumen
 
 ```
 WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docker, red privada)
                                                               │ escribe queue.json, contexto
-                                                              │ por chat, purga el historial
+                                                              │ por chat, toca state/changed
                                                               ▼
-                                        Widget de barra ──> Panel: idea → claude -p → borrador → Enviar
+                        Widget de barra ──> Ventana de chat: leer historial, responder, o idea → claude -p → borrador
 ```
 
 - **wuzapi** es la única pieza que habla con WhatsApp. Está publicado solo
@@ -75,28 +77,79 @@ WhatsApp ──> wuzapi (Docker, solo loopback) ──webhook──> sink (Docke
   no una limitación: contestarle a un cliente desde tu número personal
   porque algo tomó un valor por defecto mal es exactamente la falla que
   esto cierra por construcción.
-- **El widget de barra y el panel** (`BarWidget.qml`, `Panel.qml`) muestran
-  los chats pendientes, te dejan escribir la idea, llaman a `claude -p`
-  para redactar una respuesta según el archivo de tono de la cuenta de ese
-  chat (ver "Múltiples cuentas" más abajo) y la envían. Elegir un chat abre
-  primero un extracto corto de la conversación, con el adjunto que traiga
-  el mensaje pendiente (una foto se ve ahí mismo, un audio se reproduce ahí
-  mismo), y recién **Responder** pasa a escribir — ver "El extracto de la
-  conversación" y "Adjuntos" más abajo. Hay una sola caja de
-  texto: escribís la idea y apretás **Redactar** (o Enter) para redactarla;
-  esa misma caja pasa a tener el mensaje redactado — editable, con la idea
-  de la que salió mostrada arriba — y recién ahí se habilita **Enviar**.
-  Cada chat en la cola muestra una etiqueta con la cuenta a la que
-  pertenece, y al abrirlo la vista de detalle dice explícitamente desde qué
-  número va a salir la respuesta.
+- **El widget de barra y la ventana de chat** (`BarWidget.qml`,
+  `ChatWindow.qml`) muestran tus chats y te dejan escribir la idea, llaman
+  a `claude -p` para redactar una respuesta según el archivo de tono de la
+  cuenta de ese chat (ver "Múltiples cuentas" más abajo) y la envían. Ver
+  "La ventana de chat" más abajo. Cada chat dice a qué cuenta pertenece, y
+  la conversación dice explícitamente desde qué número va a salir una
+  respuesta.
 - **`bin/wa-media`** descarga un adjunto cuando pedís verlo, con el token
   de la cuenta por la que llegó el mensaje, a una caché local — **sin
   cifrar**, ver "Adjuntos" más abajo. No tiene ningún camino de envío.
-- **El engranaje (⚙)** abre una pantalla de configuración incrustada en el
-  mismo panel: la lista de cuentas configuradas, emparejar una nueva,
+- **El engranaje (⚙)** abre una pantalla de configuración incrustada en la
+  ventana de chat: la lista de cuentas configuradas, emparejar una nueva,
   desvincular una, editar el tono y las respuestas rápidas de cada cuenta,
   y vaciar la caché de adjuntos — ver "Pantalla de configuración" más
   abajo.
+
+## La ventana de chat
+
+Se abre con **SUPER+ALT+W** o tocando el contador de la barra (que la abre
+en **No leídos**). Es una ventana superpuesta con la lista de chats a la
+izquierda (caja de búsqueda y las pestañas **Todos / No leídos / Trabajo /
+Personal**) y la conversación a la derecha.
+
+El atajo vive en tu propio `~/.config/hypr/bindings.lua`; `install.sh` no
+lo agrega. Agregalo así:
+
+```lua
+o.bind("SUPER + ALT + W", "WhatsApp", "omarchy-shell shell toggle io.github.cristosolar.waassistant '{}'")
+```
+
+En una conversación:
+
+- El historial se va cargando a medida que subís; las fotos, audios y
+  documentos funcionan como se describe en "Adjuntos".
+- **Enter envía** lo que escribiste — un clic, sin paso de confirmación, y
+  sigue sujeto al dry-run (ver "Desactivar el dry-run").
+- **Ctrl+Enter redacta con Claude**: lo que escribiste se toma como la
+  idea y el borrador queda en la caja para que lo edites. Redactar nunca
+  envía.
+- Las respuestas rápidas aparecen como botones sobre la caja; "Sale por:
+  <cuenta>" dice desde qué número va a salir el mensaje, siempre el del
+  chat.
+- Aparece una franja cuando el puente está desconectado. El engranaje abre
+  la configuración.
+
+**Cuándo se marca un chat como leído.** Solo cuando lo tocás en la lista:
+eso manda el acuse de lectura al teléfono. Los chats que la ventana
+restaura o recuerda de la vez anterior, y los que abrís tocando una
+notificación, se muestran pero **no** se marcan como leídos. Los marcadores
+de lectura se guardan en `state/read.json`.
+
+Si el resultado de un envío es desconocido (timeout, proceso cortado a
+mitad), la ventana se niega a volver a enviar en ese chat hasta que
+confirmes que revisaste WhatsApp; ver "Envíos cuyo resultado nadie
+conoce".
+
+## Notificaciones
+
+`install.sh` instala y habilita `systemd/wa-notify.service`, un servicio de
+usuario (`bin/wa-notify`) que muestra una notificación de escritorio por
+cada mensaje entrante — una por chat, reemplazada por el siguiente mensaje
+de ese chat. Al tocarla se abre ese chat en la ventana (sin marcarlo como
+leído). No hay notificación para tus propios mensajes, para grupos que no
+habilitaste salvo que te mencionen, ni para el chat que está abierto y con
+foco en la ventana. El servicio solo lee; nunca envía.
+
+## Qué no está en v1
+
+- **Mensajes anteriores al momento en que se activó el historial.** Pedirle
+  al teléfono el historial viejo no funcionó. El rodeo es desvincular y
+  volver a emparejar la cuenta con `days_to_sync_history`, lo que hace que
+  WhatsApp vuelque de nuevo lo que tiene.
+- Enviar adjuntos, reacciones, editar o borrar mensajes.
 
 ## Requisitos
 
@@ -259,7 +312,7 @@ en sí, no algo que haga este plugin.
 ## Emparejar
 
 Esto se puede hacer desde la terminal, tal cual abajo, o desde la pantalla
-de configuración del panel (el engranaje, ⚙ — "+ Vincular cuenta nueva"),
+de configuración dla ventana de chat (el engranaje, ⚙ — "+ Vincular cuenta nueva"),
 que corre este mismo script por detrás. Ver "Pantalla de configuración" más
 abajo para cómo se ve el camino desde la UI; el comportamiento de fondo no
 cambia entre uno y otro.
@@ -271,7 +324,7 @@ cambia entre uno y otro.
 `<account-id>` nombra la cuenta que estás emparejando — es lo que
 `accounts.json` va a usar para llamar a este número en el resto del
 sistema: se convierte en el usuario de wuzapi, en el nombre por defecto del
-archivo de tono, y en la etiqueta que se muestra en las badges del panel
+archivo de tono, y en la etiqueta que se muestra en las badges dla ventana de chat
 (ver "Múltiples cuentas" más abajo). En una instalación nueva, elegí el id
 que quieras para tu primer número, por ejemplo:
 
@@ -298,63 +351,11 @@ crear.
 Esto imprime un código de vinculación de 8 dígitos y te dice dónde
 ingresarlo: **WhatsApp > Dispositivos vinculados > Vincular un dispositivo
 > Vincular con número de teléfono**. Una vez que WhatsApp reporta la sesión
-como logueada, `wa-pair` no se detiene ahí: vigila la cantidad de filas en
-la tabla de historial de wuzapi hasta que aparezcan filas y después dejen
-de crecer, reinicia el contenedor del sink (que purga esa tabla al
-arrancar), espera a que la purga termine, y recién ahí chequea que la
-tabla haya quedado realmente vacía. Esperá que todo este paso tarde un par
-de minutos después de ingresar el código — es el volcado de historial
-llegando y siendo borrado, no que se colgó.
-
-Hay exactamente tres cosas que te puede decir, y significan cosas
-distintas.
-
-**1. Salió bien.**
-
-```
-linked.
-waiting for WhatsApp to finish sending history...
-history purged: 14832 row(s) seen for trabajo, table now empty.
-```
-
-**2. No salió bien.**
-
-```
-WARNING: history may NOT have been fully cleared.
-  History was still arriving when purge ran: settled=False
-  Rows seen for trabajo before restart: 9021, rows remaining (all accounts): 342
-  Please run 'docker restart omarchy-wa-sink' in a minute and check again.
-```
-
-Hacé exactamente eso: esperá un minuto, corré `docker restart
-omarchy-wa-sink` vos mismo, y volvé a revisar. El sink purga la tabla de
-historial cada vez que arranca, así que un segundo reinicio después de que
-el volcado haya terminado de verdad debería dejar la tabla vacía. No des
-por terminado el emparejamiento hasta confirmar eso. Notá que la cantidad
-de filas restantes es la de **todas** las cuentas juntas, no solo la que
-acabás de emparejar — la purga siempre vacía la tabla entera, que es
-compartida.
-
-**3. No puede saberlo.**
-
-```
-history: no rows for trabajo were ever observed in wuzapi's
-  message_history table. That may mean this account has no
-  history to sync, or it may mean WhatsApp had not started
-  sending it yet. This run cannot tell which. Nothing was
-  confirmed purged for this account, because nothing was ever seen.
-```
-
-Esto **no** es un mensaje de éxito, aunque el comando salga con código 0.
-`loggedIn` se prende al final del handshake de emparejamiento, *antes* de
-que whatsmeow empiece a mandar el historial, así que una tabla vacía es
-genuinamente ambigua y nada en la base puede resolver esa ambigüedad. Si
-querés certeza, esperá unos minutos y después:
-
-```sh
-docker restart omarchy-wa-sink
-docker logs omarchy-wa-sink   # buscá la línea "purged N history rows"
-```
+como logueada, `wa-pair` confirma que el webhook quedó puesto y configura
+el historial de wuzapi para guardar hasta 100.000 mensajes de la cuenta
+(`wa-heal` reafirma el mismo ajuste en su timer). **No** purga nada: lo que
+WhatsApp mande del historial durante la vinculación queda en `users.db`,
+sin cifrar, y es lo que muestra la ventana de chat.
 
 ## Múltiples cuentas
 
@@ -378,7 +379,7 @@ entrada en `~/.local/share/omarchy-wa/state/accounts.json`, una lista JSON.
 Cada entrada tiene:
 
 - `id` — el account id que le diste a `wa-pair`.
-- `label` — se muestra en las badges del panel y en la línea "sale desde";
+- `label` — se muestra en las badges dla ventana de chat y en la línea "sale desde";
   por defecto es el id con los guiones bajos convertidos en espacios y con
   la primera letra de cada palabra en mayúscula (`trabajo` → `Trabajo`), y
   podés cambiarla a lo que quieras.
@@ -390,16 +391,16 @@ Cada entrada tiene:
   respuesta para esta cuenta. Editá `agents/<ese archivo>` para cambiar
   cómo responde esta cuenta.
 - `quick_replies` — las respuestas rápidas propias de esta cuenta, una
-  lista simple de strings que se muestran como botones en el panel cuando
+  lista simple de strings que se muestran como botones en la ventana de chat cuando
   está abierto un chat de esta cuenta. Editá este arreglo a mano para
-  agregar, cambiar o borrar una; no hace falta reiniciar nada, el panel lo
+  agregar, cambiar o borrar una; no hace falta reiniciar nada, la ventana de chat lo
   relee (vía `wa-reply quick`) cada vez que abrís un chat.
 
 Para cambiarle el nombre a una cuenta, editá su entrada en `accounts.json`
 directamente y guardá — hoy no hay un comando para esto. Su tono y sus
 respuestas rápidas también se pueden editar a mano de la misma forma (el
 archivo que indica su campo `agent`, y su array `quick_replies`
-respectivamente), o desde la pantalla de configuración del panel (el
+respectivamente), o desde la pantalla de configuración dla ventana de chat (el
 engranaje, ⚙ — ver "Pantalla de configuración" más abajo), que lee y
 escribe exactamente los mismos archivos vía `wa-reply tone-get`/`tone-set`
 y `quick-get`/`quick-set`. Ninguna de las dos vías es una capa de
@@ -414,7 +415,7 @@ ningún escenario donde el mismo JID necesite habilitación distinta según
 la cuenta, así que separar este ajuste por cuenta solo agregaría un lugar
 donde el mismo JID podría contradecirse a sí mismo.
 
-**En el panel:** cada chat en la cola lleva una pequeña badge con el
+**En la ventana de chat:** cada chat en la cola lleva una pequeña badge con el
 nombre de la cuenta a la que llegó, y una vez que abrís un chat, la vista
 de detalle dice explícitamente por qué número va a salir la respuesta
 ("La respuesta va a salir desde: …") — nunca una elección, porque una
@@ -470,8 +471,8 @@ rehacer pasos ya terminados o perder algo.
 
 ## Pantalla de configuración
 
-El engranaje (⚙) en la esquina superior derecha del panel abre una pantalla
-de configuración incrustada en el mismo panel; el mismo botón, ahora
+El engranaje (⚙) en la esquina superior derecha dla ventana de chat abre una pantalla
+de configuración incrustada en la ventana de chat; el mismo botón, ahora
 rotulado "Volver", la cierra y vuelve a la cola de mensajes exactamente
 donde la dejaste. Lista todas las cuentas configuradas, y desde ahí podés
 emparejar una nueva, editar el tono o las respuestas rápidas de una cuenta
@@ -479,7 +480,7 @@ existente, o desvincularla. Nunca envía un mensaje — no hay ningún camino
 de envío en la pantalla de configuración, solo los subcomandos de lectura y
 escritura de tono y respuestas rápidas de `wa-pair`/`wa-unlink`/`wa-reply`
 — y sigue corriendo un emparejamiento o una desvinculación en segundo plano
-aunque cierres la pantalla de configuración o todo el panel mientras uno
+aunque cierres la pantalla de configuración o todo la ventana de chat mientras uno
 está en curso.
 
 Arriba de la lista de cuentas, un recuadro "Caché de adjuntos" muestra
@@ -498,27 +499,11 @@ de cuenta y un número de teléfono — y después corre `wa-pair` en modo
    terminal, mostrado grande, con las mismas instrucciones: WhatsApp >
    Dispositivos vinculados > Vincular un dispositivo > Vincular con número
    de teléfono.
-3. **Vinculado. Confirmando el webhook…**
-4. **Esperando que WhatsApp termine de mandar el historial** — la espera
-   del volcado de historial descrita en "Emparejar" más arriba. Puede
-   tardar varios minutos; la pantalla lo dice y se queda abierta. No pasa
-   nada raro si tarda un rato acá.
-5. Uno de los mismos tres resultados de historial que `wa-pair` siempre
-   reporta (ver "Emparejar" más arriba), mostrado como texto simple en vez
-   de algo que tengas que interpretar de una terminal:
-   - **purgado y verificado** — se vio historial y se confirmó que quedó
-     vacío;
-   - **quedan filas** — el historial puede no haberse borrado del todo,
-     mostrado como advertencia, con la misma indicación de "reiniciá el
-     sink y volvé a chequear";
-   - **nunca se vio una fila** — también mostrado como advertencia, nunca
-     como éxito. Es incertidumbre honesta, no un resultado vacío
-     confirmado: puede significar que esta cuenta no tiene historial, o que
-     WhatsApp todavía no había empezado a mandarlo, y la pantalla dice
-     exactamente eso en vez de elegir una de las dos.
+3. **Vinculado. Confirmando el webhook…**, y después la pantalla informa
+   que terminó.
 
 Si `wa-pair` se corta a la mitad (un reinicio de la barra, un crash) antes
-de reportar alguno de los tres resultados, la pantalla lo dice claramente
+de reportar su resultado final, la pantalla lo dice claramente
 en vez de adivinar — no sabe si la cuenta terminó vinculada, y te pide que
 lo chequees a mano (la lista de cuentas, o `docker logs omarchy-wa-sink`)
 antes de reintentar.
@@ -680,7 +665,7 @@ mensaje. Copiá el JID al arreglo de arriba.
 
 ## Respuestas rápidas
 
-La vista de detalle del panel muestra una fila de botones de respuesta
+La vista de detalle dla ventana de chat muestra una fila de botones de respuesta
 rápida arriba del cuadro de redacción. **Tocar uno manda ese texto tal
 cual, al instante — no hay confirmación, no hay deshacer, no hay borrador
 para revisar antes.** No es un atajo para llenar el cuadro; el mensaje
@@ -714,83 +699,49 @@ más arriba.
 Para agregar, editar o borrar una respuesta rápida de una cuenta dada:
 editá el arreglo `quick_replies` de esa cuenta en `accounts.json` a mano
 (agregá un string, cambiá uno, o borrá uno) y guardá. No hace falta
-reiniciar nada — el panel lo relee con `wa-reply quick` cada vez que abrís
+reiniciar nada — la ventana de chat lo relee con `wa-reply quick` cada vez que abrís
 un chat que pertenece a esa cuenta.
 
-## El extracto de la conversación
+## El anillo de contexto por chat
 
-Elegir un chat en la cola no te lleva directo al compositor. Abre una
-pantalla intermedia, "Extracto de la conversación", con los mensajes
-recientes del chat, del más viejo al más nuevo: los del otro a la
-izquierda con el nombre del contacto, los tuyos a la derecha con "Vos".
-**Responder** es la única forma de pasar de ahí al compositor, y
-**Volver** vuelve a la lista; el Volver del compositor (o Escape) vuelve
-al extracto, no a la lista, así que salir a mitad de un borrador no te
-hace perder qué chat tenías abierto. Leer y escribir son pasos separados a
-propósito.
-
-El extracto es el mismo anillo de contexto por chat que usa la redacción —
-como mucho los últimos 10 mensajes, por chat y por cuenta
-(`state/ctx/<account-id>/`, ver "Dónde vive el estado" más abajo) — leído
-con `wa-reply thread <entry-id>`, que le pasa al panel solo la dirección y
-el texto de cada mensaje. De qué lado va cada mensaje sale de una marca
-`direction` explícita guardada con él, nunca de comparar nombres: un
-contacto se puede llamar igual que vos.
-
-Tu lado de la conversación llega por un solo camino: el sink registra cada
-mensaje que WhatsApp informa como enviado **por vos**, desde el
-dispositivo que sea — el teléfono, WhatsApp Web, ZapZap o este plugin (sus
-propios envíos le vuelven al sink como ese mismo eco; `wa-reply` ya no
-escribe en el anillo). Por eso un dry run nunca aparece como enviado:
-no se envió nada. El prompt de redacción también ve los dos lados, con
-"Yo" para los tuyos, así que Claude redacta sobre la conversación real en
-vez de adivinar qué dijiste.
-
-Dos cosas para tener en cuenta:
-
-- **El anillo solo tiene lo que pasó desde que el plugin está corriendo.**
-  Para una conversación más vieja, el extracto va a estar vacío o casi, y
-  el panel lo dice en lugar de mostrar una pantalla en blanco — es el caso
-  normal, no una falla. No se reconstruye nada desde el historial de
-  WhatsApp (ese historial es justamente lo que `wa-pair` y el sink purgan,
-  ver "Emparejar").
-- **Lo que mandás ahora queda guardado localmente**, junto con lo que
-  recibís: el anillo guarda hasta 10 mensajes de cada chat en las dos
-  direcciones, en JSON plano bajo `state/ctx/`. Desvincular una cuenta
-  borra su anillo.
-
-Si el último envío del chat quedó sin confirmar (`unknown`/`sending`, ver
-"Envíos cuyo resultado nadie conoce" más abajo), el aviso y su botón
-*"Revisé WhatsApp, quiero reenviar"* están en el extracto, y
-**Responder** queda deshabilitado hasta que lo apretás.
+La redacción lee un anillo de contexto chico por chat, que escribe el
+sink: como mucho los últimos 10 mensajes por chat y por cuenta
+(`state/ctx/<account-id>/`, ver "Dónde vive el estado"), en las dos
+direcciones. De qué lado va cada mensaje sale de una marca `direction`
+explícita, nunca de comparar nombres. Tu lado es todo lo que WhatsApp
+informa como enviado **por vos**, desde cualquier dispositivo, incluido
+este plugin (cuyos envíos vuelven como ese eco). El prompt de redacción ve
+los dos lados, con "Yo" para los tuyos. La ventana de chat en sí lee el
+historial completo de `users.db`, no este anillo. Desvincular una cuenta
+borra su anillo.
 
 ## Adjuntos
 
 Cuando alguien manda una foto, un audio, un video, un sticker o un
 documento, la cola sigue mostrando el marcador (`[imagen]`, `[audio]`,
-...), y el extracto muestra un bloque "Adjunto" con un botón:
+...), y la conversación muestra un bloque "Adjunto" con un botón:
 
 - **Imágenes y stickers** — **Ver imagen** la descarga y la muestra ahí
-  mismo, ajustada al ancho del panel (y con un alto máximo); se decodifica
+  mismo, ajustada al ancho dla ventana de chat (y con un alto máximo); se decodifica
   más o menos al tamaño en que se muestra, no a resolución completa.
 - **Audios y notas de voz** — **Reproducir** lo descarga y lo reproduce en
-  el panel mismo, con pausa, tiempo transcurrido/total y una barra para
+  la ventana de chat mismo, con pausa, tiempo transcurrido/total y una barra para
   adelantar o volver.
 - **Videos y documentos** — **Abrir** lo descarga y le pasa el archivo a
-  tu visor del sistema con `xdg-open`. El panel espera el código de salida
+  tu visor del sistema con `xdg-open`. La ventana de chat espera el código de salida
   de `xdg-open` antes de decir "Se abrió con el visor del sistema."; si
   falla, lo dice y vuelve a ofrecer el botón.
 - **Ubicaciones y contactos** — no hay nada que descargar (wuzapi no tiene
-  endpoint para eso), y el panel lo dice en vez de mostrar un botón que
+  endpoint para eso), y la ventana de chat lo dice en vez de mostrar un botón que
   nunca podría funcionar. Lo mismo para un adjunto cuyo evento llegó sin
   algún campo que la descarga necesita.
 
 Una descarga que falla dice por qué y el botón pasa a **Reintentar**. Un
 archivo que estaba en la caché pero ya se podó se informa igual, nunca
 como una imagen rota. Solo se puede abrir el adjunto de la entrada de la
-cola en sí — el último mensaje de ese chat —; los mensajes anteriores del
-extracto se ven como su texto marcador. Ver es todo lo que hace: no hay
-forma de *mandar* un adjunto desde el panel.
+cola en sí — el último mensaje de ese chat —; los mensajes anteriores de la
+conversación se ven como su texto marcador. Ver es todo lo que hace: no hay
+forma de *mandar* un adjunto desde la ventana de chat.
 
 **Quién descarga.** `bin/wa-media`, nunca el sink: el sink sigue sin
 tener credenciales. Igual que `wa-reply`, toma la cuenta de la entrada de
@@ -820,10 +771,9 @@ que no se monta en ningún contenedor.
 
 **Estos archivos quedan guardados en disco sin cifrar.** Eso incluye
 fotos, audios y documentos que te mandan terceros que no tienen idea de
-que este plugin existe. Este proyecto se esfuerza en purgar el historial
-de texto de WhatsApp; la caché de adjuntos va en la dirección contraria, y
-fue una decisión deliberada del dueño, tomada viendo exactamente este
-costo — no un descuido. Si no la querés, vaciá la caché y no aprietes los
+que este plugin existe. El historial de texto también queda sin cifrar (ver el
+comienzo de este README), y fue una decisión deliberada del dueño, tomada
+viendo exactamente este costo — no un descuido. Si no la querés, vaciá la caché y no aprietes los
 botones.
 
 La caché tiene límites:
@@ -853,9 +803,8 @@ cuenta **no** vacía sus adjuntos; para eso corré
 `bin/wa-up` levanta wuzapi con `LOG_LEVEL=warn`. Sin esa variable, wuzapi
 usa por defecto su nivel más verboso y escribe el texto completo de cada
 mensaje —tuyo y de la otra persona— en `docker logs omarchy-wuzapi` en
-texto plano. Eso anula directamente la purga de historial de arriba: no
-tiene mucho sentido borrar 15.000 filas de SQLite si el mismo contenido
-queda guardado en el journal de Docker. `warn` mantiene visibles los
+texto plano. El contenido de mensajes en un journal de Docker es una segunda
+copia del historial, menos visible y sin paginado ni limpieza. `warn` mantiene visibles los
 problemas de conexión (logins fallidos, sesiones caídas, el warning "No
 webhook set for user") y a la vez descarta las líneas de debug por mensaje
 que contienen el contenido.
@@ -888,7 +837,7 @@ docker rm -f omarchy-wuzapi
 
 Todo envío pasa por `bin/wa-reply`, y por defecto no hace nada más que
 reportar lo que *habría* enviado. Ninguna petición llega a wuzapi y nada
-cambia en la cola: el panel muestra "DRY RUN — no se envió nada. La
+cambia en la cola: la ventana de chat muestra "DRY RUN — no se envió nada. La
 entrada sigue pendiente en la cola.", la entrada queda abierta y su
 estado guardado queda tal cual estaba — incluido un `unknown` o un
 `sending`, que un dry run nunca debe borrar — así que podés seguir
@@ -921,7 +870,7 @@ quizás ya llegó a WhatsApp y nadie registró la respuesta:
 
 Los dos reciben el mismo tratamiento, porque los dos tienen la misma
 consecuencia. `wa-reply` escribe el estado en esa entrada de `queue.json`,
-y el panel muestra (con la redacción ajustada a cuál de los dos fue):
+y la ventana de chat muestra (con la redacción ajustada a cuál de los dos fue):
 
 > sin confirmación: puede que el mensaje ya se haya enviado — revisá
 > WhatsApp antes de reintentar
@@ -933,7 +882,7 @@ protección:
   guardado sea `unknown` o `sending`, y devuelve
   `{"ok": false, "needs_ack": true, "status": "...", ...}` salvo que se lo
   llame con `--acknowledged`.
-- El panel marca la entrada en la lista de la cola ("⚠ sin confirmar" o
+- La ventana de chat marca la entrada en la lista de la cola ("⚠ sin confirmar" o
   "⚠ envío interrumpido"), no solo cuando la abrís, y deja **Enviar**
   deshabilitado hasta que apretés *"Revisé WhatsApp, quiero reenviar"*.
   Apretar eso es lo que pasa `--acknowledged`.
@@ -942,7 +891,7 @@ protección:
 
 Cerrar el popup, reiniciar la barra, dejar que la cola se refresque o hacer
 un dry run **no** levanta el bloqueo: la advertencia se recalcula desde lo
-que hay en disco cada vez, así que no se pierde reabriendo el panel ni
+que hay en disco cada vez, así que no se pierde reabriendo la ventana de chat ni
 apretando Enviar con el dry-run todavía activo. Revisá WhatsApp vos mismo
 para ver si salió antes de confirmar.
 
@@ -950,7 +899,7 @@ para ver si salió antes de confirmar.
 
 Si alguien vuelve a escribir en el mismo chat entre que abrís la entrada y
 que el envío se confirma, la entrada **no** se elimina: queda en la cola
-con el mensaje nuevo, y el panel lo dice:
+con el mensaje nuevo, y la ventana de chat lo dice:
 
 > enviado. Llegó un mensaje nuevo en este chat mientras redactabas, así que
 > la entrada sigue en la cola.
@@ -963,11 +912,11 @@ abajo: ver el último punto de la sección siguiente.)
 
 Un chat sale de la cola de tres formas, no de una sola:
 
-- **Lo contestás desde el panel** y el envío se confirma (con la excepción
+- **Lo contestás desde la ventana de chat** y el envío se confirma (con la excepción
   de la sección anterior).
 - **Lo contestás desde otro dispositivo** — el teléfono, WhatsApp Web,
   ZapZap. WhatsApp le avisa tu propio mensaje a cada dispositivo
-  vinculado; el sink lo registra en el extracto como tuyo y saca la
+  vinculado; el sink lo registra en el anillo de contexto como tuyo y saca la
   entrada de ese chat.
 - **Lo leés en otro dispositivo.** Cuando otro de tus dispositivos marca
   el chat como leído, WhatsApp manda un acuse de lectura y el sink saca la
@@ -987,7 +936,7 @@ Lo que **nunca** se saca solo: una entrada cuyo último envío quedó en
 `unknown` o `sending` (ver "Envíos cuyo resultado nadie conoce" más
 arriba). Esa entrada es el único registro de que un mensaje puede haber
 salido sin confirmación; se queda, intacta, ante un acuse de lectura y
-ante un mensaje tuyo, hasta que la resuelvas en el panel.
+ante un mensaje tuyo, hasta que la resuelvas en la ventana de chat.
 
 Un acuse de lectura o un mensaje tuyo para un chat sin entrada no hace
 nada, y uno que llega por un número que no está en `accounts.json` se
@@ -1033,13 +982,12 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
   sink es el contenedor que recibe lo que llega de internet, y no tiene
   por qué tener una credencial que pueda mandar mensajes en tu nombre. No
   está montado en ningún lado.
-- `state/queue.json` — los mensajes pendientes que se ven en el panel,
+- `state/queue.json` — los mensajes pendientes que se ven en la ventana de chat,
   cada uno con la cuenta a la que llegó.
 - `state/accounts.json` — las cuentas configuradas: una entrada por
   número, ver "Múltiples cuentas" más arriba.
 - `state/ctx/<account-id>/` — un archivo JSON chico por chat, por cuenta:
-  los últimos 10 mensajes en las dos direcciones, usados al redactar y
-  mostrados en el extracto (ver "El extracto de la conversación" más
+  los últimos 10 mensajes en las dos direcciones, usados al redactar (ver "El anillo de contexto por chat" más
   arriba).
 - `state/config.json` — `groups_enabled` (compartido por todas las
   cuentas), los límites opcionales de la caché de adjuntos
@@ -1051,8 +999,15 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
   host; se vacía con `./bin/wa-media clear` o con **Vaciar caché** en la
   pantalla de configuración (ver "Adjuntos" más arriba).
 - `wuzdata/` — la base SQLite y los datos de sesión propios de wuzapi,
-  montados en los dos contenedores. Ahí es donde cae el volcado de
-  historial antes de que `wa-pair`/el sink lo purguen.
+  montados en los dos contenedores. Su `users.db` guarda el historial
+  completo de mensajes (hasta 100.000 por cuenta), **sin cifrar** y ya sin
+  purgar: la ventana de chat lo lee. También guarda el login de cada sesión.
+- `state/read.json` — marcadores de lectura (ids de fila) por chat;
+  `state/changed` lo toca el sink en cada evento para que la ventana y
+  `wa-notify` se refresquen; `state/focused` lo escribe la ventana para que
+  `wa-notify` sepa qué chat estás mirando; `state/chat_unknown.json` anota
+  los envíos de chat de resultado desconocido (ver "Envíos cuyo resultado
+  nadie conoce").
 
 Tres variables de entorno permiten mover cada cosa por separado, que es el
 punto de haberlas separado: `WA_STATE_ROOT` (la raíz de arriba),
@@ -1068,7 +1023,7 @@ El sink corre como **tu** usuario (`--user "$(id -u):$(id -g)"`), no como
 root, así que todo lo que escribe en `state/` queda legible para vos.
 Versiones anteriores corrían el sink como root, lo que dejaba `queue.json`
 y demás archivos con dueño root e ilegibles para vos — la cola tenía
-mensajes reales pero `wa-reply list`, `wa-status` y el panel reportaban
+mensajes reales pero `wa-reply list`, `wa-status` y la ventana de chat reportaban
 todo vacío, porque un error de permisos y una cola vacía se veían
 idénticos. `wa-up` ahora detecta archivos de estado que no puede leer como
 tu usuario y repara el dueño automáticamente antes de (re)iniciar nada; si
@@ -1078,7 +1033,7 @@ rota corriendo. Si esto vuelve a pasar, un estado ilegible o corrupto
 ahora lo dice a los gritos en vez de reportar cero en silencio: `wa-reply
 list` imprime `{"error": "..."}` (nunca un `[]` a secas) y sale con código
 distinto de cero, `wa-status` reporta `ok: false` (que el widget de la
-barra muestra como `WA ✕`), y el panel muestra un aviso rojo en vez de una
+barra muestra como `WA ✕`), y la ventana de chat muestra un aviso rojo en vez de una
 lista vacía.
 
 Para borrar todo y empezar de cero:

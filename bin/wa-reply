@@ -517,7 +517,7 @@ def cmd_list(args):
 def cmd_accounts(args):
     """The configured accounts' `id` and `label` — nothing else.
 
-    Exists so Panel.qml can label a queue entry's `account` field (a
+    Exists so ChatWindow.qml can label a queue entry's `account` field (a
     badge in the list, and the "sale desde" line in the detail view)
     without the queue ever carrying a denormalised copy of the label
     itself. A copy on the entry could disagree with a later rename in
@@ -569,7 +569,7 @@ def cmd_quick(args):
 def cmd_thread(args):
     """The stored context ring of the entry's chat, oldest first.
 
-    Read-only, for the thread-preview screen (Panel.qml, Task 2 of the
+    Read-only, for the thread-preview screen (ChatWindow.qml, Task 2 of the
     2026-09-23 extract plan). Takes the same entry id `draft`/`send`/`quick`
     take, not a jid/account pair, for the same reason `quick` does: the
     panel already knows which queued entry it is showing, and letting a
@@ -994,7 +994,7 @@ def main():
         # root-owned queue.json from before the sink ran as the invoking
         # user) or is not valid JSON. This is a broken install, not an
         # empty queue, and must never look like one: `list` must not print
-        # a bare `[]` (Panel.qml would render that as an empty queue) and
+        # a bare `[]` (ChatWindow.qml would render that as an empty queue) and
         # `draft`/`send` must not look like a normal empty result either.
         # Say so on stderr, where a human running this by hand will see
         # it, and print a JSON object (never an array, never blank) so
