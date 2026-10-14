@@ -128,10 +128,11 @@ restaura o recuerda de la vez anterior, y los que abrís tocando una
 notificación, se muestran pero **no** se marcan como leídos. Los marcadores
 de lectura se guardan en `state/read.json`.
 
-Si el resultado de un envío es desconocido (timeout, proceso cortado a
-mitad), la ventana se niega a volver a enviar en ese chat hasta que
-confirmes que revisaste WhatsApp; ver "Envíos cuyo resultado nadie
-conoce".
+Si el resultado de un envío es desconocido (timeout, conexión cortada, o
+cerraste la ventana con el envío en curso), la ventana se niega a volver a
+enviar en ese chat hasta que confirmes que revisaste WhatsApp; ver "Envíos
+cuyo resultado nadie conoce". Un envío que wuzapi rechazó de entrada (el
+puente está caído) muestra "No salió" y podés reintentarlo sin más.
 
 ## Notificaciones
 
@@ -859,9 +860,15 @@ conexión a mitad, o se mató a `wa-reply` (un reinicio de la barra, un OOM)
 entre empezar el POST y enterarse del resultado. La petición puede tardar
 hasta 20 segundos, así que esa ventana es real.
 
-`wa-reply chat-send` lo anota como una marca por chat en
-`state/chat_unknown.json` (no en ninguna entrada de la cola), y la ventana
-de chat muestra:
+`wa-reply chat-send` se protege con una marca por chat en
+`state/chat_unknown.json`. La marca se escribe **antes** de que salga la
+petición y se borra solo cuando el resultado es seguro: wuzapi confirmó el
+envío, respondió con un error, o rechazó la conexión (no había nadie
+escuchando, así que no salió nada). Un timeout o una conexión cortada la
+dejan puesta, y también cerrar la ventana a mitad del envío (Esc, ✕ o el
+botón de la barra), que mata a `wa-reply` antes de que pueda escribir
+nada. Un chat que además tiene entrada en la cola guarda la misma
+protección en el estado de esa entrada. La ventana de chat muestra:
 
 > Sin confirmación: puede que ya haya salido. Revisá WhatsApp antes de
 > reintentar.

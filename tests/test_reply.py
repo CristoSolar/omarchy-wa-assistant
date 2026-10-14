@@ -1689,5 +1689,117 @@ def test_a_lid_chat_is_still_a_chat():
         assert out == {"ok": True, "dry_run": True}
 
 
+def _marks(d):
+    p = d / "chat_unknown.json"
+    return json.loads(p.read_text()) if p.exists() else []
+
+
+class _Killed(BaseException):
+    """What Esc, the close button or the bar toggle do to an in-flight send."""
+
+
+def test_chat_send_marks_unknown_before_the_request_so_a_kill_keeps_the_guard():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        eid = store.entry_id("personal", DM)
+        seen = []
+        def killed_mid_request(jid, text, token):
+            seen.append(list(_marks(d)))
+            raise _Killed()
+        os.environ["WA_DRY_RUN"] = "0"
+        original, wa.send = wa.send, killed_mid_request
+        try:
+            try:
+                _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+                assert False, "the kill must propagate"
+            except _Killed:
+                pass
+            assert seen == [[eid]] and _marks(d) == [eid]
+            wa.send = _no_network
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out["needs_ack"] is True and out["ok"] is False
+        finally:
+            wa.send = original
+            os.environ.pop("WA_DRY_RUN", None)
+
+
+def test_chat_send_clears_the_mark_on_a_definite_failure_and_after_a_dry_run():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        eid = store.entry_id("personal", DM)
+        original = wa.send
+        try:
+            os.environ["WA_DRY_RUN"] = "0"
+            wa.send = lambda jid, text, token: {"code": 500, "error": "no"}
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out["ok"] is False and "unknown" not in out and _marks(d) == []
+            def refused(jid, text, token):
+                raise wa.SendFailed("refused")
+            wa.send = refused
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out["ok"] is False and "unknown" not in out and _marks(d) == []
+            os.environ.pop("WA_DRY_RUN", None)
+            wa.send = original
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+            assert out == {"ok": True, "dry_run": True} and _marks(d) == []
+            (d / "chat_unknown.json").write_text(json.dumps([eid]))
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=True)
+            assert out == {"ok": True, "dry_run": True} and _marks(d) == [eid]  # a dry run changes nothing
+        finally:
+            wa.send = original
+            os.environ.pop("WA_DRY_RUN", None)
+
+
+def _urlopen_raising(exc):
+    def _f(*a, **k):
+        raise exc
+    return _f
+
+
+def test_post_maps_a_refused_connection_to_a_definite_failure():
+    import urllib.error
+    original = wa.urllib.request.urlopen
+    try:
+        for exc in (urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+                    ConnectionRefusedError(111, "Connection refused")):
+            wa.urllib.request.urlopen = _urlopen_raising(exc)
+            try:
+                wa._post("http://127.0.0.1:8080/chat/send/text", {"Phone": "x", "Body": "y"}, "tok")
+                assert False, "should have raised"
+            except wa.SendOutcomeUnknown:
+                raise AssertionError("a refused connection never reached wuzapi: not unknown")
+            except wa.SendFailed:
+                pass
+        # a reset mid-request is still unknown
+        wa.urllib.request.urlopen = _urlopen_raising(urllib.error.URLError(ConnectionResetError()))
+        try:
+            wa._post("http://127.0.0.1:8080/chat/send/text", {"Phone": "x", "Body": "y"}, "tok")
+        except wa.SendOutcomeUnknown:
+            pass
+    finally:
+        wa.urllib.request.urlopen = original
+
+
+def test_queue_send_on_a_refused_connection_is_failed_not_unknown():
+    import urllib.error
+    with tmpdir() as d:
+        entry = _queue_entry()
+        _enqueue(d, entry)
+        (d / "secrets.env").write_text("WA_TOKEN_PERSONAL=tok\nWA_DRY_RUN=0\n")
+        original = wa.urllib.request.urlopen
+        wa.urllib.request.urlopen = _urlopen_raising(
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")))
+        try:
+            out = _run_cmd_send(d, entry["id"])
+            assert out["ok"] is False and "unknown" not in out
+            assert store.load_queue(d)[0]["status"] == "failed"
+            out = _run_cmd_send(d, entry["id"])  # failed needs no acknowledgement
+            assert "needs_ack" not in out and out["ok"] is False
+        finally:
+            wa.urllib.request.urlopen = original
+
+
 if __name__ == "__main__":
     run(dict(globals()))

@@ -118,9 +118,11 @@ sends the read receipt to the phone. Chats the window restores or remembers
 from last time, and chats opened by clicking a notification, are shown but
 **not** marked read. Read markers are kept in `state/read.json`.
 
-If a send's outcome is unknown (timeout, killed mid-request), the window
-refuses to send again in that chat until you confirm you checked WhatsApp;
-see "Sends whose outcome nobody knows".
+If a send's outcome is unknown (timeout, connection dropped, or the window
+closed while the send was in flight), the window refuses to send again in
+that chat until you confirm you checked WhatsApp; see "Sends whose outcome
+nobody knows". A send wuzapi refused outright (the bridge is down) shows
+"No salió" and can simply be retried.
 
 ## Notifications
 
@@ -803,9 +805,15 @@ connection dropped mid-request, or `wa-reply` was killed (a bar restart, an
 OOM kill) between starting the POST and learning its result. The request
 can take up to 20 seconds, so this window is real.
 
-`wa-reply chat-send` records that as a per-chat mark in
-`state/chat_unknown.json` (not on any queue entry), and the chat window
-shows:
+`wa-reply chat-send` guards against it with a per-chat mark in
+`state/chat_unknown.json`. The mark is written **before** the request goes
+out and cleared only when the outcome is definite: wuzapi confirmed the
+send, answered with an error, or refused the connection (nothing was
+listening, so nothing left). A timeout or a dropped connection leaves it,
+and so does closing the window mid-send (Esc, ✕ or the bar button), which
+kills `wa-reply` before it can write anything. A chat that also has a
+queue entry keeps the same guard on that entry's status instead. The chat
+window shows:
 
 > Sin confirmación: puede que ya haya salido. Revisá WhatsApp antes de
 > reintentar.

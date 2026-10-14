@@ -63,11 +63,16 @@ NEEDS_ACK_MESSAGE = {
 class SendOutcomeUnknown(Exception):
     """The request may or may not have reached wuzapi.
 
-    Raised on a timeout or connection error, where the message could
-    already have been delivered. Never treat this the same as a definite
+    Raised on a timeout or a connection error other than a refusal, where
+    the message could already have been delivered. Never treat this the same as a definite
     failure: a caller that reacts by resending risks a double-send to a
     real person.
     """
+
+
+class SendFailed(Exception):
+    """The request definitely never reached wuzapi (connection refused:
+    nothing was listening). Safe to retry; never shown as unknown."""
 
 
 class ReplyRefused(Exception):
@@ -374,8 +379,15 @@ def _post(url, payload, token):
         # The server answered (with an error status): that is a definite
         # outcome, not an unknown one.
         raise
-    except (TimeoutError, socket.timeout, urllib.error.URLError,
-            ConnectionError) as exc:
+    except urllib.error.URLError as exc:
+        # Refused means nothing accepted the connection, so no byte of the
+        # request left: definite. Anything else may have reached wuzapi.
+        if isinstance(exc.reason, ConnectionRefusedError):
+            raise SendFailed(f"wuzapi no aceptó la conexión ({exc.reason}); el mensaje no salió") from exc
+        raise SendOutcomeUnknown(str(exc)) from exc
+    except ConnectionRefusedError as exc:
+        raise SendFailed(f"wuzapi no aceptó la conexión ({exc}); el mensaje no salió") from exc
+    except (TimeoutError, socket.timeout, ConnectionError) as exc:
         raise SendOutcomeUnknown(str(exc)) from exc
 
 
@@ -937,24 +949,42 @@ def cmd_chat_send(args):
                                            acknowledged=args.acknowledged))
     token = account_token(account)
     # Same double-send guard as the queue path, for chats with no entry.
-    if eid in _unknown_marks(d) and not getattr(args, "acknowledged", False):
+    had_mark = eid in _unknown_marks(d)
+    if had_mark and not getattr(args, "acknowledged", False):
         print(json.dumps({"ok": False, "needs_ack": True, "status": "unknown",
                           "error": NEEDS_ACK_MESSAGE["unknown"]}, ensure_ascii=False))
         return
+    # Written BEFORE the request, like the queue path's "sending": closing
+    # the window mid-send kills this process, and a kill cannot write
+    # anything afterwards. Cleared only once the outcome is definite.
+    _set_unknown_mark(d, eid, True)
+    confirmed_sent = False
     try:
         result = send(args.jid, args.text, token)
         if _is_dry_run(result):
+            _set_unknown_mark(d, eid, had_mark)  # sent nothing, changes nothing
             out = {"ok": True, "dry_run": True}
         elif _is_confirmed_sent(result):
-            _set_unknown_mark(d, eid, False)
+            confirmed_sent = True
             out = {"ok": True, "dry_run": False}
+            _set_unknown_mark(d, eid, False)
         else:
             out = {"ok": False, "error": json.dumps(result, ensure_ascii=False)}
+            _set_unknown_mark(d, eid, False)
     except SendOutcomeUnknown as exc:
-        _set_unknown_mark(d, eid, True)
         out = {"ok": False, "unknown": True, "error": str(exc)}
     except Exception as exc:
-        out = {"ok": False, "error": str(exc)}
+        if confirmed_sent:
+            # It went out; only clearing the mark failed. The mark staying
+            # is the true, safe state.
+            out = {"ok": False, "unknown": True,
+                   "error": f"el mensaje SE ENVIÓ, pero no se pudo actualizar el registro: {exc}"}
+        else:
+            out = {"ok": False, "error": str(exc)}
+            try:
+                _set_unknown_mark(d, eid, False)
+            except Exception:
+                pass  # the mark stays: one extra confirmation, never a double send
     print(json.dumps(out, ensure_ascii=False))
 
 
