@@ -149,6 +149,9 @@ def process(d, wuzdata, cursor, notifier, now=None):
             _log(exc)
     for (acc_id, jid), (acc, msg) in latest.items():
         try:
+            msg = dict(msg, text=contacts.with_mention_names(
+                msg["text"], msg.get("mentions"),
+                lambda j: contacts.display_name(wuzdata, acc["wuzapi_user"], j, "")))
             text = body(msg)
             if jid.endswith("@g.us") and msg["push_name"]:
                 text = f"{msg['push_name']}: {text}"

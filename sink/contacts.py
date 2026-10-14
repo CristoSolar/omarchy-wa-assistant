@@ -106,6 +106,15 @@ def address_book(wuzdata, instance_name: str) -> list:
     return sorted(out, key=lambda c: c["name"].casefold())
 
 
+def with_mention_names(text: str, mentions, name_of) -> str:
+    """'@105189… hola' -> '@Ana hola' for each mentioned jid (name_of(jid))."""
+    for jid in mentions or ():
+        user = str(jid).partition("@")[0].split(":")[0]
+        if user and "@" + user in text:
+            text = text.replace("@" + user, "@" + name_of(jid))
+    return text
+
+
 def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> str:
     event_name = push_name if push_name and push_name != chat_jid else ""
     try:

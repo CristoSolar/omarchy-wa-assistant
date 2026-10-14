@@ -3,7 +3,7 @@ import sqlite3, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tests.runner import run, tmpdir
-from sink.contacts import display_name, muted_chats, our_ids
+from sink.contacts import display_name, muted_chats, our_ids, with_mention_names
 
 OUR = "56900000001@s.whatsapp.net"
 LID = "237786636488820@lid"
@@ -102,6 +102,15 @@ def test_muted_chats_are_the_ones_muted_on_the_phone_and_not_yet_expired():
         m.commit(); m.close()
         assert muted_chats(d, "trabajo", 1000) == {"1@g.us", "2@g.us"}
         assert muted_chats(d, "nadie", 1000) == set()
+
+
+
+def test_mentions_show_names_instead_of_numbers():
+    names = {"105@lid": "Felipe", "5691@s.whatsapp.net": "Ana"}.get
+    assert with_mention_names("@105 y @5691: hola", ["105@lid", "5691:3@s.whatsapp.net".replace(":3", "")],
+                              names) == "@Felipe y @Ana: hola"
+    assert with_mention_names("sin nada", [], names) == "sin nada"
+    assert with_mention_names("@999 no mencionado", ["105@lid"], names) == "@999 no mencionado"
 
 
 if __name__ == "__main__":

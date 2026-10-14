@@ -417,5 +417,34 @@ def test_avatars_stop_offline_refuse_other_hosts_and_bad_names():
             os.environ.pop("WA_STATE_ROOT") if old is None else os.environ.__setitem__("WA_STATE_ROOT", old)
 
 
+
+def test_messages_show_mentioned_names():
+    with tmpdir() as d:
+        db = _setup(d)
+        _main_db(d, contacts=[("56944444444@s.whatsapp.net", "Ana")])
+        msg = {"extendedTextMessage": {"text": "@56944444444 venís?",
+                                       "contextInfo": {"mentionedJID": ["56944444444@s.whatsapp.net"]}}}
+        db.add(GROUP, "@56944444444 venís?", sender="56922@s.whatsapp.net", message=msg)
+        (m,) = wc.messages_page(d, d, "personal", GROUP)["messages"]
+        assert m["text"] == "@Ana venís?"
+        assert _chats(d)[0]["last_text"] == "@Ana venís?"
+
+
+def test_members_lists_people_by_name_without_the_owner():
+    with tmpdir() as d:
+        _setup(d).c.commit()
+        _main_db(d, contacts=[("56944444444@s.whatsapp.net", "Ana")])
+        info = {"data": {"Participants": [
+            {"JID": "111@lid", "PhoneNumber": "56944444444@s.whatsapp.net", "DisplayName": ""},
+            {"JID": "222@lid", "PhoneNumber": "", "DisplayName": "Beto"},
+            {"JID": "333@lid", "PhoneNumber": "56900000001@s.whatsapp.net", "DisplayName": "Yo"}]}}
+        asked = []
+        out = wc.members(d, d, "personal", GROUP, lambda acc, path: asked.append(path) or info)
+        assert out == {"members": [{"jid": "111@lid", "name": "Ana"}, {"jid": "222@lid", "name": "Beto"}]}
+        assert asked == ["/group/info?groupJID=" + GROUP.replace("@", "%40")]
+        assert "error" in wc.members(d, d, "personal", DM, lambda *a: info)
+        assert "error" in wc.members(d, d, "personal", GROUP, lambda *a: 1 / 0)
+
+
 if __name__ == "__main__":
     run(dict(globals()))

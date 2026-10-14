@@ -412,7 +412,7 @@ def _is_dry_run(result) -> bool:
     return isinstance(result, dict) and bool(result.get("dry_run"))
 
 
-def send(jid: str, text: str, token: str) -> dict:
+def send(jid: str, text: str, token: str, mentions=()) -> dict:
     """POST one message. The token is the caller's, already resolved.
 
     `token` is not optional and is never looked up here: cmd_send derives
@@ -436,11 +436,26 @@ def send(jid: str, text: str, token: str) -> dict:
     if not API.startswith("http://127.0.0.1:"):
         raise ValueError(
             f"refusing to send: WA_API must stay on 127.0.0.1, got {API!r}")
+    mentions = list(mentions or ())
+    for m in mentions:
+        if not history.is_chat(m) or m.endswith("@g.us"):
+            raise ValueError(f"refusing to mention {m!r}: not a person")
+    if mentions and not jid.endswith("@g.us"):
+        raise ValueError("mentions only make sense in a group")
     if os.environ.get("WA_DRY_RUN", "1") != "0":
-        return {"dry_run": True, "jid": jid, "text": text}
+        return {"dry_run": True, "jid": jid, "text": text, "mentions": mentions}
     if not token:
         raise ValueError("refusing to send without a token")
-    return _post(f"{API}/chat/send/text", {"Phone": jid, "Body": text}, token)
+    body = {"Phone": jid, "Body": text}
+    if mentions:  # the "@<number>" in Body becomes a real mention
+        body["ContextInfo"] = {"MentionedJID": mentions}
+    return _post(f"{API}/chat/send/text", body, token)
+
+
+def _mentions(args) -> dict:
+    """send()'s mentions kwarg, only when the window passed --mention."""
+    m = getattr(args, "mention", None)
+    return {"mentions": m} if m else {}
 
 
 def _entry(d, entry_id):
@@ -819,7 +834,7 @@ def cmd_send(args):
     # can consume without an acknowledgement. See the generic handler.
     confirmed_sent = False
     try:
-        result = send(entry["jid"], args.text, token)
+        result = send(entry["jid"], args.text, token, **_mentions(args))
         if _is_dry_run(result):
             # A dry run sent nothing, so it must change nothing — including
             # the guard. Writing a literal "pending" here erased a stored
@@ -950,7 +965,7 @@ def cmd_chat_send(args):
     eid = store.entry_id(account["id"], args.jid)
     if _entry(d, eid) is not None:
         # Queue bookkeeping and the "unknown outcome" guard live in cmd_send.
-        return cmd_send(argparse.Namespace(id=eid, text=args.text,
+        return cmd_send(argparse.Namespace(id=eid, text=args.text, mention=getattr(args, "mention", None),
                                            acknowledged=args.acknowledged))
     token = account_token(account)
     # Same double-send guard as the queue path, for chats with no entry.
@@ -965,7 +980,7 @@ def cmd_chat_send(args):
     _set_unknown_mark(d, eid, True)
     confirmed_sent = False
     try:
-        result = send(args.jid, args.text, token)
+        result = send(args.jid, args.text, token, **_mentions(args))
         if _is_dry_run(result):
             _set_unknown_mark(d, eid, had_mark)  # sent nothing, changes nothing
             out = {"ok": True, "dry_run": True}
@@ -1030,6 +1045,7 @@ def main():
     p.add_argument("--text", required=True)
     p.add_argument("--acknowledged", action="store_true")
     p.add_argument("--new", action="store_true", help="a chat the owner starts: no history needed")
+    p.add_argument("--mention", action="append", help="a group member's jid, whose @number is in the text")
     p.set_defaults(fn=cmd_chat_send)
     args = ap.parse_args()
     try:

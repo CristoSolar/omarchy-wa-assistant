@@ -106,6 +106,12 @@ refused, and one you already have a chat with opens that chat instead of
 a duplicate. You pick the account by the row you click; groups cannot be
 started from here.
 
+**@mentions.** In a group, typing `@` in the box suggests its members
+(↑/↓ to pick, Enter or Tab to insert, Esc to dismiss); a picked member shows
+as `@Name` and goes out as a real WhatsApp mention. Mentions you receive
+show the person's name instead of their number, in the conversation, the
+list and notifications.
+
 **Profile pictures.** Rows and the conversation header show each chat's
 or contact's picture (its initial when there is none). Only rows on screen
 ask for one, a few at a time, through wuzapi (`/user/avatar`) and

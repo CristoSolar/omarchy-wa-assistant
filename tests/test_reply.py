@@ -117,6 +117,34 @@ def test_bare_number_recipient_is_rejected():
         raise AssertionError("a recipient without @ must be rejected")
 
 
+def test_mentions_go_in_context_info_only_for_people_in_a_group():
+    called = []
+    original, wa._post = wa._post, lambda url, body, token: called.append(body) or {"success": True}
+    previous = os.environ.get("WA_DRY_RUN")
+    os.environ["WA_DRY_RUN"] = "0"
+    try:
+        g = "120363000000000001@g.us"
+        wa.send(g, "hola @10518945382535", "tok", ["10518945382535@lid"])
+        wa.send(g, "sin menciones", "tok")
+        assert called == [{"Phone": g, "Body": "hola @10518945382535",
+                           "ContextInfo": {"MentionedJID": ["10518945382535@lid"]}},
+                          {"Phone": g, "Body": "sin menciones"}]
+        for jid, bad in ((g, "status@broadcast"), (g, "1203@g.us"), ("569@s.whatsapp.net", "5@lid")):
+            try:
+                wa.send(jid, "x", "tok", [bad])
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"mention {bad} in {jid} must be refused")
+        assert len(called) == 2
+    finally:
+        wa._post = original
+        if previous is None:
+            os.environ.pop("WA_DRY_RUN", None)
+        else:
+            os.environ["WA_DRY_RUN"] = previous
+
+
 def test_dry_run_does_not_call_the_api():
     called = []
     original, wa._post = wa._post, lambda *a, **k: called.append(a)
@@ -1611,6 +1639,25 @@ def test_chat_send_new_starts_a_chat_with_no_history_but_never_a_group_or_a_stat
             assert isinstance(out, wa.NotAChat)
         finally:
             wa.send = original
+
+
+def test_chat_send_passes_mentions_to_send_on_both_paths():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(GROUP, "hola", sender="56922@s.whatsapp.net")
+        calls = []
+        original = wa.send
+        wa.send = lambda jid, text, token, **kw: calls.append(kw) or original(jid, text, token, **kw)
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=GROUP, text="@111 hola",
+                            acknowledged=False, mention=["111@lid"])
+            assert out == {"ok": True, "dry_run": True}
+            _enqueue(d, _queue_entry(jid=GROUP))
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=GROUP, text="@111 hola",
+                            acknowledged=False, mention=["111@lid"])
+        finally:
+            wa.send = original
+        assert calls == [{"mentions": ["111@lid"]}] * 2
 
 
 def test_chat_draft_builds_the_prompt_from_the_last_ten_with_yo_for_mine():

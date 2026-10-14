@@ -157,6 +157,75 @@ Item {
     return out
   }
 
+  // ---- @mentions ----------------------------------------------------------
+  // In a group, "@" in the composer suggests its members. A picked member
+  // shows as "@Name"; on send each "@Name" becomes "@<number>" plus a
+  // --mention, which is what makes WhatsApp treat it as a real mention.
+  property var members: []
+  property var mentionMap: ({})  // "Name" -> jid, for this chat's composer
+  property string mentionQuery: ""
+  property bool mentionOpen: false
+  property int mentionIndex: 0
+  readonly property var mentionMatches: {
+    if (!root.mentionOpen) return []
+    var q = root.mentionQuery.toLowerCase(), out = []
+    for (var i = 0; i < root.members.length && out.length < 6; i++)
+      if (root.members[i].name.toLowerCase().indexOf(q) !== -1) out.push(root.members[i])
+    return out
+  }
+
+  function loadMembers() {
+    root.members = []
+    if (!root.curGroup) return
+    membersProc.key = root.curKey
+    membersProc.command = [root.pluginDir + "bin/wa-chat", "members", root.curAcc, root.curJid]
+    membersProc.running = true
+  }
+  Process {
+    id: membersProc
+    property string key: ""
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (membersProc.key !== root.curKey) return
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        root.members = d && Array.isArray(d.members) ? d.members : []
+      }
+    }
+  }
+
+  // Called on every edit: is the cursor right after "@something"?
+  function updateMention() {
+    var before = composer.text.slice(0, composer.cursorPosition)
+    var m = root.curGroup ? before.match(/(^|\s)@([^\s@]*)$/) : null
+    root.mentionOpen = m !== null && root.members.length > 0
+    root.mentionQuery = m ? m[2] : ""
+    root.mentionIndex = 0
+  }
+  function pickMention(member) {
+    var pos = composer.cursorPosition
+    var start = pos - root.mentionQuery.length - 1  // the "@"
+    composer.remove(start, pos)
+    composer.insert(start, "@" + member.name + " ")
+    root.mentionMap[member.name] = member.jid
+    root.mentionOpen = false
+    composer.forceActiveFocus()
+  }
+  // [text to send, [jids]] from what the composer shows.
+  function withMentions(text) {
+    var jids = []
+    // Longest first: "@Ana María" must not be eaten by "@Ana".
+    var names = Object.keys(root.mentionMap).sort(function(a, b) { return b.length - a.length })
+    for (var k = 0; k < names.length; k++) {
+      var name = names[k]
+      if (text.indexOf("@" + name) === -1) continue
+      var jid = root.mentionMap[name]
+      text = text.split("@" + name).join("@" + jid.split("@")[0])
+      jids.push(jid)
+    }
+    return [text, jids]
+  }
+
   // ---- profile pictures -------------------------------------------------
   // `wa-chat avatars` caches them under avatars/<acc>/<name>.jpg (an empty
   // file = no picture). Only rows that get drawn ask, in batches; the
@@ -385,6 +454,9 @@ Item {
     root.resetComposer()
     composer.text = ""
     root.quickReplies = []
+    root.mentionMap = ({})
+    root.mentionOpen = false
+    root.loadMembers()
     root.fetchMessages(0)
     if (root.curExplicit) root.markRead(c, true)
     root.loadQuick()
@@ -671,7 +743,9 @@ Item {
     sendProc.key = root.curKey
     sendProc.text = text
     sendProc.gotAnswer = false
-    var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text=" + text]
+    var wm = root.withMentions(text)
+    var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text=" + wm[0]]
+    for (var i = 0; i < wm[1].length; i++) cmd.push("--mention=" + wm[1][i])
     if (acknowledged) cmd.push("--acknowledged")
     if (root.curNew) cmd.push("--new")
     sendProc.command = cmd
@@ -1343,6 +1417,51 @@ Item {
                 }
               }
 
+              // -- @mention suggestions --
+              Rectangle {
+                visible: root.mentionMatches.length > 0
+                Layout.fillWidth: true
+                implicitHeight: mentionCol.implicitHeight + Style.spacing.sm * 2
+                color: root.bg
+                border.width: Style.spacing.hairline
+                border.color: Style.normalBorderFor(root.fg, root.accent)
+                radius: Style.cornerRadius
+                Column {
+                  id: mentionCol
+                  anchors.fill: parent
+                  anchors.margins: Style.spacing.sm
+                  Repeater {
+                    model: root.mentionMatches
+                    delegate: Rectangle {
+                      id: mentionRow
+                      required property var modelData
+                      required property int index
+                      width: mentionCol.width
+                      height: mentionText.implicitHeight + Style.spacing.sm * 2
+                      radius: Style.cornerRadius
+                      color: mentionRow.index === root.mentionIndex ? Style.selectedFillFor(root.fg, root.accent)
+                             : (mentionMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
+                      Text {
+                        id: mentionText
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.left: parent.left; anchors.leftMargin: Style.spacing.md
+                        textFormat: Text.PlainText
+                        text: "@" + mentionRow.modelData.name
+                        color: root.fg
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+                      MouseArea {
+                        id: mentionMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        onClicked: root.pickMention(mentionRow.modelData)
+                      }
+                    }
+                  }
+                }
+              }
+
               // -- composer --
               Rectangle {
                 Layout.fillWidth: true
@@ -1367,7 +1486,21 @@ Item {
                     selectByMouse: true
                     readOnly: root.sending || root.drafting
                     background: null
+                    onTextChanged: root.updateMention()
+                    onCursorPositionChanged: root.updateMention()
                     Keys.onPressed: function(event) {
+                      var n = root.mentionMatches.length
+                      if (n > 0) {
+                        if (event.key === Qt.Key_Down) { root.mentionIndex = (root.mentionIndex + 1) % n; event.accepted = true; return }
+                        if (event.key === Qt.Key_Up) { root.mentionIndex = (root.mentionIndex + n - 1) % n; event.accepted = true; return }
+                        if (event.key === Qt.Key_Escape) { root.mentionOpen = false; event.accepted = true; return }
+                        if (event.key === Qt.Key_Tab || ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                                                         && !(event.modifiers & (Qt.ShiftModifier | Qt.ControlModifier)))) {
+                          root.pickMention(root.mentionMatches[Math.min(root.mentionIndex, n - 1)])
+                          event.accepted = true
+                          return
+                        }
+                      }
                       if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
                       if (event.modifiers & Qt.ShiftModifier) return  // newline
                       event.accepted = true
