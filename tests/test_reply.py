@@ -1522,5 +1522,103 @@ def test_thread_refuses_an_entry_whose_account_is_unknown():
             pass
 
 
+# --- chat-send / chat-draft: any chat in an account's history ---------------
+
+from tests.test_history import Db, DM, GROUP
+
+
+def _chat_env(d, accts=(PERSONAL, TRABAJO)):
+    _prepare(d, accts)
+    os.environ["WA_WUZAPI_DB"] = str(d / "users.db")  # restored by _reply_env
+    return Db(d)
+
+
+def _run_chat(fn, d, **kw):
+    buf = io.StringIO()
+    with _reply_env(d):
+        os.environ["WA_WUZAPI_DB"] = str(d / "users.db")
+        try:
+            with redirect_stdout(buf):
+                fn(SimpleNamespace(**kw))
+        except wa.ReplyRefused as exc:
+            return exc
+    return json.loads(buf.getvalue())
+
+
+def _no_network(*a, **k):
+    raise AssertionError("must not reach send()")
+
+
+def test_chat_send_refuses_a_chat_that_is_not_in_the_account_before_any_network():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola", uid="u2")  # the chat belongs to trabajo, not personal
+        original, wa.send = wa.send, _no_network
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+        finally:
+            wa.send = original
+        assert isinstance(out, wa.ChatNotInAccount) and out.payload["ok"] is False
+
+
+def test_chat_send_without_a_queue_entry_sends_through_send_in_dry_run():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        calls = []
+        original = wa.send
+        wa.send = lambda jid, text, token: calls.append((jid, text, token)) or original(jid, text, token)
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="buenas", acknowledged=False)
+        finally:
+            wa.send = original
+        assert out == {"ok": True, "dry_run": True}
+        assert calls == [(DM, "buenas", "tok-personal")]
+
+
+def test_chat_send_with_a_queue_entry_goes_through_cmd_send_and_its_guard():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        entry = _queue_entry(jid=DM)
+        entry["status"] = "unknown"
+        _enqueue(d, entry)
+        original, wa.send = wa.send, _no_network
+        try:
+            out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=False)
+        finally:
+            wa.send = original
+        assert out["needs_ack"] is True and out["status"] == "unknown"
+        out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="x", acknowledged=True)
+        assert out == {"ok": True, "dry_run": True}
+        assert store.load_queue(d)[0]["status"] == "unknown"  # dry run keeps the guard
+
+
+def test_chat_draft_builds_the_prompt_from_the_last_ten_with_yo_for_mine():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        for i in range(12):
+            db.add(DM, f"m{i}", from_me=(i == 11))
+        prompts = []
+        original = wa.subprocess.run
+        wa.subprocess.run = lambda cmd, **k: prompts.append(cmd[2]) or SimpleNamespace(
+            returncode=0, stdout="```\nlisto\n```", stderr="")
+        try:
+            out = _run_chat(wa.cmd_chat_draft, d, account="personal", jid=DM, idea="decile si")
+        finally:
+            wa.subprocess.run = original
+        assert out == {"draft": "listo", "error": ""}
+        p = prompts[0]
+        assert "Yo: m11" in p and "m2" in p and "m1\n" not in p and "decile si" in p
+
+
+def test_chat_draft_refuses_a_chat_that_is_not_in_the_account():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola", uid="u2")
+        out = _run_chat(wa.cmd_chat_draft, d, account="personal", jid=DM, idea="x")
+        assert isinstance(out, wa.ChatNotInAccount)
+
+
 if __name__ == "__main__":
     run(dict(globals()))

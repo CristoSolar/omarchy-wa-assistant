@@ -598,5 +598,69 @@ def test_limits_honour_a_valid_configured_value():
         assert wm._limits(d) == (42, 7)
 
 
+# --- get-msg: any message in an account's history ----------------------------
+
+from tests.test_history import Db, DM, _event
+
+
+def _history_image(d, **extra):
+    db = Db(d)
+    msg = {"imageMessage": {**FULL_FIELDS, **extra}}
+    db.add(DM, "", mtype="image", datajson=_event(DM, message=msg, mid="M1"))
+    db.add(DM, "solo texto")
+    os.environ["WA_WUZAPI_DB"] = str(d / "users.db")
+    return db
+
+
+def test_get_msg_builds_the_attachment_from_the_stored_event_and_caches():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        _history_image(t)
+        calls, fake = _fake_download()
+        original, wm._download_bytes = wm._download_bytes, fake
+        try:
+            path = wm.get_msg_path(d, "personal", "M1")
+            again = wm.get_msg_path(d, "personal", "M1")
+        finally:
+            wm._download_bytes = original
+            os.environ.pop("WA_WUZAPI_DB", None)
+        assert path == again and path.read_bytes() == FAKE_IMAGE_BYTES
+        assert len(calls) == 1 and calls[0][:2] == ("personal", "image")
+
+
+def test_get_msg_cache_key_never_collides_with_a_queue_entry_key():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        _history_image(t)
+        original, wm._download_bytes = wm._download_bytes, _fake_download()[1]
+        try:
+            via_msg = wm.get_msg_path(d, "personal", "M1")
+            store.upsert_queue(d, _entry(entry_id="personal:M1"))
+            via_entry = wm.get_media_path(d, "personal:M1")
+        finally:
+            wm._download_bytes = original
+            os.environ.pop("WA_WUZAPI_DB", None)
+        assert via_msg != via_entry
+
+
+def test_get_msg_refuses_a_text_message_a_missing_one_and_an_unknown_account():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        _history_image(t)
+        def _no_download(*a, **k):
+            raise AssertionError("no network")
+        original, wm._download_bytes = wm._download_bytes, _no_download
+        try:
+            for acc, mid in (("personal", "M2"), ("personal", "nope"), ("ghost", "M1")):
+                try:
+                    wm.get_msg_path(d, acc, mid)
+                    assert False, "should have refused"
+                except wm.MediaRefused:
+                    pass
+        finally:
+            wm._download_bytes = original
+            os.environ.pop("WA_WUZAPI_DB", None)
+
+
 if __name__ == "__main__":
     run(globals())
