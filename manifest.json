@@ -6,11 +6,17 @@
   "author": "CristoSolar",
   "license": "MIT",
   "description": "Queues incoming WhatsApp messages and drafts replies. You give the idea in one line, Claude writes the message, and nothing is sent until you confirm. The bridge runs in Docker on loopback only.",
-  "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "ChatWindow.qml"
+  },
   "barWidget": {
     "displayName": "WhatsApp Assistant",
-    "description": "Pending WhatsApp replies; click to open the queue.",
+    "description": "Pending WhatsApp replies; click to open the chat window on unread chats.",
     "category": "Communication",
     "defaultSection": "right",
     "allowMultiple": false
