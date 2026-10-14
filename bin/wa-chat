@@ -64,8 +64,12 @@ def http_get(acc_id, path):
     return _request("GET", acc_id, path)
 
 
-def _phone(jid):
-    return jid.split("@")[0].split(":")[0]
+def _user_server(jid):
+    """`user@server` without the device suffix. wuzapi's parseJID reads a
+    value with no '@' as <user>@s.whatsapp.net, so a @lid sender must keep
+    its server or the receipt targets the wrong participant."""
+    user, _, server = jid.partition("@")
+    return f"{user.split(':')[0]}@{server}"
 
 
 def _account(d, acc_id):
@@ -79,7 +83,7 @@ def _mark_read_on_wuzapi(post, acc_id, jid, pairs):
     """pairs: [(message_id, sender_jid)]. 1:1 chats send one call; groups one per sender."""
     if not pairs:
         return
-    chat = _phone(jid)
+    chat = jid
     if not jid.endswith("@g.us"):
         post(acc_id, "/chat/markread", {"Id": [m for m, _ in pairs], "ChatPhone": chat})
         return
@@ -87,13 +91,14 @@ def _mark_read_on_wuzapi(post, acc_id, jid, pairs):
     for mid, sender in pairs:
         by_sender.setdefault(sender, []).append(mid)
     for sender, ids in by_sender.items():
-        post(acc_id, "/chat/markread", {"Id": ids, "ChatPhone": chat, "SenderPhone": _phone(sender)})
+        post(acc_id, "/chat/markread", {"Id": ids, "ChatPhone": chat, "SenderPhone": _user_server(sender)})
 
 
 def read_chat(d, wuzdata, acc_id, jid, post):
     acc = _account(d, acc_id)
     conn = history.connect(wuzdata)
     try:
+        readstate.ensure(d, history.last_id(conn))
         uid = history.user_ids(conn)[acc["wuzapi_user"]]
         top = history.last_id(conn, uid, jid)
         pairs = history.unread_ids(conn, uid, jid, readstate.marker(readstate.load(d), acc_id, jid))
@@ -112,6 +117,7 @@ def read_chat(d, wuzdata, acc_id, jid, post):
 
 
 def _retry_pending(d, wuzdata, post):
+    """True if wuzapi was unreachable (the first failure ends the pass)."""
     for key in list(readstate.load(d)["pending"]):
         acc_id, jid = store.split_entry_id(key)
         try:
@@ -127,17 +133,22 @@ def _retry_pending(d, wuzdata, post):
             _mark_read_on_wuzapi(post, acc_id, jid,
                                  [(m["message_id"], m["sender"]) for m in page if not m["from_me"]])
             readstate.mark(d, acc_id, jid, 0, pending=False)
-        except (OSError, KeyError, ValueError):
+        except (KeyError, ValueError):
             pass  # stays pending; next list retries
+        except Exception:
+            return True
+    return False
 
 
 def _group_names(d, accounts, get):
+    """(names, offline). A failed refresh backs off 60 s instead of retrying every poll."""
     path = Path(d) / "groups.json"
     cache = store.read_json(path, {})
     if not isinstance(cache, dict):
         cache = {}
     if time.time() - cache.get("fetched", 0) >= GROUPS_TTL:
         names = dict(cache.get("names", {}))
+        offline = False
         try:
             for acc in accounts:
                 data = get(acc["id"], "/group/list")
@@ -146,8 +157,11 @@ def _group_names(d, accounts, get):
             cache = {"fetched": time.time(), "names": names}
             store.atomic_write(path, json.dumps(cache))
         except Exception:
-            pass  # network down: keep what we have
-    return cache.get("names", {})
+            offline = True  # keep what we have, retry in a minute
+            cache = {"fetched": time.time() - GROUPS_TTL + 60, "names": names}
+            store.atomic_write(path, json.dumps(cache))
+        return names if offline else cache["names"], offline
+    return cache.get("names", {}), False
 
 
 def _text(msg):
@@ -155,14 +169,16 @@ def _text(msg):
 
 
 def list_chats(d, wuzdata, post, get=http_get):
-    _retry_pending(d, wuzdata, post)
+    offline = _retry_pending(d, wuzdata, post)
     accts = accounts_mod.load(d)
     enabled = store.load_config(d).get("groups_enabled", [])
-    names = _group_names(d, accts, get)
-    state = readstate.load(d)
+    names, names_offline = _group_names(d, accts, get)
+    offline = offline or names_offline
     conn = history.connect(wuzdata)
     out = []
     try:
+        readstate.ensure(d, history.last_id(conn))
+        state = readstate.load(d)
         uids = history.user_ids(conn)
         for acc in accts:
             uid = uids.get(acc["wuzapi_user"])
@@ -181,7 +197,7 @@ def list_chats(d, wuzdata, post, get=http_get):
     finally:
         conn.close()
     out.sort(key=lambda c: -c["last_id"])
-    return {"chats": out}
+    return {"chats": out, "offline": offline}
 
 
 def messages_page(d, wuzdata, acc_id, jid, before=None):

@@ -3,7 +3,7 @@
 A marker is a wuzapi `message_history.id` (the autoincrement row id, see
 sink/history.py), never a time. `since` is the highest id when the file was
 first created, so history that predates this feature never shows as unread.
-Only the sink writes it.
+The sink and bin/wa-chat both write it (each via `ensure`/`mark`, atomic replace).
 """
 import json
 from pathlib import Path

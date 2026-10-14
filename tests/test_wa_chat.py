@@ -73,10 +73,66 @@ def test_read_in_a_group_posts_one_call_per_sender_and_marks():
         assert wc.read_chat(d, d, "personal", GROUP, post) == {"ok": True}
         assert len(post.calls) == 2
         by = {c[2]["SenderPhone"]: c[2] for c in post.calls}
-        assert by["56911"]["Id"] == ["M1", "M3"] and by["56922"]["Id"] == ["M2"]
-        assert all(c[1] == "/chat/markread" and c[2]["ChatPhone"] == "120363000000000001" for c in post.calls)
+        assert by["56911@s.whatsapp.net"]["Id"] == ["M1", "M3"] and by["56922@s.whatsapp.net"]["Id"] == ["M2"]
+        assert all(c[1] == "/chat/markread" and c[2]["ChatPhone"] == GROUP for c in post.calls)
         st = readstate.load(d)
         assert readstate.marker(st, "personal", GROUP) == 3 and st["pending"] == []
+
+
+def test_group_sender_on_lid_keeps_its_server_and_loses_the_device_suffix():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(GROUP, "a", sender="237786636488820:23@lid")
+        post = Post()
+        wc.read_chat(d, d, "personal", GROUP, post)
+        assert post.calls[0][2]["SenderPhone"] == "237786636488820@lid"
+
+
+def test_missing_read_json_baselines_at_the_current_last_id():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "viejo")
+        (c,) = _chats(d)
+        assert c["unread"] == 0 and readstate.load(d)["since"] == 1
+        db.add(DM, "nuevo")
+        assert _chats(d)[0]["unread"] == 1
+
+
+def test_read_with_no_read_json_does_not_bake_since_zero():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "viejo")
+        wc.read_chat(d, d, "personal", DM, Post())
+        assert readstate.load(d)["since"] == 1
+
+
+def test_offline_flag_and_backoff_after_group_fetch_failure():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(GROUP, "x", sender="56922@s.whatsapp.net")
+        calls = []
+        def boom(acc, path):
+            calls.append(acc); raise OSError("down")
+        assert wc.list_chats(d, d, Post(), get=boom)["offline"] is True
+        n = len(calls)
+        out = wc.list_chats(d, d, Post(), get=boom)
+        assert len(calls) == n and out["offline"] is False
+        assert wc.list_chats(d, d, Post(), get=_get())["offline"] is False
+
+
+def test_retry_stops_after_first_connection_failure():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a"); db.add("56922@s.whatsapp.net", "b")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))
+        wc.read_chat(d, d, "personal", "56922@s.whatsapp.net", Post(fail=True))
+        class Count(Post):
+            def __call__(self, *a):
+                self.n = getattr(self, "n", 0) + 1
+                raise OSError("down")
+        post = Count()
+        out = wc.list_chats(d, d, post, get=_get())
+        assert post.n == 1 and out["offline"] is True
 
 
 def test_read_in_a_dm_has_no_sender_phone():
@@ -86,7 +142,7 @@ def test_read_in_a_dm_has_no_sender_phone():
         post = Post()
         wc.read_chat(d, d, "personal", DM, post)
         (c,) = post.calls
-        assert c[2] == {"Id": ["M1"], "ChatPhone": "56911111111"}
+        assert c[2] == {"Id": ["M1"], "ChatPhone": DM}
 
 
 def test_failed_post_is_pending_and_marker_still_rises_then_retried_on_next_list():
