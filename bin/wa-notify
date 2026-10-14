@@ -16,6 +16,7 @@ Never sends a message and never writes to wuzapi.
 """
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
@@ -97,33 +98,47 @@ def _title(d, wuzdata, acc, jid, msg):
 
 
 def process(d, wuzdata, cursor, notifier):
-    """Notify for rows after `cursor`; returns the new cursor."""
+    """Notify for rows after cursor["id"], advancing it as each row is consumed.
+
+    A row that blows up is skipped (the cursor already passed it) and a
+    failed notification is lost rather than repeated: neither can stall the
+    rows behind it or re-run the batch.
+    """
     accts = accounts_mod.load(d)
     enabled = set(store.load_config(d).get("groups_enabled", []))
     focused = _read_focused(d)
     conn = history.connect(wuzdata)
     try:
         uids = history.user_ids(conn)
-        rows = history.rows_after(conn, cursor)
+        rows = history.rows_after(conn, cursor["id"])
     finally:
         conn.close()
     latest, ours = {}, {}
     for uid, jid, msg in rows:
-        cursor = max(cursor, msg["id"])
-        acc = next((a for a in accts if uids.get(a["wuzapi_user"]) == uid), None)
-        if acc is None:
-            continue
-        if acc["id"] not in ours:
-            ours[acc["id"]] = contacts.our_ids(wuzdata, acc["wuzapi_user"])
-        if should_notify(msg, acc["id"], jid, enabled_groups=enabled, focused=focused,
-                         our_ids=ours[acc["id"]]):
-            latest[(acc["id"], jid)] = (acc, msg)
+        cursor["id"] = max(cursor["id"], msg["id"])
+        try:
+            acc = next((a for a in accts if uids.get(a["wuzapi_user"]) == uid), None)
+            if acc is None:
+                continue
+            if acc["id"] not in ours:
+                ours[acc["id"]] = contacts.our_ids(wuzdata, acc["wuzapi_user"])
+            if should_notify(msg, acc["id"], jid, enabled_groups=enabled, focused=focused,
+                             our_ids=ours[acc["id"]]):
+                latest[(acc["id"], jid)] = (acc, msg)
+        except Exception as exc:
+            _log(exc)
     for (acc_id, jid), (acc, msg) in latest.items():
-        text = body(msg)
-        if jid.endswith("@g.us") and msg["push_name"]:
-            text = f"{msg['push_name']}: {text}"
-        notifier.show((acc_id, jid), _title(d, wuzdata, acc, jid, msg), text)
-    return cursor
+        try:
+            text = body(msg)
+            if jid.endswith("@g.us") and msg["push_name"]:
+                text = f"{msg['push_name']}: {text}"
+            notifier.show((acc_id, jid), _title(d, wuzdata, acc, jid, msg), text)
+        except Exception as exc:
+            _log(exc)
+
+
+def _log(exc):
+    print(f"wa-notify: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
 
 def _start_cursor(wuzdata):
@@ -138,19 +153,24 @@ def main():
     d, wuzdata = store.data_dir(), store.wuzdata_dir()
     changed = d / "changed"
     changed.touch(exist_ok=True)
-    notifier, cursor = Notifier(), None
+    notifier, cursor = Notifier(), {"id": None}
+    # One persistent watcher: a touch that lands while we are processing stays
+    # queued in the pipe, so the next wait returns at once instead of missing it.
+    watcher = subprocess.Popen(["inotifywait", "-m", "-q", "-e", "close_write,attrib", str(changed)],
+                               stdout=subprocess.PIPE, bufsize=0)
     while True:
         try:
-            if cursor is None:
-                cursor = _start_cursor(wuzdata)  # no backlog flood
+            if cursor["id"] is None:
+                cursor["id"] = _start_cursor(wuzdata)  # no backlog flood
             else:
-                cursor = process(d, wuzdata, cursor, notifier)
+                process(d, wuzdata, cursor, notifier)
         except Exception as exc:  # users.db missing/locked/SchemaError: retry on next change
-            print(f"wa-notify: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            _log(exc)
             time.sleep(RETRY_SECONDS)
-        # Wake on the sink's touch; the timeout is the retry cadence after a failure.
-        subprocess.run(["inotifywait", "-qq", "-t", "300", "-e", "close_write,attrib", str(changed)],
-                       check=False)
+        # Wake on a touch; the timeout is the retry cadence after a failure.
+        if select.select([watcher.stdout], [], [], 300)[0]:
+            if not os.read(watcher.stdout.fileno(), 65536):  # drains every queued event at once
+                sys.exit("wa-notify: inotifywait exited")  # systemd restarts us
 
 
 if __name__ == "__main__":

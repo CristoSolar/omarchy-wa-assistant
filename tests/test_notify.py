@@ -2,7 +2,9 @@
 import importlib.machinery, importlib.util, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tests.runner import run
+import json
+from tests.runner import run, tmpdir
+from tests.test_history import Db
 
 _p = Path(__file__).resolve().parents[1] / "bin" / "wa-notify"
 _loader = importlib.machinery.SourceFileLoader("wa_notify", str(_p))
@@ -71,6 +73,53 @@ def test_body_attachments():
     assert wn.body(_msg(text="", attachment={"type": "audio", "downloadable": True})) == "🎤 Audio"
     assert wn.body(_msg(text="", attachment={"type": "document", "downloadable": True})) == "📎 Archivo"
     assert wn.body(_msg(text="mira", attachment={"type": "image", "downloadable": True})) == "mira"
+
+
+class Fake:
+    def __init__(self, fail_on=None):
+        self.shown, self.fail_on = [], fail_on
+
+    def show(self, key, title, text):
+        if text == self.fail_on:
+            raise OSError("notify-send gone")
+        self.shown.append((key, text))
+
+
+def _setup(d):
+    (d / "accounts.json").write_text(json.dumps([{"id": "personal", "label": "P", "wuzapi_user": "omarchy"}]))
+    (d / "config.json").write_text(json.dumps({"groups_enabled": []}))
+    return Db(d)
+
+
+def test_a_row_that_raises_does_not_stall_later_rows_and_cursor_passes_it():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "uno"); bad = db.add(DM, "boom"); last = db.add("5692@s.whatsapp.net", "tres")
+        real, calls = wn.should_notify, []
+
+        def flaky(msg, *a, **k):
+            if msg["text"] == "boom":
+                raise KeyError("bad row")
+            return real(msg, *a, **k)
+        wn.should_notify = flaky
+        try:
+            cur, n = {"id": 0}, Fake()
+            wn.process(d, d, cur, n)
+        finally:
+            wn.should_notify = real
+        assert [t for _, t in n.shown] == ["uno", "tres"]
+        assert cur["id"] == last > bad
+
+
+def test_a_failing_show_does_not_repeat_or_block_other_chats():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "uno"); last = db.add("5692@s.whatsapp.net", "dos")
+        cur, n = {"id": 0}, Fake(fail_on="uno")
+        wn.process(d, d, cur, n)
+        assert [t for _, t in n.shown] == ["dos"] and cur["id"] == last
+        wn.process(d, d, cur, n)
+        assert len(n.shown) == 1
 
 
 if __name__ == "__main__":
