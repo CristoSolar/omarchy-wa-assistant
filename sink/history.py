@@ -26,12 +26,23 @@ COLUMNS = {"id", "user_id", "chat_jid", "sender_jid", "message_id", "timestamp",
 HIDDEN_TYPES = ("reaction", "delete", "edit")
 _SELECT = "SELECT id, sender_jid, message_id, timestamp, message_type, text_content, datajson FROM message_history"
 _VISIBLE = f"message_type NOT IN {HIDDEN_TYPES}"
+# The only servers that are conversations. Everything else (status@broadcast,
+# broadcast lists, @newsletter channels) is left out of every listing, and
+# bin/wa-reply and bin/wa-media refuse it: whatsmeow sends a message to
+# status@broadcast as a public Status post.
+CHAT_SERVERS = ("s.whatsapp.net", "lid", "g.us")
+_IS_CHAT = "(" + " OR ".join(f"chat_jid LIKE '_%@{s}'" for s in CHAT_SERVERS) + ")"
 _INCOMING = ("sender_jid != 'me' AND CASE WHEN json_valid(datajson)"
              " THEN json_extract(datajson, '$.Info.IsFromMe') END = 0")
 
 
 class SchemaError(Exception):
     """message_history is not the table this module was written against."""
+
+
+def is_chat(jid) -> bool:
+    user, at, server = str(jid or "").rpartition("@")
+    return bool(user and at) and server in CHAT_SERVERS
 
 
 def connect(wuzdata) -> sqlite3.Connection:
@@ -91,7 +102,7 @@ def _decoded(rows) -> list:
 
 def chats(conn, uid) -> list:
     last = conn.execute(f"SELECT chat_jid, MAX(id) FROM message_history WHERE user_id = ? AND {_VISIBLE}"
-                        " GROUP BY chat_jid ORDER BY MAX(id) DESC", (uid,)).fetchall()
+                        f" AND {_IS_CHAT} GROUP BY chat_jid ORDER BY MAX(id) DESC", (uid,)).fetchall()
     out = []
     for jid, last_id in last:
         msg = _decode(conn.execute(f"{_SELECT} WHERE id = ?", (last_id,)).fetchone())
@@ -142,7 +153,7 @@ def last_id(conn, uid=None, jid=None) -> int:
 def rows_after(conn, after_id) -> list:
     """(user_id, chat_jid, msg) for every visible row newer than after_id."""
     rows = conn.execute("SELECT user_id, chat_jid, id, sender_jid, message_id, timestamp, message_type,"
-                        " text_content, datajson FROM message_history WHERE id > ? ORDER BY id",
+                        f" text_content, datajson FROM message_history WHERE id > ? AND {_IS_CHAT} ORDER BY id",
                         (after_id,)).fetchall()
     return [(r[0], r[1], m) for r in rows if (m := _decode(r[2:])) is not None]
 
@@ -155,6 +166,12 @@ def message_event(conn, uid, message_id) -> dict | None:
         return json.loads(row[0]) if row and row[0] else None
     except ValueError:
         return None
+
+
+def chat_of(conn, uid, message_id) -> str | None:
+    row = conn.execute("SELECT chat_jid FROM message_history WHERE user_id = ? AND message_id = ?",
+                       (uid, message_id)).fetchone()
+    return row[0] if row else None
 
 
 def has_chat(conn, uid, jid) -> bool:

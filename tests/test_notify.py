@@ -122,5 +122,15 @@ def test_a_failing_show_does_not_repeat_or_block_other_chats():
         assert len(n.shown) == 1
 
 
+def test_a_status_post_never_notifies():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add("status@broadcast", "mi estado", sender="56933@s.whatsapp.net")
+        last = db.add(DM, "hola")
+        cur, n = {"id": 0}, Fake()
+        wn.process(d, d, cur, n)
+        assert [(k[1], t) for k, t in n.shown] == [(DM, "hola")] and cur["id"] == last
+
+
 if __name__ == "__main__":
     run(dict(globals()))

@@ -229,10 +229,6 @@ class QuickRepliesConflict(ReplyRefused):
         })
 
 
-# The single definition of the token variable's name now lives in
-# sink/accounts.py (token_env_var): bin/wa-status needs it too, polled
-# every few seconds by the bar widget once per configured account, so it
-# cannot afford to shell out to `wa-reply token-var` per account per poll —
 class ChatNotInAccount(ReplyRefused):
     """The chat has no history under the named account.
 
@@ -248,6 +244,25 @@ class ChatNotInAccount(ReplyRefused):
         })
 
 
+class NotAChat(ReplyRefused):
+    """The JID is not a person or a group: status@broadcast, a broadcast
+    list, a @newsletter channel. whatsmeow sends a message addressed to
+    status@broadcast as the owner's public Status, so these are refused
+    before anything reads the history or touches the network.
+    """
+
+    def __init__(self, jid):
+        super().__init__({
+            "ok": False,
+            "error": (f"{jid!r} no es un chat (estado, difusión o canal); "
+                      f"no se envía nada."),
+        })
+
+
+# The single definition of the token variable's name now lives in
+# sink/accounts.py (token_env_var): bin/wa-status needs it too, polled
+# every few seconds by the bar widget once per configured account, so it
+# cannot afford to shell out to `wa-reply token-var` per account per poll —
 # it imports sink.accounts directly instead. This name is a reference to
 # that one function, not a second copy of it, kept so every existing
 # `wa.token_env_var(...)` call (here and in tests) still works unchanged.
@@ -866,6 +881,8 @@ def cmd_send(args):
 
 def _chat_history(d, account_id, jid, limit=0):
     """(account, last `limit` messages) for a chat, or ChatNotInAccount."""
+    if not history.is_chat(jid):
+        raise NotAChat(jid)
     account = _account_or_refuse(d, account_id)
     try:
         conn = history.connect(store.wuzdata_dir())

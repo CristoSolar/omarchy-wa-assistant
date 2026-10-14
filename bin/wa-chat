@@ -95,6 +95,8 @@ def _mark_read_on_wuzapi(post, acc_id, jid, pairs):
 
 
 def read_chat(d, wuzdata, acc_id, jid, post):
+    if not history.is_chat(jid):
+        return {"ok": False, "error": f"{jid!r} no es un chat (estado, difusión o canal)"}
     acc = _account(d, acc_id)
     conn = history.connect(wuzdata)
     try:

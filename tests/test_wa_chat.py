@@ -206,5 +206,16 @@ def test_wuzapi_url_must_be_local():
     raise AssertionError("expected ValueError")
 
 
+def test_status_broadcast_is_not_listed_and_is_never_read():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "hola")
+        db.add("status@broadcast", "mi estado", sender="56933@s.whatsapp.net", push="Beto")
+        assert [c["jid"] for c in _chats(d)] == [DM]
+        post = Post()
+        out = wc.read_chat(d, d, "personal", "status@broadcast", post)
+        assert out["ok"] is False and out["error"] and post.calls == []
+
+
 if __name__ == "__main__":
     run(dict(globals()))

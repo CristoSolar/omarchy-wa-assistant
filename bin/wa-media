@@ -178,6 +178,17 @@ class NotDownloadable(MediaRefused):
         })
 
 
+class NotAChat(MediaRefused):
+    """The message belongs to status@broadcast, a broadcast list or a
+    channel: not a chat the window shows, so nothing is downloaded."""
+
+    def __init__(self, jid):
+        super().__init__({
+            "ok": False,
+            "error": f"{jid!r} no es un chat (estado, difusión o canal); no se descarga nada.",
+        })
+
+
 class DownloadFailed(MediaRefused):
     def __init__(self, entry_id, reason):
         super().__init__({
@@ -537,6 +548,9 @@ def get_msg_path(d, account_id, message_id) -> Path:
                             f"({why}); no se descarga nada."}) from None
     try:
         uid = history.user_ids(conn).get(account["wuzapi_user"])
+        chat = history.chat_of(conn, uid, message_id) if uid else None
+        if chat is not None and not history.is_chat(chat):
+            raise NotAChat(chat)
         event = history.message_event(conn, uid, message_id) if uid else None
     finally:
         conn.close()

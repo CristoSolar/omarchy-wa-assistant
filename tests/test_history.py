@@ -174,5 +174,28 @@ def test_an_unknown_schema_is_refused_not_guessed():
         raise AssertionError("expected SchemaError")
 
 
+STATUS = "status@broadcast"
+LID = "237786636488820@lid"
+
+
+def test_only_person_lid_and_group_chats_are_chats():
+    assert history.is_chat(DM) and history.is_chat(GROUP) and history.is_chat(LID)
+    for jid in (STATUS, "123@broadcast", "1203630@newsletter", "", "x", "@s.whatsapp.net", None):
+        assert not history.is_chat(jid), jid
+
+
+def test_status_broadcast_and_newsletters_never_list_nor_notify():
+    with tmpdir() as d:
+        db = Db(d)
+        db.add(DM, "a"); db.add(LID, "b")
+        db.add(STATUS, "mi estado", sender="56933@s.whatsapp.net")
+        db.add("1203630@newsletter", "canal")
+        db.add("123@broadcast", "lista")
+        assert [c["jid"] for c in history.chats(_conn(d), "u1")] == [LID, DM]
+        assert [j for _, j, _ in history.rows_after(_conn(d), 0)] == [DM, LID]
+        assert history.chat_of(_conn(d), "u1", "M3") == STATUS
+        assert history.chat_of(_conn(d), "u1", "nope") is None
+
+
 if __name__ == "__main__":
     run(dict(globals()))

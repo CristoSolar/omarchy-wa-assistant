@@ -675,5 +675,26 @@ def test_get_msg_refuses_with_a_payload_when_history_is_unreadable():
             os.environ.pop("WA_WUZAPI_DB", None)
 
 
+def test_get_msg_refuses_a_status_post_before_any_network():
+    with tmpdir() as t, _media_env(t) as d:
+        _prepare(d)
+        db = Db(t)
+        msg = {"imageMessage": dict(FULL_FIELDS)}
+        db.add("status@broadcast", "", mtype="image", sender="56933@s.whatsapp.net",
+               datajson=_event("status@broadcast", message=msg, mid="M1"))
+        os.environ["WA_WUZAPI_DB"] = str(t / "users.db")
+        def _no_download(*a, **k):
+            raise AssertionError("no network")
+        original, wm._download_bytes = wm._download_bytes, _no_download
+        try:
+            wm.get_msg_path(d, "personal", "M1")
+            assert False, "should have refused"
+        except wm.NotAChat as exc:
+            assert exc.payload["ok"] is False and "no se descarga nada" in exc.payload["error"]
+        finally:
+            wm._download_bytes = original
+            os.environ.pop("WA_WUZAPI_DB", None)
+
+
 if __name__ == "__main__":
     run(globals())

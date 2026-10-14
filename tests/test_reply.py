@@ -1656,5 +1656,38 @@ def test_chat_send_and_draft_answer_a_refusal_when_history_is_unreadable():
             assert out.payload["error"]
 
 
+def test_status_broadcast_and_other_non_chats_are_refused_before_any_network():
+    # status@broadcast is in the history (the contacts' Status posts) and
+    # whatsmeow would send to it as the owner's public Status.
+    for jid in ("status@broadcast", "123@broadcast", "1203630@newsletter"):
+        with tmpdir() as d:
+            db = _chat_env(d)
+            db.add(jid, "estado", sender="56933@s.whatsapp.net")
+            os.environ["WA_DRY_RUN"] = "0"
+            original_send, wa.send = wa.send, _no_network
+            original_run = wa.subprocess.run
+            wa.subprocess.run = _no_network
+            try:
+                for fn, kw in ((wa.cmd_chat_send, dict(text="x", acknowledged=True)),
+                               (wa.cmd_chat_draft, dict(idea="x"))):
+                    out = _run_chat(fn, d, account="personal", jid=jid, **kw)
+                    assert isinstance(out, wa.NotAChat), (jid, out)
+                    assert out.payload["ok"] is False and "no se envía nada" in out.payload["error"]
+            finally:
+                wa.send = original_send
+                wa.subprocess.run = original_run
+                os.environ.pop("WA_DRY_RUN", None)
+            assert not (d / "chat_unknown.json").exists()
+
+
+def test_a_lid_chat_is_still_a_chat():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add("237786636488820@lid", "hola")
+        out = _run_chat(wa.cmd_chat_send, d, account="personal", jid="237786636488820@lid",
+                        text="x", acknowledged=False)
+        assert out == {"ok": True, "dry_run": True}
+
+
 if __name__ == "__main__":
     run(dict(globals()))
