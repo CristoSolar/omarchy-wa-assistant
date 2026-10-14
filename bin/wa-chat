@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+# bin/wa-chat
+"""Host-side CLI behind the chat window: list chats, page messages, mark read.
+
+Always prints one JSON object on stdout and exits 0, so the QML caller can
+show an error instead of losing it in a non-zero exit. It reads history
+through sink/history.py and talks to wuzapi for exactly two things:
+POST /chat/markread and GET /group/list. It never sends a message; only
+bin/wa-reply does.
+
+Usage: wa-chat chats | messages ACC JID [--before ID] | read ACC JID
+"""
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sink import accounts as accounts_mod, contacts, history, readstate, store  # noqa: E402
+
+API = os.environ.get("WA_API", "http://127.0.0.1:8080")
+GROUPS_TTL = 6 * 3600
+RETRY_WINDOW = 50
+
+
+def _url(api, path):
+    url = api + path
+    if not url.startswith("http://127.0.0.1:"):
+        raise ValueError(f"refusing a non-local wuzapi url: {url}")
+    return url
+
+
+def _token(acc_id):
+    var = accounts_mod.token_env_var(acc_id)
+    if var in os.environ:
+        return os.environ[var]
+    try:
+        lines = store.secrets_path().read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        k, _, v = line.strip().partition("=")
+        if k.strip() == var:
+            return v.strip()
+    raise OSError(f"no {var} in secrets.env")
+
+
+def _request(method, acc_id, path, body=None):
+    req = urllib.request.Request(
+        _url(API, path), method=method, headers={"token": _token(acc_id), "Content-Type": "application/json"},
+        data=json.dumps(body).encode() if body is not None else None)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def http_post(acc_id, path, body):
+    return _request("POST", acc_id, path, body)
+
+
+def http_get(acc_id, path):
+    return _request("GET", acc_id, path)
+
+
+def _phone(jid):
+    return jid.split("@")[0].split(":")[0]
+
+
+def _account(d, acc_id):
+    acc = accounts_mod.by_id(accounts_mod.load(d), acc_id)
+    if acc is None:
+        raise KeyError(f"unknown account {acc_id!r}")
+    return acc
+
+
+def _mark_read_on_wuzapi(post, acc_id, jid, pairs):
+    """pairs: [(message_id, sender_jid)]. 1:1 chats send one call; groups one per sender."""
+    if not pairs:
+        return
+    chat = _phone(jid)
+    if not jid.endswith("@g.us"):
+        post(acc_id, "/chat/markread", {"Id": [m for m, _ in pairs], "ChatPhone": chat})
+        return
+    by_sender = {}
+    for mid, sender in pairs:
+        by_sender.setdefault(sender, []).append(mid)
+    for sender, ids in by_sender.items():
+        post(acc_id, "/chat/markread", {"Id": ids, "ChatPhone": chat, "SenderPhone": _phone(sender)})
+
+
+def read_chat(d, wuzdata, acc_id, jid, post):
+    acc = _account(d, acc_id)
+    conn = history.connect(wuzdata)
+    try:
+        uid = history.user_ids(conn)[acc["wuzapi_user"]]
+        top = history.last_id(conn, uid, jid)
+        pairs = history.unread_ids(conn, uid, jid, readstate.marker(readstate.load(d), acc_id, jid))
+    finally:
+        conn.close()
+    try:
+        _mark_read_on_wuzapi(post, acc_id, jid, pairs)
+        ok = True
+    except Exception:
+        ok = False
+    # ponytail: read.json is also written by the sink (in the container); mark()
+    # is an atomic replace but load-modify-save, so two simultaneous writers can
+    # lose one update. Accepted: the marker only rises and the next write fixes it.
+    readstate.mark(d, acc_id, jid, top, pending=not ok)
+    return {"ok": True} if ok else {"ok": False, "pending": True}
+
+
+def _retry_pending(d, wuzdata, post):
+    for key in list(readstate.load(d)["pending"]):
+        acc_id, jid = store.split_entry_id(key)
+        try:
+            acc = _account(d, acc_id)
+            conn = history.connect(wuzdata)
+            try:
+                uid = history.user_ids(conn)[acc["wuzapi_user"]]
+                # ponytail: the marker already rose, so the exact unread set is gone;
+                # re-ack the incoming rows of the last page instead.
+                page, _ = history.messages(conn, uid, jid, limit=RETRY_WINDOW)
+            finally:
+                conn.close()
+            _mark_read_on_wuzapi(post, acc_id, jid,
+                                 [(m["message_id"], m["sender"]) for m in page if not m["from_me"]])
+            readstate.mark(d, acc_id, jid, 0, pending=False)
+        except (OSError, KeyError, ValueError):
+            pass  # stays pending; next list retries
+
+
+def _group_names(d, accounts, get):
+    path = Path(d) / "groups.json"
+    cache = store.read_json(path, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    if time.time() - cache.get("fetched", 0) >= GROUPS_TTL:
+        names = dict(cache.get("names", {}))
+        try:
+            for acc in accounts:
+                data = get(acc["id"], "/group/list")
+                groups = (data.get("data") or {}).get("Groups") or []
+                names[acc["id"]] = {g["JID"]: g.get("Name", "") for g in groups}
+            cache = {"fetched": time.time(), "names": names}
+            store.atomic_write(path, json.dumps(cache))
+        except Exception:
+            pass  # network down: keep what we have
+    return cache.get("names", {})
+
+
+def _text(msg):
+    return msg["text"] or (f"[{msg['attachment']['type']}]" if msg.get("attachment") else "")
+
+
+def list_chats(d, wuzdata, post, get=http_get):
+    _retry_pending(d, wuzdata, post)
+    accts = accounts_mod.load(d)
+    enabled = store.load_config(d).get("groups_enabled", [])
+    names = _group_names(d, accts, get)
+    state = readstate.load(d)
+    conn = history.connect(wuzdata)
+    out = []
+    try:
+        uids = history.user_ids(conn)
+        for acc in accts:
+            uid = uids.get(acc["wuzapi_user"])
+            if uid is None:
+                continue
+            for c in history.chats(conn, uid):
+                jid, last = c["jid"], c["last"]
+                group = jid.endswith("@g.us")
+                name = (names.get(acc["id"], {}).get(jid) if group else None) or contacts.display_name(
+                    wuzdata, acc["wuzapi_user"], jid, "" if last["from_me"] else last["push_name"])
+                out.append({
+                    "account": acc["id"], "label": acc.get("label", acc["id"]), "jid": jid, "name": name,
+                    "last_text": _text(last), "last_ts": last["ts"], "last_id": c["last_id"],
+                    "unread": history.unread_count(conn, uid, jid, readstate.marker(state, acc["id"], jid)),
+                    "group": group, "muted": group and jid not in enabled})
+    finally:
+        conn.close()
+    out.sort(key=lambda c: -c["last_id"])
+    return {"chats": out}
+
+
+def messages_page(d, wuzdata, acc_id, jid, before=None):
+    acc = _account(d, acc_id)
+    conn = history.connect(wuzdata)
+    try:
+        msgs, more = history.messages(conn, history.user_ids(conn)[acc["wuzapi_user"]], jid, before=before)
+    finally:
+        conn.close()
+    seen = {}
+    for m in msgs:
+        key = (m["sender"], m["push_name"])
+        if m["from_me"]:
+            m["sender_name"] = ""
+        else:
+            if key not in seen:
+                seen[key] = contacts.display_name(wuzdata, acc["wuzapi_user"], m["sender"], m["push_name"])
+            m["sender_name"] = seen[key]
+    return {"messages": msgs, "more": more}
+
+
+def run_cli(argv, d, wuzdata):
+    try:
+        cmd = argv[0]
+        if cmd == "chats":
+            return list_chats(d, wuzdata, http_post)
+        if cmd == "messages":
+            before = int(argv[argv.index("--before") + 1]) if "--before" in argv else None
+            return messages_page(d, wuzdata, argv[1], argv[2], before)
+        if cmd == "read":
+            return read_chat(d, wuzdata, argv[1], argv[2], http_post)
+        return {"error": f"comando desconocido: {cmd}"}
+    except history.SchemaError:
+        return {"error": "esquema"}
+    except sqlite3.OperationalError as exc:
+        return {"error": "ocupada" if "locked" in str(exc) else str(exc)}
+    except (IndexError, ValueError):
+        return {"error": "uso: wa-chat chats | messages ACC JID [--before ID] | read ACC JID"}
+    except Exception as exc:  # the window shows whatever we say
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+if __name__ == "__main__":
+    print(json.dumps(run_cli(sys.argv[1:], store.data_dir(), store.wuzdata_dir()), ensure_ascii=False))

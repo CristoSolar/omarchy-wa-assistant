@@ -1,0 +1,154 @@
+# tests/test_wa_chat.py
+import importlib.machinery, importlib.util, json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from tests.runner import run, tmpdir
+from tests.test_history import Db, DM, GROUP
+from sink import readstate
+
+_p = Path(__file__).resolve().parents[1] / "bin" / "wa-chat"
+_loader = importlib.machinery.SourceFileLoader("wa_chat", str(_p))
+_spec = importlib.util.spec_from_loader("wa_chat", _loader)
+wc = importlib.util.module_from_spec(_spec)
+_loader.exec_module(wc)
+
+ACCOUNTS = [{"id": "personal", "label": "Personal", "wuzapi_user": "omarchy"},
+            {"id": "trabajo", "label": "Trabajo", "wuzapi_user": "trabajo"}]
+
+
+def _setup(d, groups_enabled=()):
+    (d / "accounts.json").write_text(json.dumps(ACCOUNTS))
+    (d / "config.json").write_text(json.dumps({"groups_enabled": list(groups_enabled)}))
+    return Db(d)
+
+
+def _get(names=None):
+    return lambda acc, path: {"data": {"Groups": [{"JID": j, "Name": n} for j, n in (names or {}).items()]}}
+
+
+class Post:
+    def __init__(self, fail=False):
+        self.calls, self.fail = [], fail
+
+    def __call__(self, acc, path, body):
+        if self.fail:
+            raise OSError("down")
+        self.calls.append((acc, path, body))
+        return {}
+
+
+def _chats(d, post=None, get=None):
+    return wc.list_chats(d, d, post or Post(), get=get or _get())["chats"]
+
+
+def test_chats_list_names_groups_muted_and_unread():
+    with tmpdir() as d:
+        db = _setup(d, groups_enabled=[])
+        readstate.ensure(d, 0)
+        db.add(DM, "hola", push="Ana"); db.add(GROUP, "buenas", sender="56922@s.whatsapp.net")
+        cs = _chats(d, get=_get({GROUP: "Equipo"}))
+        by = {c["jid"]: c for c in cs}
+        assert by[GROUP]["name"] == "Equipo" and by[GROUP]["group"] and by[GROUP]["muted"]
+        assert by[DM]["name"] == "Ana" and not by[DM]["group"] and not by[DM]["muted"]
+        assert by[DM]["unread"] == 1 and by[DM]["account"] == "personal" and by[DM]["label"] == "Personal"
+        assert by[DM]["last_text"] == "hola" and by[DM]["last_id"] == 1
+
+
+def test_enabled_group_is_not_muted_and_marker_clears_unread():
+    with tmpdir() as d:
+        db = _setup(d, groups_enabled=[GROUP])
+        readstate.ensure(d, 0)
+        db.add(GROUP, "buenas", sender="56922@s.whatsapp.net")
+        readstate.mark(d, "personal", GROUP, 1)
+        (c,) = _chats(d)
+        assert not c["muted"] and c["unread"] == 0
+
+
+def test_read_in_a_group_posts_one_call_per_sender_and_marks():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(GROUP, "a", sender="56911@s.whatsapp.net"); db.add(GROUP, "b", sender="56922@s.whatsapp.net")
+        db.add(GROUP, "c", sender="56911@s.whatsapp.net")
+        post = Post()
+        assert wc.read_chat(d, d, "personal", GROUP, post) == {"ok": True}
+        assert len(post.calls) == 2
+        by = {c[2]["SenderPhone"]: c[2] for c in post.calls}
+        assert by["56911"]["Id"] == ["M1", "M3"] and by["56922"]["Id"] == ["M2"]
+        assert all(c[1] == "/chat/markread" and c[2]["ChatPhone"] == "120363000000000001" for c in post.calls)
+        st = readstate.load(d)
+        assert readstate.marker(st, "personal", GROUP) == 3 and st["pending"] == []
+
+
+def test_read_in_a_dm_has_no_sender_phone():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        post = Post()
+        wc.read_chat(d, d, "personal", DM, post)
+        (c,) = post.calls
+        assert c[2] == {"Id": ["M1"], "ChatPhone": "56911111111"}
+
+
+def test_failed_post_is_pending_and_marker_still_rises_then_retried_on_next_list():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        assert wc.read_chat(d, d, "personal", DM, Post(fail=True)) == {"ok": False, "pending": True}
+        st = readstate.load(d)
+        assert readstate.marker(st, "personal", DM) == 1 and len(st["pending"]) == 1
+        post = Post()
+        _chats(d, post=post)
+        assert len(post.calls) == 1 and post.calls[0][2]["Id"] == ["M1"]
+        assert readstate.load(d)["pending"] == []
+
+
+def test_pending_stays_when_retry_fails():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(DM, "a")
+        wc.read_chat(d, d, "personal", DM, Post(fail=True))
+        _chats(d, post=Post(fail=True))
+        assert len(readstate.load(d)["pending"]) == 1
+
+
+def test_groups_cache_is_reused_within_six_hours_and_kept_on_network_failure():
+    with tmpdir() as d:
+        db = _setup(d); readstate.ensure(d, 0)
+        db.add(GROUP, "x", sender="56922@s.whatsapp.net")
+        _chats(d, get=_get({GROUP: "Equipo"}))
+        calls = []
+        def boom(acc, path):
+            calls.append(acc); raise OSError("down")
+        assert _chats(d, get=boom)[0]["name"] == "Equipo" and calls == []
+        cache = json.loads((d / "groups.json").read_text())
+        cache["fetched"] = 0
+        (d / "groups.json").write_text(json.dumps(cache))
+        assert _chats(d, get=boom)[0]["name"] == "Equipo" and calls
+
+
+def test_messages_page_adds_sender_name():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.add(DM, "uno", push="Ana"); db.add(DM, "dos", push="Ana")
+        out = wc.messages_page(d, d, "personal", DM, before=2)
+        assert [m["text"] for m in out["messages"]] == ["uno"] and out["messages"][0]["sender_name"] == "Ana"
+        assert out["more"] is False
+
+
+def test_errors_become_json():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.c.execute("DROP TABLE message_history"); db.c.execute("CREATE TABLE message_history (id)"); db.c.commit()
+        assert wc.run_cli(["chats"], d, d) == {"error": "esquema"}
+
+
+def test_wuzapi_url_must_be_local():
+    try:
+        wc._url("http://evil.example/x", "/p")
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+if __name__ == "__main__":
+    run(dict(globals()))
