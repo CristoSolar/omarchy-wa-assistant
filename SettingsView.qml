@@ -3,6 +3,7 @@ pragma ComponentBehavior: Bound
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
+import Quickshell
 import Quickshell.Io
 import qs.Ui
 import qs.Commons
@@ -10,11 +11,20 @@ import qs.Commons
 // The settings screen: list accounts, link a new one, unlink one behind a
 // typed confirmation, and edit each account's tone and quick replies.
 //
-// Embedded as a plain child of ChatWindow.qml (not a Loader), so it is never
-// destroyed while a link or unlink is mid-flight — toggling the gear only
-// changes `visible`, the same technique the list/conversation split in ChatWindow.qml
-// already uses. This is deliberate: a pairing run takes a while, and the
-// person may close the window to do something else while it waits. The Process instances below keep running regardless.
+// Embedded as a plain child of ChatWindow.qml, which the shell destroys
+// whenever the window closes (Esc, ✕, the bar button) — and every Process
+// in it is killed with it. A pairing takes minutes and the person may well
+// close the window while it waits; a wa-pair or wa-unlink killed halfway
+// can leave the wuzapi user, accounts.json and secrets.env out of step. So
+// neither runs as a child of this view: `detached()` starts each one in its
+// own transient systemd user unit (systemd-run --user --collect), which
+// outlives the window and even a shell restart, with its --json event
+// stream going to a file under the state root (link.jsonl / unlink.jsonl).
+// This view only reads that file back, polling it once a second while the
+// run is alive, and replays it from the top on every read. When the window
+// is opened again, Component.onCompleted finds the file and picks the run
+// up where it is — still going, or finished while nobody was looking. The
+// file is emptied once its result has been shown and the person moves on.
 //
 // This view owns its OWN Processes for everything it does. It never calls
 // into ChatWindow.qml's `doSend()` or any of its Process ids — that is
@@ -27,6 +37,8 @@ ColumnLayout {
   spacing: Style.spacing.lg
 
   property string pluginDir: ""
+  // Where link.jsonl / unlink.jsonl live; ChatWindow.qml passes its own.
+  property string stateRoot: ""
   property color foreground: Color.foreground
   property string fontFamily: Style.font.family
   property color urgent: Color.urgent
@@ -57,13 +69,18 @@ ColumnLayout {
   // history rather than news. Once the result has been shown and the
   // screen closed, the screen has done its job; the next open starts from
   // the list, freshly read.
+  //
+  // A run that finished while this screen was not on view (the window
+  // closed, or the person in a chat) shows its result once on the next
+  // open instead: *ResultShown records that it has been seen.
   function onShown() {
-    if (root.mode === "unlink" && root.unlinkDone)
-      root.mode = "list"
-    else if (root.mode === "link"
-             && (root.linkStage === "done" || root.linkStage === "error"
-                 || root.linkStage === "no_terminal"))
-      root.mode = "list"
+    if (root.mode === "unlink" && root.unlinkDone) {
+      if (root.unlinkResultShown) root.mode = "list"
+      else root.unlinkResultShown = true
+    } else if (root.mode === "link" && root.linkFinished()) {
+      if (root.linkResultShown) root.mode = "list"
+      else root.linkResultShown = true
+    }
     if (root.mode === "list") {
       root.refreshAccounts()
       root.fetchMediaCacheSize()
@@ -73,6 +90,59 @@ ColumnLayout {
   Component.onCompleted: {
     root.refreshAccounts()
     root.fetchMediaCacheSize()
+    root.recoverRuns()
+  }
+
+  // -------------------------------------------------------------------
+  // Detached runs (see the header). One fixed unit name per script, so a
+  // second link or unlink cannot start while one is alive: systemd-run
+  // refuses a unit that already exists.
+  // -------------------------------------------------------------------
+
+  readonly property string linkLog: root.stateRoot + "/link.jsonl"
+  readonly property string unlinkLog: root.stateRoot + "/unlink.jsonl"
+
+  function detached(unit, log, argv) {
+    var cmd = ["systemd-run", "--user", "--collect", "--quiet", "--unit=" + unit,
+               "-p", "StandardOutput=truncate:" + log, "-p", "StandardError=journal"]
+    // The unit starts from the user manager's environment, not the
+    // shell's: carry over the state overrides this window itself honors.
+    var vars = ["WA_STATE_ROOT", "WA_DATA_DIR", "WA_SECRETS_FILE"]
+    for (var i = 0; i < vars.length; i++) {
+      var v = Quickshell.env(vars[i])
+      if (v) cmd.push("--setenv=" + vars[i] + "=" + v)
+    }
+    return cmd.concat(["--"], argv)
+  }
+
+  // One probe answers both questions at once, in this order: is the unit
+  // still alive, then what has it written. Checking first means a "gone"
+  // answer always comes with the complete file (the run has exited).
+  function probeCommand(unit, log) {
+    return ["sh", "-c", 'if systemctl --user is-active --quiet "$1"; then echo active; '
+            + 'else echo gone; fi; cat "$2" 2>/dev/null', "sh", unit, log]
+  }
+
+  // The window was (re)opened: pick up a run that a previous window
+  // started, still going or finished while nobody was looking.
+  function recoverRuns() {
+    root.unlinkRecovering = true
+    unlinkProbe.running = true
+    root.linkRecovering = true
+    linkProbe.running = true
+  }
+
+  // Leaving a finished run's screen is what "the result was seen" means;
+  // the file is emptied so the next window does not bring it back.
+  onModeChanged: {
+    if (root.mode !== "link" && !root.linkRunning && root.linkOwnsLog) {
+      Quickshell.execDetached(["truncate", "-s", "0", root.linkLog])
+      root.linkOwnsLog = false
+    }
+    if (root.mode !== "unlink" && !root.unlinkRunning && root.unlinkOwnsLog) {
+      Quickshell.execDetached(["truncate", "-s", "0", root.unlinkLog])
+      root.unlinkOwnsLog = false
+    }
   }
 
   // -------------------------------------------------------------------
@@ -115,8 +185,8 @@ ColumnLayout {
   }
 
   // Set only once a usable answer (parsed JSON, either shape) actually
-  // arrives. Checked in onExited the same way this file's `unlinkProc` and
-  // `pairProc` check their own terminal-event flags: a process that dies
+  // arrives. Checked the same way linkProbe and unlinkProbe check the
+  // link/unlink terminal-event flags: a process that dies
   // without ever printing something this handler could parse — killed,
   // crashed before writing a line — must not leave the size silently
   // wherever it last was; it has to say plainly that nothing was learned.
@@ -139,7 +209,7 @@ ColumnLayout {
         }
         // Neither shape: leave mediaSizeTerminalSeen false and let
         // onExited below report it — the same "no terminal event" case
-        // pairProc/unlinkProc already handle in this file.
+        // the link and unlink runs already handle in this file.
       }
     }
     onExited: function (exitCode) {
@@ -339,11 +409,9 @@ ColumnLayout {
 
   // -------------------------------------------------------------------
   // Linking — the centrepiece. `wa-pair --json` emits one JSON object per
-  // line over several minutes; this reads it incrementally via SplitParser
-  // (onRead fires per line, as it arrives) rather than collecting the
-  // whole stream and waiting for exit, which is what makes the code
-  // shows up while it is still happening instead of only once the process
-  // is long gone.
+  // line over several minutes into link.jsonl; linkPoll re-reads and
+  // replays the file every second, which is what makes the code show up while the run is
+  // still happening instead of only once it is long gone.
   // -------------------------------------------------------------------
 
   property string linkAccountId: ""
@@ -354,14 +422,28 @@ ColumnLayout {
   property string linkCode: ""
   property string linkError: ""
   // Set the moment a "done" or "error" event is actually parsed. Checked
-  // in pairProc's onExited: if the process ends and this is still false,
-  // the stream ended with no terminal event — the script's own header
-  // says a SIGKILL cannot run its EXIT trap, so this is a real outcome
-  // the UI must show plainly, not a bug to paper over with a spinner.
+  // once the unit is gone (linkProbe): if it is still false, the stream
+  // ended with no terminal event — the script's own header says a SIGKILL
+  // cannot run its EXIT trap, so this is a real outcome the UI must show
+  // plainly, not a bug to paper over with a spinner.
   property bool linkTerminalSeen: false
+  // The omarchy-wa-pair unit is (or may be) alive: linkPoll runs.
+  property bool linkRunning: false
+  property bool linkResultShown: false
+  // link.jsonl holds a run this view started or recovered (never clear a
+  // file some other run is writing).
+  property bool linkOwnsLog: false
+  property bool linkRecovering: false
+
+  function linkFinished() {
+    return root.linkStage === "done" || root.linkStage === "error"
+      || root.linkStage === "no_terminal"
+  }
 
   function openLink() {
     root.mode = "link"
+    if (root.linkRunning)
+      return  // show the run that is going, never a fresh form over it
     root.linkStage = "form"
     root.linkAccountId = ""
     root.linkNumber = ""
@@ -370,7 +452,7 @@ ColumnLayout {
   }
 
   function startLink() {
-    if (pairProc.running)
+    if (root.linkRunning || root.linkRecovering || pairLaunch.running)
       return
     var id = root.linkAccountId.trim()
     var num = root.linkNumber.trim()
@@ -380,8 +462,24 @@ ColumnLayout {
     root.linkCode = ""
     root.linkError = ""
     root.linkTerminalSeen = false
-    pairProc.command = [root.pluginDir + "bin/wa-pair", id, num, "--json"]
-    pairProc.running = true
+    root.linkResultShown = false
+    pairLaunch.command = root.detached("omarchy-wa-pair", root.linkLog, [root.pluginDir + "bin/wa-pair", id, num, "--json"])
+    pairLaunch.running = true
+  }
+
+  // Rebuild the whole link state from link.jsonl, from the top.
+  function replayLink(lines) {
+    root.linkStage = "validating"
+    root.linkCode = ""
+    root.linkError = ""
+    root.linkTerminalSeen = false
+    for (var i = 0; i < lines.length; i++)
+      root.handlePairLine(lines[i])
+  }
+
+  function linkEnded() {
+    root.linkRunning = false
+    if (root.visible) root.linkResultShown = true
   }
 
   function handlePairLine(line) {
@@ -395,6 +493,7 @@ ColumnLayout {
     switch (obj.event) {
     case "validating":
       root.linkStage = "validating"
+      if (obj.account) root.linkAccountId = obj.account
       break
     case "code":
       root.linkCode = obj.code || ""
@@ -416,19 +515,65 @@ ColumnLayout {
     }
   }
 
+  // systemd-run returns as soon as the unit has started; the run itself
+  // is then followed through link.jsonl.
   Process {
-    id: pairProc
-    stdout: SplitParser { onRead: function (line) { root.handlePairLine(line) } }
+    id: pairLaunch
+    stderr: StdioCollector { id: pairLaunchErr }
     onExited: function (exitCode) {
-      if (!root.linkTerminalSeen) {
-        root.linkStage = "no_terminal"
-        root.linkError = "wa-pair terminó (código " + exitCode + ") sin "
-          + "confirmar el resultado. Puede haber sido interrumpido a la "
-          + "fuerza. No se sabe si la cuenta quedó vinculada — revisá "
-          + "manualmente antes de reintentar (por ejemplo, mirando si la "
-          + "cuenta aparece en la lista, o los logs del contenedor)."
+      if (exitCode === 0) {
+        root.linkOwnsLog = true
+        root.linkRunning = true
+        return
       }
+      root.linkStage = "error"
+      root.linkTerminalSeen = true
+      root.linkError = "No se pudo iniciar wa-pair (systemd-run, código " + exitCode
+        + "). ¿Ya hay una vinculación en curso? " + String(pairLaunchErr.text || "").trim()
+      root.linkEnded()
     }
+  }
+
+  Timer {
+    id: linkPoll
+    interval: 1000; repeat: true
+    running: root.linkRunning
+    onTriggered: if (!linkProbe.running) linkProbe.running = true
+  }
+
+  Process {
+    id: linkProbe
+    command: root.probeCommand("omarchy-wa-pair.service", root.linkLog)
+    stdout: StdioCollector { onStreamFinished: root.onLinkProbe(text) }
+  }
+
+  function onLinkProbe(text) {
+    var lines = String(text || "").split("\n")
+    var active = lines.shift() === "active"
+    if (root.linkRecovering) {
+      root.linkRecovering = false
+      if (!active && lines.join("").trim() === "")
+        return  // nothing to pick up
+      root.linkOwnsLog = true
+      root.linkResultShown = false
+      root.mode = "link"
+    } else if (!root.linkRunning) {
+      return
+    }
+    root.replayLink(lines)
+    if (!root.linkTerminalSeen && active) {
+      root.linkRunning = true
+      return
+    }
+    if (!root.linkTerminalSeen) {
+      root.linkStage = "no_terminal"
+      root.linkError = "wa-pair terminó sin "
+        + "confirmar el resultado. Puede haber sido interrumpido a la "
+        + "fuerza. No se sabe si la cuenta quedó vinculada — revisá "
+        + "manualmente antes de reintentar (por ejemplo, mirando si la "
+        + "cuenta aparece en la lista, o los logs del contenedor)."
+    }
+    root.linkEnded()
   }
 
   ColumnLayout {
@@ -605,6 +750,14 @@ ColumnLayout {
   property string unlinkWarning: ""
   property bool unlinkTerminalSeen: false
   property string unlinkError: ""
+  // Same roles as their link* counterparts.
+  property bool unlinkRunning: false
+  property bool unlinkResultShown: false
+  property bool unlinkOwnsLog: false
+  property bool unlinkRecovering: false
+  // Picked up from unlink.jsonl by a new window: the discard count asked
+  // before it started is gone, so it is not shown.
+  property bool unlinkRecovered: false
 
   function unlinkConfirmed() {
     return root.unlinkTyped.trim() === root.unlinkAccountId && root.unlinkAccountId !== ""
@@ -622,6 +775,9 @@ ColumnLayout {
 
   function openUnlink(accountId) {
     root.mode = "unlink"
+    if (root.unlinkRunning)
+      return
+    root.unlinkRecovered = false
     root.unlinkAccountId = accountId
     root.unlinkTyped = ""
     root.unlinkPending = null
@@ -670,13 +826,32 @@ ColumnLayout {
   }
 
   function doUnlink() {
-    if (unlinkProc.running || !root.unlinkConfirmed() || !root.unlinkCountKnown())
+    if (root.unlinkRunning || root.unlinkRecovering || unlinkLaunch.running
+        || !root.unlinkConfirmed() || !root.unlinkCountKnown())
       return
     root.unlinkBusy = true
     root.unlinkError = ""
     root.unlinkTerminalSeen = false
-    unlinkProc.command = [root.pluginDir + "bin/wa-unlink", "--json", root.unlinkAccountId]
-    unlinkProc.running = true
+    root.unlinkResultShown = false
+    unlinkLaunch.command = root.detached("omarchy-wa-unlink", root.unlinkLog, [root.pluginDir + "bin/wa-unlink", "--json", root.unlinkAccountId])
+    unlinkLaunch.running = true
+  }
+
+  // Rebuild the whole unlink state from unlink.jsonl, from the top.
+  function replayUnlink(lines) {
+    root.unlinkWarning = ""
+    root.unlinkError = ""
+    root.unlinkDone = false
+    root.unlinkTerminalSeen = false
+    root.unlinkBusy = true
+    for (var i = 0; i < lines.length; i++)
+      root.handleUnlinkLine(lines[i])
+  }
+
+  function unlinkEnded() {
+    root.unlinkRunning = false
+    root.unlinkBusy = false
+    if (root.visible) root.unlinkResultShown = true
   }
 
   function handleUnlinkLine(line) {
@@ -684,7 +859,9 @@ ColumnLayout {
     try { obj = JSON.parse(String(line).trim()) } catch (e) { return }
     if (!obj || !obj.event)
       return
-    if (obj.event === "user_removed" && obj.ok === false) {
+    if (obj.event === "validating" && obj.account) {
+      root.unlinkAccountId = obj.account
+    } else if (obj.event === "user_removed" && obj.ok === false) {
       // Not fatal — the local cleanup goes on, and it should: an
       // unreachable wuzapi must never leave an account un-removable. But
       // a wuzapi user left behind is exactly what breaks the NEXT link of
@@ -709,17 +886,61 @@ ColumnLayout {
   }
 
   Process {
-    id: unlinkProc
-    stdout: SplitParser { onRead: function (line) { root.handleUnlinkLine(line) } }
+    id: unlinkLaunch
+    stderr: StdioCollector { id: unlinkLaunchErr }
     onExited: function (exitCode) {
-      root.unlinkBusy = false
-      if (!root.unlinkTerminalSeen) {
-        root.unlinkError = "wa-unlink terminó (código " + exitCode + ") sin "
-          + "confirmar el resultado. Revisá a mano si la cuenta sigue en "
-          + "accounts.json antes de reintentar — no se sabe si terminó de "
-          + "desvincularse."
+      if (exitCode === 0) {
+        root.unlinkOwnsLog = true
+        root.unlinkRunning = true
+        return
       }
+      root.unlinkTerminalSeen = true
+      root.unlinkError = "No se pudo iniciar wa-unlink (systemd-run, código " + exitCode
+        + "). ¿Ya hay una desvinculación en curso? " + String(unlinkLaunchErr.text || "").trim()
+      root.unlinkEnded()
     }
+  }
+
+  Timer {
+    id: unlinkPoll
+    interval: 1000; repeat: true
+    running: root.unlinkRunning
+    onTriggered: if (!unlinkProbe.running) unlinkProbe.running = true
+  }
+
+  Process {
+    id: unlinkProbe
+    command: root.probeCommand("omarchy-wa-unlink.service", root.unlinkLog)
+    stdout: StdioCollector { onStreamFinished: root.onUnlinkProbe(text) }
+  }
+
+  function onUnlinkProbe(text) {
+    var lines = String(text || "").split("\n")
+    var active = lines.shift() === "active"
+    if (root.unlinkRecovering) {
+      root.unlinkRecovering = false
+      if (!active && lines.join("").trim() === "")
+        return
+      root.unlinkOwnsLog = true
+      root.unlinkRecovered = true
+      root.unlinkResultShown = false
+      root.mode = "unlink"
+    } else if (!root.unlinkRunning) {
+      return
+    }
+    root.replayUnlink(lines)
+    if (root.unlinkRecovered) root.unlinkTyped = root.unlinkAccountId
+    if (!root.unlinkTerminalSeen && active) {
+      root.unlinkRunning = true
+      return
+    }
+    if (!root.unlinkTerminalSeen) {
+      root.unlinkError = "wa-unlink terminó sin "
+        + "confirmar el resultado. Revisá a mano si la cuenta sigue en "
+        + "accounts.json antes de reintentar — no se sabe si terminó de "
+        + "desvincularse."
+    }
+    root.unlinkEnded()
   }
 
   // Wrapped for the same reason as the link-progress view: unlinkWarning
@@ -749,6 +970,7 @@ ColumnLayout {
 
     Text {
       textFormat: Text.PlainText
+      visible: !root.unlinkRecovered
       text: root.unlinkPending === null
         ? "Calculando cuántas conversaciones pendientes se van a descartar…"
         : root.unlinkPending < 0

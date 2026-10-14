@@ -454,9 +454,16 @@ every configured account, and from there you can link a new one, edit an
 existing account's tone or quick replies, or unlink it. It never sends a
 message — there is no send path in the settings screen at all, only
 `wa-pair`/`wa-unlink`/`wa-reply`'s read and write subcommands for tone and
-quick replies — and it keeps running a link or an unlink in the background
-even if you close the settings screen or the whole chat window while one is
-mid-flight.
+quick replies.
+
+A link or an unlink keeps running if you close the settings screen or the
+whole chat window while it is mid-flight, and even across a bar restart:
+the screen starts `wa-pair`/`wa-unlink` in its own transient systemd user
+unit (`omarchy-wa-pair` / `omarchy-wa-unlink`, via `systemd-run --user`),
+not as a child of the window, with its `--json` progress going to
+`link.jsonl` / `unlink.jsonl` in the state root. Reopen the window and the
+gear shows that run where it is, or its result if it finished while the
+window was closed. Only one link and one unlink can run at a time.
 
 Above the account list, a "Caché de adjuntos" box shows how much disk the
 attachment cache takes (from `bin/wa-media size`) and a **Vaciar caché**
@@ -475,8 +482,8 @@ mode and shows its progress one stage at a time:
    devices > Link device > Link with phone number.
 3. **Linked. Confirming the webhook…**, then the screen reports done.
 
-If `wa-pair` is killed mid-run (a bar restart, a crash) before it reports
-its final result, the screen says so plainly instead of guessing — it does
+If `wa-pair` dies mid-run (a crash, a kill) before it reports its final
+result, the screen says so plainly instead of guessing — it does
 not know whether the account ended up linked, and tells you to check by
 hand (the account list, or `docker logs omarchy-wa-sink`) before retrying.
 
@@ -933,6 +940,9 @@ Everything lives under `~/.local/share/omarchy-wa/` (mode 700):
   `state/focused` is written by the window so `wa-notify` knows which chat
   you are looking at; `state/chat_unknown.json` records chat sends whose
   outcome is unknown (see "Sends whose outcome nobody knows").
+- `link.jsonl` / `unlink.jsonl` — the `--json` progress of the last link or
+  unlink started from the settings screen, kept until its result has been
+  shown (see "Settings screen").
 
 Three environment variables override these independently, which is the
 point of splitting them: `WA_STATE_ROOT` (the root above), `WA_DATA_DIR`

@@ -681,6 +681,7 @@ Item {
           Layout.fillWidth: true
           Layout.fillHeight: true
           pluginDir: root.pluginDir
+          stateRoot: root.stateRoot
           foreground: root.fg
           fontFamily: root.fontFamily
           urgent: root.urgent

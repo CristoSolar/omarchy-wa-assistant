@@ -487,10 +487,18 @@ donde la dejaste. Lista todas las cuentas configuradas, y desde ahí podés
 emparejar una nueva, editar el tono o las respuestas rápidas de una cuenta
 existente, o desvincularla. Nunca envía un mensaje — no hay ningún camino
 de envío en la pantalla de configuración, solo los subcomandos de lectura y
-escritura de tono y respuestas rápidas de `wa-pair`/`wa-unlink`/`wa-reply`
-— y sigue corriendo un emparejamiento o una desvinculación en segundo plano
-aunque cierres la pantalla de configuración o todo la ventana de chat mientras uno
-está en curso.
+escritura de tono y respuestas rápidas de `wa-pair`/`wa-unlink`/`wa-reply`.
+
+Un emparejamiento o una desvinculación sigue corriendo aunque cierres la
+pantalla de configuración o toda la ventana de chat mientras está en
+curso, y hasta si reiniciás la barra: la pantalla arranca `wa-pair`/
+`wa-unlink` en su propia unidad transitoria de systemd de usuario
+(`omarchy-wa-pair` / `omarchy-wa-unlink`, con `systemd-run --user`), no
+como hijo de la ventana, y su progreso `--json` va a `link.jsonl` /
+`unlink.jsonl` en la raíz de estado. Volvés a abrir la ventana y el
+engranaje muestra esa corrida donde está, o su resultado si terminó con la
+ventana cerrada. Corre un solo emparejamiento y una sola desvinculación a
+la vez.
 
 Arriba de la lista de cuentas, un recuadro "Caché de adjuntos" muestra
 cuánto disco ocupa la caché de adjuntos (según `bin/wa-media size`) y un
@@ -511,7 +519,7 @@ de cuenta y un número de teléfono — y después corre `wa-pair` en modo
 3. **Vinculado. Confirmando el webhook…**, y después la pantalla informa
    que terminó.
 
-Si `wa-pair` se corta a la mitad (un reinicio de la barra, un crash) antes
+Si `wa-pair` muere a la mitad (un crash, alguien lo mata) antes
 de reportar su resultado final, la pantalla lo dice claramente
 en vez de adivinar — no sabe si la cuenta terminó vinculada, y te pide que
 lo chequees a mano (la lista de cuentas, o `docker logs omarchy-wa-sink`)
@@ -994,6 +1002,10 @@ Todo vive bajo `~/.local/share/omarchy-wa/` (modo 700):
   `wa-notify` sepa qué chat estás mirando; `state/chat_unknown.json` anota
   los envíos de chat de resultado desconocido (ver "Envíos cuyo resultado
   nadie conoce").
+- `link.jsonl` / `unlink.jsonl` — el progreso `--json` del último
+  emparejamiento o desvinculación que arrancó la pantalla de
+  configuración, guardado hasta que se mostró su resultado (ver "Pantalla
+  de configuración").
 
 Tres variables de entorno permiten mover cada cosa por separado, que es el
 punto de haberlas separado: `WA_STATE_ROOT` (la raíz de arriba),

@@ -612,6 +612,27 @@ def test_reopening_settings_after_a_finished_unlink_starts_from_the_list():
         "gear is opened")
 
 
+def test_closing_the_window_never_kills_a_link_or_an_unlink():
+    """ChatWindow is destroyed on hide, and every Process in it dies with
+    it. wa-pair and wa-unlink run in their own transient systemd unit, with
+    their --json stream going to a file the view reads back."""
+    for script, unit, log in (("wa-pair", "omarchy-wa-pair", "link.jsonl"),
+                              ("wa-unlink", "omarchy-wa-unlink", "unlink.jsonl")):
+        assert re.search(r'root\.detached\("%s", root\.\w+Log, \[root\.pluginDir \+ "bin/%s"'
+                         % (unit, script), SETTINGS), script
+        assert '"/%s"' % log in SETTINGS, log
+    # no Process runs either script directly any more (wa-unlink --count-only
+    # only reads, and is the one exception)
+    direct = re.findall(r'\w+\.command = \[root\.pluginDir \+ "bin/(wa-pair|wa-unlink)",([^\]]*)', SETTINGS)
+    assert all(script == "wa-unlink" and "--count-only" in rest for script, rest in direct), direct
+    m = re.search(r"function detached\((.*?)\n  \}", SETTINGS, re.S)
+    assert m and '"systemd-run", "--user", "--collect"' in m.group(1)
+    assert "StandardOutput=truncate:" in m.group(1)
+    assert "keep running regardless" not in SETTINGS
+    chat = (ROOT / "ChatWindow.qml").read_text()
+    assert re.search(r"SettingsView \{[^}]*stateRoot: root\.stateRoot", chat, re.S)
+
+
 # --- Task 2 (auto-clear): the webhook subscription must include ---------
 # --- ReadReceipt, everywhere wa-pair and wa-heal set it, not just once ---
 #
