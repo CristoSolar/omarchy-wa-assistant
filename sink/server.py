@@ -93,6 +93,25 @@ def touch_changed(d) -> None:
     p.touch()
 
 
+def ensure_baseline(data_dir) -> None:
+    """Create read.json (since = newest history row now) if it is absent.
+
+    Called at start and before every event, so rows that arrive before the
+    first read event are never folded into `since`. An unavailable
+    users.db is logged and left for the next event.
+    """
+    if (Path(data_dir) / "read.json").exists():
+        return
+    try:
+        conn = history.connect(store.wuzdata_dir())
+        try:
+            readstate.ensure(data_dir, history.last_id(conn))
+        finally:
+            conn.close()
+    except (sqlite3.Error, history.SchemaError) as exc:
+        print(f"read baseline not set yet: {exc}", file=sys.stderr, flush=True)
+
+
 def _mark_read(data_dir, instance_name, account_id, jid) -> None:
     """Record that the owner has read `jid` up to wuzapi's newest row for it.
 
@@ -183,7 +202,13 @@ def _handle_own_message(own, instance_name, data_dir) -> bool:
     store.append_context(data_dir, jid,
                          {"direction": "out", "text": own["text"],
                           "ts": own["ts"]}, account_id)
-    _mark_read(data_dir, instance_name, account_id, jid)
+    # An echo older than the queued entry (a superseded send) must neither
+    # clear it nor mark the chat read up to the newer message it holds.
+    kept = any(e["id"] == store.entry_id(account_id, jid)
+               and not _newer_than_entry(own["ts"], e.get("ts"))
+               for e in store.load_queue(data_dir))
+    if not kept:
+        _mark_read(data_dir, instance_name, account_id, jid)
     _remove_unless_ambiguous(data_dir, account_id, jid, own["ts"])
     return True
 
@@ -193,6 +218,7 @@ def handle_payload(raw: bytes, content_type: str, data_dir) -> bool:
     if event is None:
         return False
     try:
+        ensure_baseline(data_dir)
         return _handle_event(event, instance_name, data_dir)
     finally:
         touch_changed(data_dir)
@@ -308,6 +334,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     Handler.data_dir = store.data_dir()
+    ensure_baseline(Handler.data_dir)
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

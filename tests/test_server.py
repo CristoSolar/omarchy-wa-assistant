@@ -149,7 +149,7 @@ def test_a_plain_read_receipt_marks_nothing():
         db.add(DM, "uno")
         with _wuz(wuz):
             _post(_receipt("Read"), state)
-        assert not (state / "read.json").exists()
+        assert readstate.load(state)["chats"] == {}
 
 
 def test_an_own_device_message_marks_the_chat_read():
@@ -219,6 +219,35 @@ def test_the_echo_of_an_older_send_does_not_delete_a_newer_unanswered_message():
         echo["event"]["Info"]["Timestamp"] = "2026-09-22T16:01:00Z"
         _post(echo, d)
         assert len(store.load_queue(d)) == 1
+
+
+def test_that_echo_does_not_mark_the_chat_read_past_the_kept_entry():
+    with tmpdir() as d:
+        state, wuz, db = _setup(d)
+        db.add(DM, "uno")
+        with _wuz(wuz):
+            _post(_event(), state)
+            db.add(DM, "y otra cosa")
+            echo = _event(is_from_me=True, text="respuesta")
+            echo["event"]["Info"]["Timestamp"] = "2026-09-22T15:59:00Z"
+            _post(echo, state)
+        assert len(store.load_queue(state)) == 1
+        s = readstate.load(state)
+        assert readstate.marker(s, "personal", DM) == s["since"]
+
+
+def test_a_message_arriving_before_the_first_read_event_stays_unread():
+    with tmpdir() as d:
+        state, wuz, db = _setup(d)
+        old = db.add(DM, "viejo")
+        other = "56944444444@s.whatsapp.net"
+        with _wuz(wuz):
+            _post(_event(chat=other), state)       # baseline baked here
+            db.add(other, "nuevo")
+            _post(_receipt("ReadSelf"), state)     # first read event, other chat
+        s = readstate.load(state)
+        assert s["since"] == old
+        assert readstate.marker(s, "personal", other) == old
 
 
 # --- Task 2: account resolution ----------------------------------------
