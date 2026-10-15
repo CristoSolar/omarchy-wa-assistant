@@ -925,6 +925,32 @@ Item {
     }
   }
 
+  // "Guardar como": a copy out of the cache, wherever the owner picks.
+  // Nothing is copied unless asked; the cache itself stays where it is.
+  function saveMedia(path, ts) {
+    if (saveProc.running) return
+    var ext = (String(path).match(/\.[a-z0-9]+$/) || [""])[0]
+    var stamp = String(ts).replace("T", " ").slice(0, 19).replace(/:/g, ".")
+    saveProc.command = ["sh", "-c",
+      'd=$(xdg-user-dir DOWNLOAD 2>/dev/null); [ -d "$d" ] || d="$HOME"; ' +
+      'f=$(zenity --file-selection --save --confirm-overwrite --title="Guardar adjunto" --filename="$d/$2") || exit 3; ' +
+      'cp -- "$1" "$f" && printf %s "$f"',
+      "sh", path, "WhatsApp " + (stamp || "adjunto") + ext]
+    saveProc.running = true
+  }
+  Process {
+    id: saveProc
+    property string out: ""
+    stdout: StdioCollector { onStreamFinished: saveProc.out = text }
+    onExited: function(exitCode) {
+      if (exitCode === 3) return  // cancelled
+      root.status = exitCode === 0 && saveProc.out !== "" ? "Guardado en " + saveProc.out
+                    : "No se pudo guardar (código " + exitCode + ")"
+      root.statusWarn = exitCode !== 0
+      saveProc.out = ""
+    }
+  }
+
   function toggleAudio(messageId, path) {
     if (root.playingId === messageId) {
       if (audioPlayer.playbackState === MediaPlayer.PlayingState) audioPlayer.pause()
@@ -1640,6 +1666,23 @@ Item {
                         textFormat: Text.PlainText
                         text: msgRow.reacts
                         font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        visible: msgRow.ready
+                        text: "⬇ Guardar"
+                        color: root.fg
+                        opacity: saveMouse.containsMouse ? 1 : 0.6
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                        font.underline: saveMouse.containsMouse
+                        MouseArea {
+                          id: saveMouse
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.saveMedia(msgRow.mstate.path, msgRow.ts)
+                        }
                       }
 
                       Text {
