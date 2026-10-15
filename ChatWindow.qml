@@ -45,6 +45,10 @@ Item {
   readonly property color accent: Color.accent
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: Style.font.family
+  // Omarchy draws square (cornerRadius mirrors Hyprland's rounding, 0 by
+  // default); a chat reads better rounded, so the window keeps its own.
+  readonly property int round: 10
+  readonly property int bubbleRound: 16
 
   // ---- lifecycle ---------------------------------------------------------
   property bool opened: false
@@ -382,6 +386,15 @@ Item {
       }
     }
     onExited: if (root.avatarQueue.length > 0) avatarTimer.restart()
+  }
+
+  component Field: TextField {
+    background: Rectangle {
+      radius: root.round
+      color: Style.normalFillFor(root.fg, root.accent)
+      border.width: parent.activeFocus ? Style.spacing.hairline : 0
+      border.color: Style.focusBorderFor(root.fg, root.accent)
+    }
   }
 
   component Avatar: Item {
@@ -1015,6 +1028,7 @@ Item {
             Layout.fillWidth: true
           }
           Button {
+            radius: root.round
             text: root.settingsOpen ? "Volver" : "⚙"
             foreground: root.fg
             fontFamily: root.fontFamily
@@ -1026,6 +1040,7 @@ Item {
             }
           }
           Button {
+            radius: root.round
             text: "✕"
             foreground: root.fg
             fontFamily: root.fontFamily
@@ -1042,7 +1057,7 @@ Item {
           color: Style.normalFillFor(root.urgent, root.urgent)
           border.width: Style.spacing.hairline
           border.color: root.urgent
-          radius: Style.cornerRadius
+          radius: root.round
           Text {
             id: offlineText
             anchors.centerIn: parent
@@ -1078,7 +1093,7 @@ Item {
             Layout.fillHeight: true
             spacing: Style.spacing.md
 
-            TextField {
+            Field {
               id: searchField
               Layout.fillWidth: true
               placeholderText: "Buscar, o un número para chat nuevo"
@@ -1096,6 +1111,7 @@ Item {
                          { id: "trabajo", label: "Trabajo" }, { id: "personal", label: "Personal" },
                          { id: "contacts", label: "Contactos" } ]
                 delegate: Button {
+                  radius: root.round
                   required property var modelData
                   text: modelData.label
                   foreground: root.fg
@@ -1157,7 +1173,7 @@ Item {
                                                   && chatRow.modelData.jid === root.curJid
                 width: ListView.view.width
                 height: Math.max(chatCol.implicitHeight, rowAvatar.size) + Style.spacing.md * 2
-                radius: Style.cornerRadius
+                radius: root.round
                 color: chatRow.isCurrent ? Style.selectedFillFor(root.fg, root.accent)
                        : (rowMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
 
@@ -1214,7 +1230,7 @@ Item {
                       Layout.fillWidth: true
                     }
                     Rectangle {
-                      radius: Style.cornerRadius
+                      radius: root.round
                       color: Style.normalFillFor(root.fg, root.accent)
                       border.width: Style.spacing.hairline
                       border.color: Style.normalBorderFor(root.fg, root.accent)
@@ -1315,7 +1331,7 @@ Item {
                   font.pixelSize: Style.font.caption
                 }
                 Rectangle {
-                  radius: Style.cornerRadius
+                  radius: root.round
                   color: Style.normalFillFor(root.fg, root.accent)
                   border.width: Style.spacing.hairline
                   border.color: Style.normalBorderFor(root.fg, root.accent)
@@ -1405,11 +1421,12 @@ Item {
                     height: bubbleCol.implicitHeight + Style.spacing.md * 2
                     anchors.right: msgRow.fromMe ? parent.right : undefined
                     anchors.left: msgRow.fromMe ? undefined : parent.left
-                    radius: Style.cornerRadius
-                    color: msgRow.fromMe ? Style.selectedFillFor(root.fg, root.accent)
-                                         : Style.normalFillFor(root.fg, root.accent)
-                    border.width: Style.spacing.hairline
-                    border.color: Style.normalBorderFor(root.fg, root.accent)
+                    // tail corner on the sender's side, no outline: the fill alone
+                    // tells mine (accent) from theirs
+                    radius: root.bubbleRound
+                    bottomRightRadius: msgRow.fromMe ? 4 : root.bubbleRound
+                    bottomLeftRadius: msgRow.fromMe ? root.bubbleRound : 4
+                    color: msgRow.fromMe ? Qt.alpha(root.accent, 0.30) : Qt.alpha(root.fg, 0.09)
 
                     ColumnLayout {
                       id: bubbleCol
@@ -1513,7 +1530,7 @@ Item {
                 color: Style.normalFillFor(root.urgent, root.urgent)
                 border.width: Style.spacing.hairline
                 border.color: root.urgent
-                radius: Style.cornerRadius
+                radius: root.round
                 ColumnLayout {
                   id: ackCol
                   anchors.left: parent.left; anchors.right: parent.right
@@ -1531,6 +1548,7 @@ Item {
                   RowLayout {
                     spacing: Style.spacing.md
                     Button {
+                      radius: root.round
                       text: "Revisé WhatsApp, enviar igual"
                       foreground: root.fg
                       fontFamily: root.fontFamily
@@ -1540,6 +1558,7 @@ Item {
                                                     : root.doSend(root.ackText, true)
                     }
                     Button {
+                      radius: root.round
                       text: "Cancelar"
                       foreground: root.fg
                       fontFamily: root.fontFamily
@@ -1558,6 +1577,7 @@ Item {
                 Repeater {
                   model: root.quickReplies
                   delegate: Button {
+                    radius: root.round
                     required property string modelData
                     text: modelData.length > 40 ? modelData.slice(0, 39) + "…" : modelData
                     tooltipText: "Envía al toque: " + modelData
@@ -1579,7 +1599,7 @@ Item {
                 color: root.bg
                 border.width: Style.spacing.hairline
                 border.color: Style.normalBorderFor(root.fg, root.accent)
-                radius: Style.cornerRadius
+                radius: root.round
                 ColumnLayout {
                   id: attachCol
                   anchors.left: parent.left; anchors.right: parent.right
@@ -1598,6 +1618,7 @@ Item {
                       Layout.fillWidth: true
                     }
                     Button {
+                      radius: root.round
                       visible: root.attachMode !== "menu"
                       text: "‹ Volver"
                       foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
@@ -1605,6 +1626,7 @@ Item {
                       onClicked: root.attachMode = "menu"
                     }
                     Button {
+                      radius: root.round
                       text: "✕"
                       foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
                       enabled: !root.sending
@@ -1622,6 +1644,7 @@ Item {
                                { id: "location", label: "📍 Ubicación" }, { id: "contact", label: "👤 Contacto" },
                                { id: "poll", label: "📊 Encuesta" }, { id: "event", label: "📅 Evento" } ]
                       delegate: Button {
+                        radius: root.round
                         required property var modelData
                         text: modelData.label
                         foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
@@ -1644,7 +1667,7 @@ Item {
                     elide: Text.ElideMiddle
                     Layout.fillWidth: true
                   }
-                  TextField {
+                  Field {
                     id: captionField
                     visible: root.attachMode === "media"
                     Layout.fillWidth: true
@@ -1654,7 +1677,7 @@ Item {
                   }
 
                   // location
-                  TextField {
+                  Field {
                     id: locField
                     visible: root.attachMode === "location"
                     Layout.fillWidth: true
@@ -1662,7 +1685,7 @@ Item {
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
-                  TextField {
+                  Field {
                     id: locName
                     visible: root.attachMode === "location"
                     Layout.fillWidth: true
@@ -1672,7 +1695,7 @@ Item {
                   }
 
                   // contact
-                  TextField {
+                  Field {
                     visible: root.attachMode === "contact"
                     Layout.fillWidth: true
                     placeholderText: "Buscar en la agenda de " + root.curLabel
@@ -1691,7 +1714,7 @@ Item {
                       required property var modelData
                       width: ListView.view.width
                       height: pickText.implicitHeight + Style.spacing.sm * 2
-                      radius: Style.cornerRadius
+                      radius: root.round
                       color: pickMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent"
                       Text {
                         id: pickText
@@ -1715,7 +1738,7 @@ Item {
                   }
 
                   // poll
-                  TextField {
+                  Field {
                     id: pollQuestion
                     visible: root.attachMode === "poll"
                     Layout.fillWidth: true
@@ -1725,7 +1748,7 @@ Item {
                   }
                   Repeater {
                     model: pollOptions
-                    delegate: TextField {
+                    delegate: Field {
                       required property int index
                       required property string v
                       visible: root.attachMode === "poll"
@@ -1738,6 +1761,7 @@ Item {
                     }
                   }
                   Button {
+                    radius: root.round
                     visible: root.attachMode === "poll" && pollOptions.count < 12
                     text: "+ Opción"
                     foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
@@ -1746,6 +1770,8 @@ Item {
                   }
 
                   Button {
+
+                    radius: root.round
                     visible: ["media", "location", "poll"].indexOf(root.attachMode) !== -1
                     text: root.sending ? "Enviando…" : "Enviar"
                     foreground: root.fg; fontFamily: root.fontFamily
@@ -1781,7 +1807,7 @@ Item {
                 color: root.bg
                 border.width: Style.spacing.hairline
                 border.color: Style.normalBorderFor(root.fg, root.accent)
-                radius: Style.cornerRadius
+                radius: root.round
                 Column {
                   id: mentionCol
                   anchors.fill: parent
@@ -1794,7 +1820,7 @@ Item {
                       required property int index
                       width: mentionCol.width
                       height: mentionText.implicitHeight + Style.spacing.sm * 2
-                      radius: Style.cornerRadius
+                      radius: root.round
                       color: mentionRow.index === root.mentionIndex ? Style.selectedFillFor(root.fg, root.accent)
                              : (mentionMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent")
                       Text {
@@ -1826,7 +1852,7 @@ Item {
                 border.width: Style.spacing.hairline
                 border.color: composer.activeFocus ? Style.focusBorderFor(root.fg, root.accent)
                                                      : Style.normalBorderFor(root.fg, root.accent)
-                radius: Style.cornerRadius
+                radius: root.round
                 ScrollView {
                   anchors.fill: parent
                   clip: true
@@ -1871,6 +1897,7 @@ Item {
                 Layout.fillWidth: true
                 spacing: Style.spacing.md
                 Button {
+                  radius: root.round
                   text: "📎 Adjuntar"
                   foreground: root.fg
                   fontFamily: root.fontFamily
@@ -1897,6 +1924,7 @@ Item {
                   Layout.fillWidth: true
                 }
                 Button {
+                  radius: root.round
                   visible: root.failedText !== ""
                   text: "Reintentar"
                   foreground: root.fg
