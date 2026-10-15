@@ -179,6 +179,67 @@ Item {
     if (mode === "photos" || mode === "document") { root.attachMode = "menu"; root.pickFiles(mode) }
     if (mode === "poll") { pollOptions.clear(); pollOptions.append({ v: "" }); pollOptions.append({ v: "" }) }
     if (mode === "contact") root.attachSearch = ""
+    if (mode === "gif") { if (gifSearch.text !== "") gifSearch.text = ""; else root.searchGifs("") }
+    if (mode === "sticker") root.loadStickers()
+  }
+
+  // ---- GIFs and stickers ---------------------------------------------------
+  // GIFs come from Giphy (wa-chat gifs; the search words go to Giphy) and go
+  // out as a short mp4: wuzapi cannot flag a video as a GIF. Stickers are
+  // the favorites plus the newest ones received (wa-media stickers).
+  property var gifs: []
+  property string gifNote: ""
+  property var stickerFavs: []
+  property var stickerRecent: []
+  property string stickerNote: ""
+  function searchGifs(q) {
+    gifProc.running = false
+    root.gifNote = "Buscando…"
+    gifProc.command = [root.pluginDir + "bin/wa-chat", "gifs"].concat(q.trim() !== "" ? [q] : [])
+    gifProc.running = true
+  }
+  Timer { id: gifDebounce; interval: 450; onTriggered: root.searchGifs(gifSearch.text) }
+  Process {
+    id: gifProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        root.gifs = d && Array.isArray(d.gifs) ? d.gifs : []
+        root.gifNote = !d ? "wa-chat no respondió"
+            : d.error === "nokey" ? "Falta GIPHY_API_KEY en " + d.secrets + " (gratis en developers.giphy.com)"
+            : d.error ? "Giphy: " + d.error
+            : root.gifs.length === 0 ? "Sin resultados" : ""
+      }
+    }
+  }
+  function loadStickers() {
+    if (stickerProc.running) return
+    root.stickerNote = "Cargando…"
+    stickerProc.command = [root.pluginDir + "bin/wa-media", "stickers", root.curAcc]
+    stickerProc.running = true
+  }
+  Process {
+    id: stickerProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        root.stickerFavs = d && d.ok ? d.favorites : []
+        root.stickerRecent = d && d.ok ? d.recent : []
+        root.stickerNote = !d ? "wa-media no respondió" : !d.ok ? (d.error || "error")
+            : (root.stickerFavs.length + root.stickerRecent.length === 0) ? "Todavía no te mandaron stickers"
+            : "Clic envía al toque · clic derecho marca ★ favorito"
+      }
+    }
+  }
+  function toggleFav(st) {
+    favProc.command = [root.pluginDir + "bin/wa-media", "sticker-fav", st.path, st.fav ? "off" : "on"]
+    favProc.running = true
+  }
+  Process {
+    id: favProc
+    stdout: StdioCollector { onStreamFinished: root.loadStickers() }
   }
   function pickFiles(kind) {
     if (filePicker.running) return
@@ -596,6 +657,7 @@ Item {
     root.attachFiles = []
     root.attachQueue = []
     root.attachAckArgs = null
+    root.mediaQueue = []
     root.loadMembers()
     root.fetchMessages(0)
     if (root.curExplicit) root.markRead(c, true)
@@ -652,7 +714,8 @@ Item {
       mid: Number(m.id), messageId: String(m.message_id || ""),
       fromMe: m.from_me === true, senderName: String(m.sender_name || m.push_name || ""),
       ts: String(m.ts || ""), text: String(m.text || ""),
-      atype: a ? String(a.type || "") : "", adown: a ? a.downloadable === true : false
+      atype: a ? String(a.type || "") : "", adown: a ? a.downloadable === true : false,
+      reacts: Array.isArray(m.reactions) ? m.reactions.join(" ") : ""
     }
   }
 
@@ -685,6 +748,13 @@ Item {
       root.msgMore = d.more === true
     } else {
       for (i = 0; i < newer.length; i++) msgModel.insert(0, root.rowFor(newer[i]))
+      // a reaction to a message already shown changes that row, not the list
+      var reacts = ({})
+      for (i = 0; i < msgs.length; i++) reacts[msgs[i].id] = root.rowFor(msgs[i]).reacts
+      for (i = 0; i < msgModel.count && i < msgs.length + newer.length; i++) {
+        var row = msgModel.get(i)
+        if (row.mid in reacts && row.reacts !== reacts[row.mid]) msgModel.setProperty(i, "reacts", reacts[row.mid])
+      }
     }
   }
 
@@ -772,7 +842,7 @@ Item {
   }
 
   function mediaLabel(atype) {
-    var labels = { "image": "📷 Foto", "sticker": "📷 Sticker", "audio": "🎤 Audio",
+    var labels = { "image": "📷 Foto", "sticker": "💟 Sticker", "gif": "🎞️ GIF", "audio": "🎤 Audio",
                    "video": "🎬 Video", "document": "📄 Documento",
                    "ubicación": "📍 Ubicación", "contacto": "👤 Contacto" }
     return labels[atype] || ("📎 " + atype)
@@ -781,7 +851,7 @@ Item {
   // sink/events.py's placeholders, shown the way the bubbles label them
   function previewText(t) {
     var s = String(t || "").replace(/\n/g, " ")
-    var kinds = { "[audio]": "audio", "[imagen]": "image", "[video]": "video", "[sticker]": "sticker",
+    var kinds = { "[audio]": "audio", "[imagen]": "image", "[video]": "video", "[sticker]": "sticker", "[gif]": "gif",
                   "[documento]": "document", "[ubicación]": "ubicación", "[contacto]": "contacto" }
     return kinds[s] ? root.mediaLabel(kinds[s]) : s
   }
@@ -790,6 +860,21 @@ Item {
     if (!ms || ms <= 0) return "0:00"
     var s = Math.floor(ms / 1000)
     return Math.floor(s / 60) + ":" + ((s % 60) < 10 ? "0" : "") + (s % 60)
+  }
+
+  // Stickers and GIFs load by themselves, as on the phone: queued, since
+  // mediaProc fetches one at a time. [key, messageId, atype]
+  property var mediaQueue: []
+  function queueMedia(messageId, atype) {
+    if (root.media[messageId]) return
+    root.mediaQueue.push([root.curKey, messageId, atype])
+    root.pumpMedia()
+  }
+  function pumpMedia() {
+    while (!mediaProc.running && root.mediaQueue.length > 0) {
+      var job = root.mediaQueue.shift()
+      if (job[0] === root.curKey && !root.media[job[1]]) root.mediaClicked(job[1], job[2])
+    }
   }
 
   function mediaClicked(messageId, atype) {
@@ -824,7 +909,7 @@ Item {
         if (d && d.ok && d.path) {
           root.setMedia(mediaProc.messageId, { state: "ready", path: d.path, error: "" })
           if (mediaProc.atype === "audio") root.toggleAudio(mediaProc.messageId, d.path)
-          else if (mediaProc.atype !== "image" && mediaProc.atype !== "sticker")
+          else if (["image", "sticker", "gif"].indexOf(mediaProc.atype) === -1)
             Quickshell.execDetached(["xdg-open", d.path])
         } else {
           root.setMedia(mediaProc.messageId, { state: "error", path: "",
@@ -833,6 +918,7 @@ Item {
       }
     }
     onExited: function(exitCode) {
+      Qt.callLater(root.pumpMedia)
       if (mediaProc.gotAnswer || mediaProc.key !== root.curKey) return
       root.setMedia(mediaProc.messageId, { state: "error", path: "",
                     error: "wa-media terminó sin responder (código " + exitCode + ")" })
@@ -1405,9 +1491,16 @@ Item {
                   required property string text
                   required property string atype
                   required property bool adown
+                  required property string reacts
                   readonly property var mstate: root.media[msgRow.messageId] || null
+                  readonly property bool ready: msgRow.mstate !== null && msgRow.mstate.state === "ready"
                   readonly property bool isImage: msgRow.atype === "image" || msgRow.atype === "sticker"
-                  readonly property bool hasImage: msgRow.isImage && msgRow.mstate !== null && msgRow.mstate.state === "ready"
+                  readonly property bool hasImage: msgRow.isImage && msgRow.ready
+                  readonly property bool hasGif: msgRow.atype === "gif" && msgRow.ready
+                  // a sticker sits on the background, no bubble, as on the phone
+                  readonly property bool bare: msgRow.atype === "sticker" && msgRow.ready
+                  Component.onCompleted: if (msgRow.adown && (msgRow.atype === "sticker" || msgRow.atype === "gif"))
+                                           root.queueMedia(msgRow.messageId, msgRow.atype)
                   // the backend's placeholder ("[imagen]", "[documento]"...) only repeats the label above
                   readonly property bool showText: msgRow.text !== "" && !(msgRow.atype !== "" && /^\[[^\]]*\]$/.test(msgRow.text))
                   width: ListView.view.width
@@ -1426,7 +1519,7 @@ Item {
                     radius: root.bubbleRound
                     bottomRightRadius: msgRow.fromMe ? 4 : root.bubbleRound
                     bottomLeftRadius: msgRow.fromMe ? root.bubbleRound : 4
-                    color: msgRow.fromMe ? Qt.alpha(root.accent, 0.30) : Qt.alpha(root.fg, 0.09)
+                    color: msgRow.bare ? "transparent" : msgRow.fromMe ? Qt.alpha(root.accent, 0.30) : Qt.alpha(root.fg, 0.09)
 
                     ColumnLayout {
                       id: bubbleCol
@@ -1449,7 +1542,7 @@ Item {
 
                       // attachment
                       Text {
-                        visible: msgRow.atype !== "" && !msgRow.hasImage
+                        visible: msgRow.atype !== "" && !msgRow.hasImage && !msgRow.hasGif
                         textFormat: Text.PlainText
                         text: !msgRow.adown ? root.mediaLabel(msgRow.atype) + " (no disponible)"
                               : (msgRow.mstate && msgRow.mstate.state === "loading") ? root.mediaLabel(msgRow.atype) + " · descargando…"
@@ -1475,8 +1568,8 @@ Item {
                       }
 
                       Image {
-                        visible: msgRow.hasImage
-                        source: msgRow.hasImage ? "file://" + msgRow.mstate.path : ""
+                        visible: msgRow.hasImage && !msgRow.bare
+                        source: msgRow.hasImage && !msgRow.bare ? "file://" + msgRow.mstate.path : ""
                         asynchronous: true
                         fillMode: Image.PreserveAspectFit
                         sourceSize.width: 320
@@ -1488,6 +1581,40 @@ Item {
                           anchors.fill: parent
                           cursorShape: Qt.PointingHandCursor
                           onClicked: Quickshell.execDetached(["xdg-open", msgRow.mstate.path])
+                        }
+                      }
+
+                      // a sticker: AnimatedImage, so an animated webp moves
+                      AnimatedImage {
+                        visible: msgRow.bare
+                        source: msgRow.bare ? "file://" + msgRow.mstate.path : ""
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectFit
+                        Layout.preferredWidth: 160
+                        Layout.preferredHeight: 160
+                      }
+
+                      // a GIF is a muted mp4 that loops
+                      Loader {
+                        active: msgRow.hasGif
+                        visible: active
+                        Layout.preferredWidth: Math.min(320, bubble.maxW - Style.spacing.lg * 2)
+                        Layout.preferredHeight: item && item.implicitHeight > 0 ? item.implicitHeight : 180
+                        sourceComponent: Video {
+                          id: gifVideo
+                          source: "file://" + msgRow.mstate.path
+                          width: parent ? parent.width : 0
+                          implicitHeight: metaData.value(MediaMetaData.Resolution)
+                              ? width * metaData.value(MediaMetaData.Resolution).height / metaData.value(MediaMetaData.Resolution).width : 180
+                          loops: MediaPlayer.Infinite
+                          muted: true
+                          autoPlay: true
+                          fillMode: VideoOutput.PreserveAspectFit
+                          MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Quickshell.execDetached(["xdg-open", msgRow.mstate.path])
+                          }
                         }
                       }
 
@@ -1506,6 +1633,13 @@ Item {
                         wrapMode: TextEdit.Wrap
                         Layout.maximumWidth: bubble.maxW - Style.spacing.lg * 2
                         Layout.fillWidth: true
+                      }
+
+                      Text {
+                        visible: msgRow.reacts !== ""
+                        textFormat: Text.PlainText
+                        text: msgRow.reacts
+                        font.pixelSize: Style.font.body
                       }
 
                       Text {
@@ -1610,7 +1744,7 @@ Item {
                     Layout.fillWidth: true
                     Text {
                       text: ({ menu: "Adjuntar", media: "Fotos, videos y documentos", location: "Ubicación",
-                               contact: "Contacto", poll: "Encuesta" })[root.attachMode] || ""
+                               contact: "Contacto", poll: "Encuesta", gif: "GIF", sticker: "Stickers" })[root.attachMode] || ""
                       color: root.fg
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.body
@@ -1619,7 +1753,7 @@ Item {
                     }
                     Button {
                       radius: root.round
-                      visible: root.attachMode !== "menu"
+                      visible: ["menu", "gif", "sticker"].indexOf(root.attachMode) === -1
                       text: "‹ Volver"
                       foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
                       enabled: !root.sending
@@ -1652,6 +1786,119 @@ Item {
                         enabled: modelData.id !== "event" && !filePicker.running
                         tooltipText: modelData.id === "event" ? "wuzapi todavía no permite enviar eventos" : ""
                         onClicked: root.openAttach(modelData.id)
+                      }
+                    }
+                  }
+
+                  // GIF
+                  Field {
+                    id: gifSearch
+                    visible: root.attachMode === "gif"
+                    Layout.fillWidth: true
+                    placeholderText: "Buscar en Giphy"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    onTextChanged: if (root.attachMode === "gif") gifDebounce.restart()
+                  }
+                  Text {
+                    visible: root.attachMode === "gif" && root.gifNote !== ""
+                    textFormat: Text.PlainText
+                    text: root.gifNote
+                    color: Color.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    wrapMode: Text.Wrap
+                    Layout.fillWidth: true
+                  }
+                  GridView {
+                    id: gifGrid
+                    visible: root.attachMode === "gif" && root.gifs.length > 0
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 260
+                    clip: true
+                    cellWidth: Math.floor(width / Math.max(1, Math.floor(width / 110)))
+                    cellHeight: 100
+                    model: root.attachMode === "gif" ? root.gifs : []
+                    delegate: Item {
+                      id: gifCell
+                      required property var modelData
+                      width: gifGrid.cellWidth; height: gifGrid.cellHeight
+                      AnimatedImage {
+                        anchors.fill: parent; anchors.margins: 3
+                        source: gifCell.modelData.preview
+                        fillMode: Image.PreserveAspectCrop
+                        asynchronous: true
+                        opacity: gifMouse.containsMouse ? 0.75 : 1
+                      }
+                      MouseArea {
+                        id: gifMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: !root.sending
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.runAttach([["--kind=gif", "--url=" + gifCell.modelData.mp4]], false)
+                      }
+                    }
+                  }
+                  Text {
+                    visible: root.attachMode === "gif"
+                    text: "Powered by GIPHY · sale como video corto"
+                    color: Color.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  // stickers
+                  Text {
+                    visible: root.attachMode === "sticker" && root.stickerNote !== ""
+                    textFormat: Text.PlainText
+                    text: root.stickerNote
+                    color: Color.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    Layout.fillWidth: true
+                  }
+                  GridView {
+                    id: stickerGrid
+                    visible: root.attachMode === "sticker"
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(260, Math.max(1, Math.ceil(count / Math.max(1, Math.floor(width / cellWidth)))) * cellHeight)
+                    clip: true
+                    cellWidth: 84; cellHeight: 84
+                    model: root.attachMode === "sticker" ? root.stickerFavs.concat(root.stickerRecent) : []
+                    delegate: Item {
+                      id: stCell
+                      required property var modelData
+                      width: 84; height: 84
+                      Rectangle {
+                        anchors.fill: parent; anchors.margins: 2
+                        radius: root.round
+                        color: stMouse.containsMouse ? Style.hoverFillFor(root.fg, root.accent) : "transparent"
+                      }
+                      AnimatedImage {
+                        anchors.fill: parent; anchors.margins: 6
+                        source: "file://" + stCell.modelData.path
+                        fillMode: Image.PreserveAspectFit
+                        asynchronous: true
+                      }
+                      Text {
+                        visible: stCell.modelData.fav
+                        anchors.right: parent.right; anchors.top: parent.top
+                        text: "★"
+                        color: root.accent
+                        font.pixelSize: Style.font.body
+                      }
+                      MouseArea {
+                        id: stMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: !root.sending
+                        acceptedButtons: Qt.LeftButton | Qt.RightButton
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: function(mouse) {
+                          if (mouse.button === Qt.RightButton) root.toggleFav(stCell.modelData)
+                          else root.runAttach([["--kind=sticker", "--file=" + stCell.modelData.path]], false)
+                        }
                       }
                     }
                   }
@@ -1906,6 +2153,40 @@ Item {
                   selected: root.attachMode !== ""
                   enabled: !root.sending && !root.drafting
                   onClicked: root.attachMode = root.attachMode === "" ? "menu" : ""
+                }
+                Button {
+                  radius: root.round
+                  text: "😊"
+                  tooltipText: "Emojis (el selector de Omarchy los escribe en el mensaje)"
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  bordered: true
+                  enabled: !root.sending && !root.drafting
+                  onClicked: { composer.forceActiveFocus(); Quickshell.execDetached(["omarchy-menu-emoji"]) }
+                }
+                Button {
+                  radius: root.round
+                  text: "GIF"
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  bordered: true
+                  selected: root.attachMode === "gif"
+                  enabled: !root.sending && !root.drafting
+                  onClicked: root.attachMode === "gif" ? root.attachMode = "" : root.openAttach("gif")
+                }
+                Button {
+                  radius: root.round
+                  text: "💟"
+                  tooltipText: "Stickers"
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.bodySmall
+                  bordered: true
+                  selected: root.attachMode === "sticker"
+                  enabled: !root.sending && !root.drafting
+                  onClicked: root.attachMode === "sticker" ? root.attachMode = "" : root.openAttach("sticker")
                 }
                 Text {
                   text: "Sale por: " + root.curLabel

@@ -1986,5 +1986,24 @@ def test_a_sent_attachment_answers_the_queue_entry():
         assert out == {"ok": True, "dry_run": False} and store.load_queue(d) == []
 
 
+def test_stickers_must_be_webp_and_gifs_must_come_from_giphy_as_mp4():
+    with tmpdir() as d:
+        bad, good = d / "x.png", d / "s.webp"
+        bad.write_bytes(b"\x89PNG....")
+        good.write_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 ")
+        assert wa.sticker_payload(good)["MimeType"] == "image/webp"
+        for call in (lambda: wa.sticker_payload(bad),
+                     lambda: wa.gif_payload("https://giphy.com.evil.net/a.mp4", fetch=None),
+                     lambda: wa.gif_payload("http://media.giphy.com/a.mp4", fetch=None),
+                     lambda: wa.gif_payload("https://media.giphy.com/a.mp4", fetch=lambda u, n: b"<html>")):
+            try:
+                call()
+                assert False, "accepted"
+            except ValueError:
+                pass
+        mp4 = b"\x00\x00\x00\x18ftypmp42"
+        assert wa.gif_payload("https://media2.giphy.com/a.mp4", fetch=lambda u, n: mp4)["MimeType"] == "video/mp4"
+
+
 if __name__ == "__main__":
     run(dict(globals()))

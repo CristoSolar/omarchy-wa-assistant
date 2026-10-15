@@ -1022,9 +1022,11 @@ def _deliver(d, eid, acknowledged, do_send, entry_unconfirmed=False):
 
 # --- attachments: photo/video, document, location, contact, poll -----------
 
-MEDIA_MAX = {"image": 16 << 20, "video": 64 << 20, "document": 100 << 20}
+MEDIA_MAX = {"image": 16 << 20, "video": 64 << 20, "document": 100 << 20, "sticker": 1 << 20}
 ENDPOINT = {"image": "/chat/send/image", "video": "/chat/send/video", "document": "/chat/send/document",
-            "location": "/chat/send/location", "contact": "/chat/send/contact", "poll": "/chat/send/poll"}
+            "location": "/chat/send/location", "contact": "/chat/send/contact", "poll": "/chat/send/poll",
+            "sticker": "/chat/send/sticker"}
+GIF_MAX = 16 << 20
 
 
 def media_payload(path, caption=""):
@@ -1044,6 +1046,38 @@ def media_payload(path, caption=""):
         return kind, {"Document": "data:application/octet-stream;base64," + b64,
                       "FileName": path.name, "MimeType": mime, "Caption": caption}
     return kind, {kind.capitalize(): f"data:{mime};base64,{b64}", "Caption": caption, "MimeType": mime}
+
+
+def sticker_payload(path):
+    """A webp file as a sticker; WhatsApp takes nothing else."""
+    raw = Path(path).read_bytes()
+    if not (raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"):
+        raise ValueError("un sticker tiene que ser webp")
+    if len(raw) > MEDIA_MAX["sticker"]:
+        raise ValueError("el sticker pesa más de 1 MB")
+    return {"Sticker": "data:image/webp;base64," + base64.b64encode(raw).decode(), "MimeType": "image/webp"}
+
+
+def _fetch(url, limit):
+    with urllib.request.urlopen(url, timeout=30) as r:
+        raw = r.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"el GIF pesa más de {limit >> 20} MB")
+    return raw
+
+
+def gif_payload(url, caption="", fetch=_fetch):
+    """A Giphy mp4 as a video. wuzapi has no gifPlayback flag, so it lands as a
+    short video, not a looping GIF."""
+    from urllib.parse import urlsplit
+    u = urlsplit(str(url))
+    if u.scheme != "https" or not (u.hostname or "").endswith(".giphy.com"):
+        raise ValueError("solo GIFs de Giphy")
+    raw = fetch(url, GIF_MAX)
+    if raw[4:8] != b"ftyp":
+        raise ValueError("Giphy no devolvió un mp4")
+    return {"Video": "data:video/mp4;base64," + base64.b64encode(raw).decode(),
+            "Caption": caption, "MimeType": "video/mp4"}
 
 
 def location_payload(lat, lon, name=""):
@@ -1092,13 +1126,17 @@ def cmd_chat_attach(args):
     try:
         if args.kind == "media":
             kind, payload = media_payload(args.file or "", args.caption or "")
+        elif args.kind == "sticker":
+            kind, payload = "sticker", sticker_payload(args.file or "")
+        elif args.kind == "gif":
+            kind, payload = "video", gif_payload(args.url or "", args.caption or "")
         elif args.kind == "location":
             kind, payload = "location", location_payload(args.lat, args.lon, args.name or "")
         elif args.kind == "contact":
             kind, payload = "contact", contact_payload(args.name or "", args.phone or "")
         else:
             kind, payload = "poll", poll_payload(args.question or "", args.option)
-    except (ValueError, TypeError, OSError) as exc:  # bad input: nothing was sent
+    except (ValueError, TypeError, OSError) as exc:  # bad input or Giphy down: nothing was sent
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
         return
     token = account_token(account)
@@ -1148,8 +1186,8 @@ def main():
     p.add_argument("--mention", action="append", help="a group member's jid, whose @number is in the text")
     p.set_defaults(fn=cmd_chat_send)
     p = sub.add_parser("chat-attach"); p.add_argument("account"); p.add_argument("jid")
-    p.add_argument("--kind", required=True, choices=["media", "location", "contact", "poll"])
-    p.add_argument("--file"); p.add_argument("--caption")
+    p.add_argument("--kind", required=True, choices=["media", "sticker", "gif", "location", "contact", "poll"])
+    p.add_argument("--file"); p.add_argument("--caption"); p.add_argument("--url")
     p.add_argument("--lat"); p.add_argument("--lon"); p.add_argument("--name")
     p.add_argument("--phone"); p.add_argument("--question"); p.add_argument("--option", action="append")
     p.add_argument("--acknowledged", action="store_true"); p.add_argument("--new", action="store_true")

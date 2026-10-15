@@ -13,6 +13,7 @@ bin/wa-reply does. A read here also takes the chat off the bar counter
 
 Usage: wa-chat chats | messages ACC JID [--before ID] | read ACC JID
               | contacts | resolve ACC PHONE | avatars ACC|TARGET... | members ACC GROUP
+              | gifs [QUERY]  (Giphy, needs GIPHY_API_KEY in secrets.env)
 """
 import json
 import os
@@ -45,7 +46,10 @@ def _url(api, path):
 
 
 def _token(acc_id):
-    var = accounts_mod.token_env_var(acc_id)
+    return _secret(accounts_mod.token_env_var(acc_id))
+
+
+def _secret(var):
     if var in os.environ:
         return os.environ[var]
     try:
@@ -377,6 +381,33 @@ def members(d, wuzdata, acc_id, group, get):
     return {"members": sorted(out, key=lambda m: m["name"].casefold())}
 
 
+GIPHY = "https://api.giphy.com/v1/gifs/"
+
+
+def gif_search(query, get_json=None):
+    """Giphy search (trending when empty). The query goes to Giphy, nothing else does."""
+    try:
+        key = _secret("GIPHY_API_KEY")
+    except OSError:
+        return {"error": "nokey", "secrets": str(store.secrets_path())}
+    params = {"api_key": key, "limit": 30, "rating": "pg-13", "lang": "es"}
+    if query.strip():
+        params["q"] = query.strip()
+    url = GIPHY + ("search" if query.strip() else "trending") + "?" + urllib.parse.urlencode(params)
+    if get_json is None:
+        def get_json(u):
+            with urllib.request.urlopen(u, timeout=15) as r:
+                return json.loads(r.read())
+    out = []
+    for g in get_json(url).get("data") or []:
+        im = g.get("images") or {}
+        preview = (im.get("fixed_width_small") or {}).get("url")
+        mp4 = (im.get("original") or {}).get("mp4") or (im.get("fixed_width") or {}).get("mp4")
+        if preview and mp4:
+            out.append({"preview": preview, "mp4": mp4, "title": g.get("title") or ""})
+    return {"gifs": out}
+
+
 def run_cli(argv, d, wuzdata):
     try:
         cmd = argv[0]
@@ -395,6 +426,8 @@ def run_cli(argv, d, wuzdata):
             return members(d, wuzdata, argv[1], argv[2], http_get)
         if cmd == "avatars":
             return avatars(argv[1:], http_post)
+        if cmd == "gifs":
+            return gif_search(" ".join(argv[1:]))
         return {"error": f"comando desconocido: {cmd}"}
     except history.SchemaError:
         return {"error": "esquema"}

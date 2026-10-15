@@ -663,6 +663,63 @@ def cmd_get_msg(args):
     print(json.dumps({"ok": True, "path": str(path)}, ensure_ascii=False))
 
 
+def favorites_dir() -> Path:
+    """Starred stickers, copied out of the cache so pruning never takes them."""
+    d = store.state_root() / "stickers"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def _sticker_entry(path: Path, favs: set) -> dict:
+    return {"name": path.name, "path": str(path), "fav": path.name in favs}
+
+
+def cmd_stickers(args):
+    """Favorites first, then the newest stickers received, downloaded on demand."""
+    d = store.data_dir()
+    account = accounts.by_id(accounts.load(d), args.account)
+    if account is None:
+        raise UnknownAccount(args.account)
+    fav_dir = favorites_dir()
+    favs = sorted((p for p in fav_dir.iterdir() if CACHE_NAME_RE.match(p.name)),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    names = {p.name for p in favs}
+    conn = history.connect(store.wuzdata_dir())
+    try:
+        uid = history.user_ids(conn).get(account["wuzapi_user"])
+        ids = history.recent_stickers(conn, uid) if uid else []
+    finally:
+        conn.close()
+    recent, failed = [], 0
+    for mid in ids:
+        try:
+            path = get_msg_path(d, account["id"], mid)
+        except Exception:  # an expired media link: that sticker is just left out
+            failed += 1
+            continue
+        if path.name not in names:
+            recent.append(_sticker_entry(path, names))
+    print(json.dumps({"ok": True, "favorites": [_sticker_entry(p, names) for p in favs],
+                      "recent": recent, "failed": failed}, ensure_ascii=False))
+
+
+def cmd_sticker_fav(args):
+    src = Path(args.path)
+    if not CACHE_NAME_RE.match(src.name) or not src.is_file() or not (
+            src.resolve().is_relative_to(media_root().resolve())
+            or src.resolve().is_relative_to(favorites_dir().resolve())):
+        raise MediaRefused({"ok": False, "error": "eso no es un sticker de la caché"})
+    dest = favorites_dir() / src.name
+    if args.state == "on":
+        if not dest.exists():
+            _atomic_write_bytes(dest, src.read_bytes())
+            os.chmod(dest, 0o600)
+    else:
+        dest.unlink(missing_ok=True)
+    print(json.dumps({"ok": True, "fav": args.state == "on", "path": str(dest)}, ensure_ascii=False))
+
+
 def cmd_clear(args):
     try:
         clear_cache(args.account)
@@ -691,6 +748,10 @@ def main():
     p.set_defaults(fn=cmd_get)
     p = sub.add_parser("get-msg"); p.add_argument("account"); p.add_argument("message_id")
     p.set_defaults(fn=cmd_get_msg)
+    p = sub.add_parser("stickers"); p.add_argument("account")
+    p.set_defaults(fn=cmd_stickers)
+    p = sub.add_parser("sticker-fav"); p.add_argument("path"); p.add_argument("state", choices=["on", "off"])
+    p.set_defaults(fn=cmd_sticker_fav)
     p = sub.add_parser("clear")
     p.add_argument("--account", default=None,
                    help="clear only this account's cache; omit for all")

@@ -92,7 +92,11 @@ def _decode(row) -> dict | None:
     }
     attachment = _attachment_of(message)
     if attachment:
-        msg["attachment"] = {"type": attachment["type"], "downloadable": attachment["downloadable"]}
+        atype = attachment["type"]
+        video = message.get("videoMessage")
+        if atype == "video" and isinstance(video, dict) and video.get("gifPlayback"):
+            atype = "gif"  # wa-media still fetches it as the video it is
+        msg["attachment"] = {"type": atype, "downloadable": attachment["downloadable"]}
     return msg
 
 
@@ -120,7 +124,54 @@ def messages(conn, uid, jid, before=None, limit=50):
                         (uid, jid, before if before is not None else 2**62, limit)).fetchall()
     # ponytail: `limit` counts hidden rows too, so a page can come back short;
     # `more` still says whether to ask for the next one.
-    return _decoded(reversed(rows)), len(rows) == limit
+    page = _decoded(reversed(rows))
+    if page:
+        found = reactions(conn, uid, jid)
+        for m in page:
+            if m["message_id"] in found:
+                m["reactions"] = found[m["message_id"]]
+    return page, len(rows) == limit
+
+
+def reactions(conn, uid, jid) -> dict:
+    """target message_id -> its emojis, one per reactor, in arrival order.
+    A reactor's newer reaction replaces the older; an empty one takes it back."""
+    # ponytail: scans the chat's every reaction per page; index by target if a chat gets huge.
+    rows = conn.execute("SELECT sender_jid, datajson FROM message_history WHERE user_id = ? AND chat_jid = ?"
+                        " AND message_type = 'reaction' ORDER BY id", (uid, jid)).fetchall()
+    by_target = {}
+    for sender, datajson in rows:
+        try:
+            event = json.loads(datajson) if datajson else {}
+        except ValueError:
+            continue
+        info = event.get("Info") if isinstance(event.get("Info"), dict) else {}
+        r = (_unwrap(event.get("Message") or {}) or {}).get("reactionMessage")
+        target = ((r or {}).get("key") or {}).get("ID") if isinstance(r, dict) else None
+        if not target:
+            continue
+        who = "me" if sender == "me" or info.get("IsFromMe") else (info.get("Sender") or sender)
+        reactors = by_target.setdefault(target, {})
+        reactors.pop(who, None)
+        if r.get("text"):
+            reactors[who] = r["text"]
+    return {t: list(v.values()) for t, v in by_target.items() if v}
+
+
+def recent_stickers(conn, uid, limit=24) -> list:
+    """message_ids of the account's newest stickers, one per distinct file."""
+    rows = conn.execute("SELECT message_id, json_extract(datajson, '$.Message.stickerMessage.fileSHA256')"
+                        " FROM message_history WHERE user_id = ? AND message_type = 'sticker'"
+                        " AND json_valid(datajson) ORDER BY id DESC", (uid,)).fetchall()
+    seen, out = set(), []
+    for mid, sha in rows:
+        key = sha or mid  # a wrapped (ephemeral) sticker has no sha at that path
+        if key not in seen:
+            seen.add(key)
+            out.append(mid)
+            if len(out) == limit:
+                break
+    return out
 
 
 def _unread(conn, uid, jid, after_id) -> list:

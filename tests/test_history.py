@@ -197,5 +197,28 @@ def test_status_broadcast_and_newsletters_never_list_nor_notify():
         assert history.chat_of(_conn(d), "u1", "nope") is None
 
 
+def test_reactions_attach_to_their_message_newest_per_person_and_can_be_taken_back():
+    with tmpdir() as d:
+        db = Db(d)
+        db.add(DM, "foto")  # M1
+        react = lambda who, emoji: db.add(DM, "", sender=who, mtype="reaction",
+                                          message={"reactionMessage": {"key": {"ID": "M1"}, "text": emoji}})
+        react("a@s.whatsapp.net", "👍"); react("b@s.whatsapp.net", "😮")
+        react("a@s.whatsapp.net", "❤️"); react("b@s.whatsapp.net", "")
+        (m,), _ = history.messages(_conn(d), "u1", DM)
+        assert m["reactions"] == ["❤️"]
+
+
+def test_a_gif_is_its_own_type_and_recent_stickers_skip_repeats():
+    with tmpdir() as d:
+        db = Db(d)
+        db.add(DM, "", mtype="video", message={"videoMessage": {"gifPlayback": True}})
+        sticker = lambda sha: db.add(DM, "", mtype="sticker", message={"stickerMessage": {"fileSHA256": sha}})
+        sticker("A"); sticker("B"); sticker("A")
+        (m, *_), _ = history.messages(_conn(d), "u1", DM)
+        assert m["attachment"]["type"] == "gif"
+        assert history.recent_stickers(_conn(d), "u1") == ["M4", "M3"]
+
+
 if __name__ == "__main__":
     run(dict(globals()))
