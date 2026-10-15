@@ -386,7 +386,8 @@ def test_avatars_fetch_once_cache_none_and_space_out_the_asks():
                 return {"data": {"url": "https://pps.whatsapp.net/v/x.jpg"}}
             keys = ["personal|56911@s.whatsapp.net", "personal|sinfoto@lid", "trabajo|569222"]
             out = wc.avatars(keys, post, download=lambda u: b"JPG", sleep=sleeps.append)
-            assert out == {"fetched": ["personal|56911@s.whatsapp.net", "trabajo|569222"], "offline": False}
+            assert out == {"fetched": ["personal|56911@s.whatsapp.net", "trabajo|569222"],
+                           "have": ["personal|56911@s.whatsapp.net", "trabajo|569222"], "offline": False}
             assert asks[0] == ("personal", "/user/avatar", {"Phone": "56911@s.whatsapp.net", "Preview": True})
             assert sleeps == [wc.AVATAR_GAP] * 2
             assert wc.avatar_path("personal", "56911@s.whatsapp.net").read_bytes() == b"JPG"
@@ -394,6 +395,7 @@ def test_avatars_fetch_once_cache_none_and_space_out_the_asks():
             asks.clear()
             assert wc.avatars(keys, post, download=lambda u: b"JPG", sleep=sleeps.append)["fetched"] == []
             assert asks == []  # all cached, the empty one too
+            assert wc.avatars(keys, post, sleep=sleeps.append)["have"] == [keys[0], keys[2]]
             later = lambda: __import__("time").time() + wc.AVATAR_TTL + 1
             wc.avatars(keys[:1], post, download=lambda u: b"NEW", sleep=sleeps.append, now=later)
             assert wc.avatar_path("personal", "56911@s.whatsapp.net").read_bytes() == b"NEW"
@@ -408,7 +410,7 @@ def test_avatars_stop_offline_refuse_other_hosts_and_bad_names():
         _avatar_env(d)
         try:
             out = wc.avatars(["personal|a@lid", "personal|b@lid"], lambda *a: 1 / 0, sleep=lambda s: None)
-            assert out == {"fetched": [], "offline": True}
+            assert out == {"fetched": [], "have": [], "offline": True}
             evil = lambda *a: {"data": {"url": "https://evil.example/x.jpg"}}
             assert wc.avatars(["personal|a@lid"], evil, sleep=lambda s: None)["offline"] is True
             assert not wc.avatar_path("personal", "a@lid").exists()

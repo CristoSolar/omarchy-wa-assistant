@@ -305,7 +305,22 @@ def avatars(keys, post, download=_download, sleep=time.sleep, now=time.time):
 
     A target with no picture leaves an empty file, so it is not asked again
     for a week. The first network failure ends the pass (offline).
+    "have" lists every key whose picture is on disk, so the window only
+    loads files that exist and decode.
     """
+    fetched, offline = _fetch_avatars(keys, post, download, sleep, now)
+    have = []
+    for key in keys:
+        acc_id, _, target = key.partition("|")
+        try:
+            if avatar_path(acc_id, target).stat().st_size > 0:
+                have.append(key)
+        except (ValueError, OSError):
+            pass
+    return {"fetched": fetched, "have": have, "offline": offline}
+
+
+def _fetch_avatars(keys, post, download, sleep, now):
     fetched, asked = [], False
     for key in keys:
         acc_id, _, target = key.partition("|")
@@ -326,10 +341,10 @@ def avatars(keys, post, download=_download, sleep=time.sleep, now=time.time):
             data = download(url) if url else b""
         except urllib.error.HTTPError as exc:
             if exc.code != 500:  # wuzapi answers 500 for "has no profile picture"
-                return {"fetched": fetched, "offline": True}
+                return fetched, True
             data = b""
         except Exception:
-            return {"fetched": fetched, "offline": True}
+            return fetched, True
         for folder in (path.parent.parent, path.parent):  # contacts' faces: owner only
             folder.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chmod(folder, 0o700)
@@ -338,7 +353,7 @@ def avatars(keys, post, download=_download, sleep=time.sleep, now=time.time):
         os.replace(tmp, path)
         if data:
             fetched.append(key)
-    return {"fetched": fetched, "offline": False}
+    return fetched, False
 
 
 def members(d, wuzdata, acc_id, group, get):

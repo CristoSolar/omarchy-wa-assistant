@@ -341,13 +341,17 @@ Item {
   // `wa-chat avatars` caches them under avatars/<acc>/<name>.jpg (an empty
   // file = no picture). Only rows that get drawn ask, in batches; the
   // backend skips anything cached in the last week.
-  property int avatarRev: 0
+  // key -> version; a key is here only once its picture is on disk, and its
+  // version bumps when refetched, so only that Image reloads
+  property var avatarHave: ({})
   property var avatarAsked: ({})
   property var avatarQueue: []
 
   function avatarUrl(acc, target) {
+    var v = root.avatarHave[acc + "|" + target]
+    if (!v) return ""
     var safe = String(target).replace(/[^A-Za-z0-9@._-]/g, "").replace(/^\.+/, "")
-    return "file://" + root.stateRoot + "/avatars/" + acc + "/" + safe + ".jpg?" + root.avatarRev
+    return "file://" + root.stateRoot + "/avatars/" + acc + "/" + safe + ".jpg?" + v
   }
   function wantAvatar(acc, target) {
     var key = acc + "|" + target
@@ -366,10 +370,18 @@ Item {
   }
   Process {
     id: avatarProc
-    onExited: {
-      root.avatarRev++
-      if (root.avatarQueue.length > 0) avatarTimer.restart()
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var d = null
+        try { d = JSON.parse(text) } catch (e) { d = null }
+        if (!d || !Array.isArray(d.have)) return
+        var have = Object.assign({}, root.avatarHave)
+        d.have.forEach(function(k) { if (!have[k]) have[k] = 1 })
+        ;(d.fetched || []).forEach(function(k) { have[k] = (have[k] || 0) + 1 })
+        root.avatarHave = have
+      }
     }
+    onExited: if (root.avatarQueue.length > 0) avatarTimer.restart()
   }
 
   component Avatar: Item {
@@ -753,6 +765,14 @@ Item {
     return labels[atype] || ("📎 " + atype)
   }
 
+  // sink/events.py's placeholders, shown the way the bubbles label them
+  function previewText(t) {
+    var s = String(t || "").replace(/\n/g, " ")
+    var kinds = { "[audio]": "audio", "[imagen]": "image", "[video]": "video", "[sticker]": "sticker",
+                  "[documento]": "document", "[ubicación]": "ubicación", "[contacto]": "contacto" }
+    return kinds[s] ? root.mediaLabel(kinds[s]) : s
+  }
+
   function formatDuration(ms) {
     if (!ms || ms <= 0) return "0:00"
     var s = Math.floor(ms / 1000)
@@ -1053,8 +1073,8 @@ Item {
 
           // ===== left: chat list =====
           ColumnLayout {
-            Layout.preferredWidth: 340
-            Layout.maximumWidth: 340
+            Layout.preferredWidth: 380  // the five filters fit on one row
+            Layout.maximumWidth: 380
             Layout.fillHeight: true
             spacing: Style.spacing.md
 
@@ -1070,7 +1090,7 @@ Item {
 
             Flow {
               Layout.fillWidth: true
-              spacing: Style.spacing.sm
+              spacing: Style.spacing.xs
               Repeater {
                 model: [ { id: "all", label: "Todos" }, { id: "unread", label: "No leídos" },
                          { id: "trabajo", label: "Trabajo" }, { id: "personal", label: "Personal" },
@@ -1185,8 +1205,9 @@ Item {
                     spacing: Style.spacing.sm
                     Text {
                       textFormat: Text.PlainText
-                      text: String(chatRow.modelData.last_text || "").replace(/\n/g, " ")
-                      color: Color.muted
+                      text: root.previewText(chatRow.modelData.last_text)
+                      color: root.fg
+                      opacity: 0.6
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.bodySmall
                       elide: Text.ElideRight
@@ -1329,8 +1350,16 @@ Item {
                 spacing: Style.spacing.sm
                 verticalLayoutDirection: ListView.BottomToTop
                 boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                ScrollBar.vertical: ScrollBar { id: msgBar; policy: ScrollBar.AsNeeded }
                 model: msgModel
+                // Pinned to the newest message unless the owner scrolled up:
+                // the composer growing, a suggestion appearing or a bubble
+                // re-wrapping would otherwise push the last message off-screen.
+                property bool stick: true
+                onContentYChanged: if (moving || msgBar.pressed) stick = atYEnd
+                onHeightChanged: if (stick) positionViewAtBeginning()
+                onContentHeightChanged: if (stick) positionViewAtBeginning()
+                Connections { target: root; function onCurKeyChanged() { msgList.stick = true } }
                 // Visual top: older messages are paged in from here.
                 readonly property bool atTop: msgList.count > 0
                     && (msgList.visibleArea.heightRatio >= 1 || msgList.visibleArea.yPosition <= 0.001)
@@ -1363,13 +1392,15 @@ Item {
                   readonly property var mstate: root.media[msgRow.messageId] || null
                   readonly property bool isImage: msgRow.atype === "image" || msgRow.atype === "sticker"
                   readonly property bool hasImage: msgRow.isImage && msgRow.mstate !== null && msgRow.mstate.state === "ready"
-                  readonly property bool showText: msgRow.text !== "" && msgRow.text !== "[" + msgRow.atype + "]"
+                  // the backend's placeholder ("[imagen]", "[documento]"...) only repeats the label above
+                  readonly property bool showText: msgRow.text !== "" && !(msgRow.atype !== "" && /^\[[^\]]*\]$/.test(msgRow.text))
                   width: ListView.view.width
                   height: bubble.height
 
                   Rectangle {
                     id: bubble
-                    readonly property real maxW: msgRow.width * 0.72
+                    // capped: on a wide window 72% is ~170 characters a line
+                    readonly property real maxW: Math.min(msgRow.width * 0.72, 640)
                     width: Math.min(maxW, Math.max(bubbleCol.implicitWidth, 80) + Style.spacing.lg * 2)
                     height: bubbleCol.implicitHeight + Style.spacing.md * 2
                     anchors.right: msgRow.fromMe ? parent.right : undefined
@@ -1462,7 +1493,9 @@ Item {
 
                       Text {
                         text: root.shortTime(msgRow.ts)
-                        color: Color.muted
+                        // muted vanished on the owner's (selected) fill
+                        color: root.fg
+                        opacity: 0.6
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         Layout.alignment: Qt.AlignRight
