@@ -1443,14 +1443,19 @@ Item {
                         }
                       }
 
-                      Text {
+                      // TextEdit, not Text: lets the owner select and copy (Ctrl+C) a message
+                      TextEdit {
                         visible: msgRow.showText
-                        textFormat: Text.PlainText
+                        readOnly: true
+                        selectByMouse: true
+                        textFormat: TextEdit.PlainText
                         text: msgRow.text
                         color: root.fg
+                        selectionColor: root.accent
+                        selectedTextColor: root.bg
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
-                        wrapMode: Text.Wrap
+                        wrapMode: TextEdit.Wrap
                         Layout.maximumWidth: bubble.maxW - Style.spacing.lg * 2
                         Layout.fillWidth: true
                       }
