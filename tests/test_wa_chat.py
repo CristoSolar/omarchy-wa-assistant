@@ -54,15 +54,28 @@ def test_chats_list_names_groups_muted_and_unread():
         assert by[DM]["last_text"] == "hola" and by[DM]["last_id"] == 1
 
 
-def _main_db(d, muted=(), contacts=()):
+
+def test_chats_list_says_who_sent_the_last_message():
+    with tmpdir() as d:
+        db = _setup(d)
+        readstate.ensure(d, 0)
+        db.add(DM, "hola", push="Ana"); db.add(DM, "chao", from_me=True, push="Yo")
+        db.add(GROUP, "buenas", sender="56922@s.whatsapp.net", push="Bea")
+        by = {c["jid"]: c for c in _chats(d)}
+        assert by[DM]["last_sender"] == "Tú" and by[DM]["last_text"] == "chao"
+        assert by[GROUP]["last_sender"] == "Bea"
+
+def _main_db(d, muted=(), contacts=(), pinned=()):
     """whatsmeow's store, keyed by the device jid of u1 (personal)."""
     m = sqlite3.connect(d / "main.db")
-    m.execute("CREATE TABLE whatsmeow_chat_settings (our_jid TEXT, chat_jid TEXT, muted_until BIGINT)")
+    m.execute("CREATE TABLE whatsmeow_chat_settings (our_jid TEXT, chat_jid TEXT, muted_until BIGINT,"
+              " pinned BOOLEAN NOT NULL DEFAULT false)")
     m.execute("CREATE TABLE whatsmeow_contacts (our_jid TEXT, their_jid TEXT, first_name TEXT,"
               " full_name TEXT, push_name TEXT, business_name TEXT, redacted_phone TEXT)")
     m.execute("CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT)")
     dev = "56900000001:27@s.whatsapp.net"
-    m.executemany("INSERT INTO whatsmeow_chat_settings VALUES (?, ?, -1)", [(dev, j) for j in muted])
+    m.executemany("INSERT INTO whatsmeow_chat_settings VALUES (?, ?, -1, false)", [(dev, j) for j in muted])
+    m.executemany("INSERT INTO whatsmeow_chat_settings VALUES (?, ?, 0, true)", [(dev, j) for j in pinned])
     m.executemany("INSERT INTO whatsmeow_contacts VALUES (?, ?, '', ?, '', '', '')",
                   [(dev, j, n) for j, n in contacts])
     m.commit(); m.close()
@@ -76,6 +89,17 @@ def test_a_chat_muted_on_the_phone_is_muted_unless_enabled():
         assert {c["jid"]: c["muted"] for c in _chats(d)} == {GROUP: True, DM: False}
         (d / "config.json").write_text(json.dumps({"groups_enabled": [GROUP]}))
         assert {c["jid"]: c["muted"] for c in _chats(d)} == {GROUP: False, DM: False}
+
+
+def test_pinned_chats_come_first_even_without_history():
+    with tmpdir() as d:
+        db = _setup(d)
+        empty = "120363000000000099@g.us"
+        _main_db(d, pinned=[GROUP, empty])
+        db.add(GROUP, "buenas", sender="56922@s.whatsapp.net"); db.add(DM, "hola")
+        cs = _chats(d, get=_get({empty: "Fijado vacío"}))
+        assert [(c["jid"], c["pinned"]) for c in cs] == [(GROUP, True), (empty, True), (DM, False)]
+        assert cs[1]["name"] == "Fijado vacío" and cs[1]["last_text"] == "" and cs[1]["unread"] == 0
 
 
 def test_contacts_lists_the_address_book_of_each_account_by_name():
@@ -446,6 +470,21 @@ def test_members_lists_people_by_name_without_the_owner():
         assert asked == ["/group/info?groupJID=" + GROUP.replace("@", "%40")]
         assert "error" in wc.members(d, d, "personal", DM, lambda *a: info)
         assert "error" in wc.members(d, d, "personal", GROUP, lambda *a: 1 / 0)
+
+
+def test_messages_name_a_sent_files_and_the_quoted_sender():
+    with tmpdir() as d:
+        db = _setup(d)
+        db.c.execute("INSERT INTO message_history (user_id, chat_jid, sender_jid, message_id, timestamp,"
+                     " message_type, text_content, datajson) VALUES ('u1', ?, 'me', 'SENT1', '', 'document', '', '')",
+                     (DM,)); db.c.commit()
+        (d / "sent_files.json").write_text(json.dumps({"SENT1": "guia.pdf"}))
+        msg = {"extendedTextMessage": {"text": "ok", "contextInfo": {
+            "stanzaID": "SENT1", "participant": "x@lid", "quotedMessage": {"conversation": "[documento]"}}}}
+        db.add(DM, "ok", message=msg)
+        sent, reply = wc.messages_page(d, d, "personal", DM)["messages"]
+        assert sent["attachment"]["name"] == "guia.pdf"
+        assert reply["quote"]["sender_name"] == "Tú"
 
 
 if __name__ == "__main__":

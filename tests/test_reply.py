@@ -2005,5 +2005,21 @@ def test_stickers_must_be_webp_and_gifs_must_come_from_giphy_as_mp4():
         assert wa.gif_payload("https://media2.giphy.com/a.mp4", fetch=lambda u, n: mp4)["MimeType"] == "video/mp4"
 
 
+def test_a_sent_file_keeps_its_name_by_message_id():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        (d / "guía final.pdf").write_bytes(b"PDF")
+        original = wa.send_attachment
+        wa.send_attachment = lambda *a: {"code": 200, "data": {"Details": "Sent", "Id": "3EB0AA"}, "success": True}
+        try:
+            with _live():
+                out = _run_chat(wa.cmd_chat_attach, d, **_attach_args(file=str(d / "guía final.pdf")))
+        finally:
+            wa.send_attachment = original
+        assert out == {"ok": True, "dry_run": False}
+        assert json.loads((d / "sent_files.json").read_text()) == {"3EB0AA": "guía final.pdf"}
+
+
 if __name__ == "__main__":
     run(dict(globals()))

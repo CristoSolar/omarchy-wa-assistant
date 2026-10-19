@@ -111,6 +111,10 @@ def test_mentions_show_names_instead_of_numbers():
                               names) == "@Felipe y @Ana: hola"
     assert with_mention_names("sin nada", [], names) == "sin nada"
     assert with_mention_names("@999 no mencionado", ["105@lid"], names) == "@999 no mencionado"
+    # sent from here: no mention list stored, the bare id is still resolved
+    names = {"105189000001@lid": "Felipe", "56911111111@s.whatsapp.net": "Ana"}.get
+    assert with_mention_names("@105189000001 y @56911111111 y @999999999", [], names) \
+        == "@Felipe y @Ana y @999999999"
 
 
 if __name__ == "__main__":

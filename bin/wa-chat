@@ -221,6 +221,8 @@ def list_chats(d, wuzdata, post, get=http_get):
             if uid is None:
                 continue
             muted = contacts.muted_chats(wuzdata, acc["wuzapi_user"], time.time())
+            pinned = contacts.pinned_chats(wuzdata, acc["wuzapi_user"])
+            listed = set()
             for c in history.chats(conn, uid):
                 jid, last = c["jid"], c["last"]
                 group = jid.endswith("@g.us")
@@ -230,11 +232,23 @@ def list_chats(d, wuzdata, post, get=http_get):
                     "account": acc["id"], "label": acc.get("label", acc["id"]), "jid": jid, "name": name,
                     "last_text": contacts.with_mention_names(_text(last), last.get("mentions"),
                                                              _namer(wuzdata, acc["wuzapi_user"])), "last_ts": last["ts"], "last_id": c["last_id"],
+                    "last_sender": "Tú" if last["from_me"] else contacts.display_name(
+                        wuzdata, acc["wuzapi_user"], last["sender"], last["push_name"]),
                     "unread": history.unread_count(conn, uid, jid, readstate.marker(state, acc["id"], jid)),
-                    "group": group, "muted": jid in muted and jid not in enabled})
+                    "group": group, "muted": jid in muted and jid not in enabled, "pinned": jid in pinned})
+                listed.add(jid)
+            # pinned on the phone but nothing in history yet: still listed, like the phone does
+            for jid in sorted(pinned - listed):
+                group = jid.endswith("@g.us")
+                name = (names.get(acc["id"], {}).get(jid) if group else None) or contacts.display_name(
+                    wuzdata, acc["wuzapi_user"], jid, "")
+                out.append({
+                    "account": acc["id"], "label": acc.get("label", acc["id"]), "jid": jid, "name": name,
+                    "last_text": "", "last_sender": "", "last_ts": "", "last_id": 0, "unread": 0,
+                    "group": group, "muted": jid in muted and jid not in enabled, "pinned": True})
     finally:
         conn.close()
-    out.sort(key=lambda c: -c["last_id"])
+    out.sort(key=lambda c: (not c["pinned"], -c["last_id"]))
     return {"chats": out, "offline": offline}
 
 
@@ -246,8 +260,17 @@ def messages_page(d, wuzdata, acc_id, jid, before=None):
     finally:
         conn.close()
     seen, name_of = {}, _namer(wuzdata, acc["wuzapi_user"])
+    # wuzapi keeps no datajson for a file sent through it; bin/wa-reply noted its name
+    sent_names = store.read_json(Path(d) / "sent_files.json", {})
     for m in msgs:
         m["text"] = contacts.with_mention_names(m["text"], m.get("mentions"), name_of)
+        a = m.get("attachment")
+        if a and not a.get("name") and isinstance(sent_names, dict) and m["message_id"] in sent_names:
+            a["name"] = str(sent_names[m["message_id"]])
+        q = m.get("quote")
+        if q:
+            q["sender_name"] = "Tú" if q.get("from_me") else contacts.display_name(
+                wuzdata, acc["wuzapi_user"], q["sender"], "") if q["sender"] else ""
         key = (m["sender"], m["push_name"])
         if m["from_me"]:
             m["sender_name"] = ""

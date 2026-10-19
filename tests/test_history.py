@@ -220,5 +220,37 @@ def test_a_gif_is_its_own_type_and_recent_stickers_skip_repeats():
         assert history.recent_stickers(_conn(d), "u1") == ["M4", "M3"]
 
 
+def test_a_document_keeps_the_senders_file_name_as_a_plain_basename():
+    doc = lambda n: {"documentMessage": {"fileName": n}}
+    assert history._file_name(doc("Salfa_Soporte.xlsx")) == "Salfa_Soporte.xlsx"
+    assert history._file_name(doc("../../.bashrc")) == "bashrc"
+    assert history._file_name(doc("C:\\x\\a\nb.pdf")) == "ab.pdf"
+    assert history._file_name({"imageMessage": {}}) == ""
+
+
+def test_a_reply_carries_the_quoted_message_and_whether_it_was_mine():
+    with tmpdir() as d:
+        db = Db(d)
+        db.add(DM, "", sender="me", datajson="")  # M1: sent through the API, no datajson
+        ctx = lambda mid: {"stanzaID": mid, "participant": DM, "quotedMessage": {"conversation": "la original"}}
+        db.add(DM, "sí", message={"extendedTextMessage": {"text": "sí", "contextInfo": ctx("M1")}})
+        db.add(DM, "", message={"imageMessage": {"caption": "", "contextInfo": ctx("NOPE")}}, mtype="image")
+        msgs, _ = history.messages(_conn(d), "u1", DM)
+        assert msgs[1]["quote"] == {"message_id": "M1", "sender": DM, "text": "la original", "from_me": True}
+        assert msgs[2]["quote"]["from_me"] is False
+        assert "quote" not in msgs[0]
+
+
+def test_a_file_sent_through_the_api_still_shows_as_an_attachment():
+    with tmpdir() as d:
+        db = Db(d)
+        db.add(DM, "la guía", sender="me", mtype="document", datajson="")
+        db.add(DM, "", sender="me", mtype="image", datajson="")
+        db.add(DM, "texto", sender="me", datajson="")
+        a, b, c = history.messages(_conn(d), "u1", DM)[0]
+        assert a["attachment"] == {"type": "document", "downloadable": False} and a["text"] == "la guía"
+        assert b["attachment"]["type"] == "image" and "attachment" not in c
+
+
 if __name__ == "__main__":
     run(dict(globals()))

@@ -1141,10 +1141,30 @@ def cmd_chat_attach(args):
         return
     token = account_token(account)
     entry = _entry(d, eid)
-    out = _deliver(d, eid, args.acknowledged, lambda: send_attachment(kind, args.jid, payload, token),
+    sent = {}
+    out = _deliver(d, eid, args.acknowledged,
+                   lambda: sent.setdefault("r", send_attachment(kind, args.jid, payload, token)),
                    entry_unconfirmed=entry is not None and entry.get("status") in UNCONFIRMED_STATUSES)
-    if out and out.get("ok") and not out.get("dry_run") and entry is not None:
-        store.remove_queue(d, eid)  # answered, like a text reply
+    if out and out.get("ok") and not out.get("dry_run"):
+        if args.kind == "media":
+            _remember_file_name(d, sent.get("r"), Path(args.file).name)
+        if entry is not None:
+            store.remove_queue(d, eid)  # answered, like a text reply
+
+
+def _remember_file_name(d, result, name):
+    """wuzapi stores a file sent through it with no datajson, so the chat
+    would show a nameless document; keep the name by message id."""
+    data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else result
+    mid = (data.get("Id") or data.get("ID")) if isinstance(data, dict) else None
+    if not mid:
+        return
+    path = Path(d) / "sent_files.json"
+    names = store.read_json(path, {})
+    names = names if isinstance(names, dict) else {}
+    names[str(mid)] = name
+    # ponytail: grows by one short entry per file sent; trim when it matters.
+    store.atomic_write(path, json.dumps(names, ensure_ascii=False))
 
 def main():
     ap = argparse.ArgumentParser()

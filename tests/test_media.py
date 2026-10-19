@@ -696,5 +696,13 @@ def test_get_msg_refuses_a_status_post_before_any_network():
             os.environ.pop("WA_WUZAPI_DB", None)
 
 
+def test_office_mimetypes_keep_their_real_extension():
+    x = "application/vnd.openxmlformats-officedocument."
+    assert wm._extension(x + "spreadsheetml.sheet") == ".xlsx"
+    assert wm._extension(x + "presentationml.presentation") == ".pptx"
+    assert wm._extension(x + "wordprocessingml.document") == ".docx"
+    assert wm._extension("application/x-totally-unknown") == ".xtotallyun"
+
+
 if __name__ == "__main__":
     run(globals())

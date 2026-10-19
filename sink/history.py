@@ -36,8 +36,34 @@ _INCOMING = ("sender_jid != 'me' AND CASE WHEN json_valid(datajson)"
              " THEN json_extract(datajson, '$.Info.IsFromMe') END = 0")
 
 
+# Types a row sent through wuzapi's API is stored as, with no datajson: the
+# file went out, but nothing of it is kept to fetch it back.
+SENT_MEDIA = ("image", "video", "document", "audio", "sticker")
+
+
 class SchemaError(Exception):
     """message_history is not the table this module was written against."""
+
+
+def _file_name(message) -> str:
+    """The sender's own file name, reduced to a plain basename: it comes
+    off the wire, so no separators, control chars or leading dots."""
+    doc = message.get("documentMessage") if isinstance(message, dict) else None
+    raw = doc.get("fileName") if isinstance(doc, dict) else None
+    if not isinstance(raw, str):
+        return ""
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name if c.isprintable()).strip().lstrip(".")
+    return name[:200]
+
+
+def _context(message) -> dict | None:
+    """The contextInfo (mentions, quoted message) of whichever kind of
+    message this is: text, caption of a photo, a sticker..."""
+    for inner in (message.values() if isinstance(message, dict) else ()):
+        if isinstance(inner, dict) and isinstance(inner.get("contextInfo"), dict):
+            return inner["contextInfo"]
+    return None
 
 
 def is_chat(jid) -> bool:
@@ -79,8 +105,7 @@ def _decode(row) -> dict | None:
     message = _unwrap(event.get("Message") or {})
     if _is_invisible(message):
         return None
-    ext = message.get("extendedTextMessage") if isinstance(message, dict) else None
-    ctx = ext.get("contextInfo") if isinstance(ext, dict) else None
+    ctx = _context(message)
     msg = {
         "id": rid, "message_id": mid,
         "from_me": sender == "me" or bool(info.get("IsFromMe")),
@@ -90,6 +115,10 @@ def _decode(row) -> dict | None:
         "text": _text_of(message) if message else (text or ""),
         "mentions": list((ctx or {}).get("mentionedJID") or []),
     }
+    quoted = (ctx or {}).get("quotedMessage")
+    if isinstance(quoted, dict):
+        msg["quote"] = {"message_id": str(ctx.get("stanzaID") or ""), "sender": str(ctx.get("participant") or ""),
+                        "text": _text_of(_unwrap(quoted))}
     attachment = _attachment_of(message)
     if attachment:
         atype = attachment["type"]
@@ -97,6 +126,11 @@ def _decode(row) -> dict | None:
         if atype == "video" and isinstance(video, dict) and video.get("gifPlayback"):
             atype = "gif"  # wa-media still fetches it as the video it is
         msg["attachment"] = {"type": atype, "downloadable": attachment["downloadable"]}
+        name = _file_name(message)
+        if name:
+            msg["attachment"]["name"] = name
+    elif not message and mtype in SENT_MEDIA:
+        msg["attachment"] = {"type": mtype, "downloadable": False}
     return msg
 
 
@@ -130,6 +164,15 @@ def messages(conn, uid, jid, before=None, limit=50):
         for m in page:
             if m["message_id"] in found:
                 m["reactions"] = found[m["message_id"]]
+        quoted = [m["quote"]["message_id"] for m in page if m.get("quote")]
+        if quoted:
+            marks = ",".join("?" * len(quoted))
+            mine = {r[0] for r in conn.execute(
+                f"SELECT message_id FROM message_history WHERE user_id = ? AND message_id IN ({marks})"
+                f" AND NOT ({_INCOMING})", (uid, *quoted))}
+            for m in page:
+                if m.get("quote"):
+                    m["quote"]["from_me"] = m["quote"]["message_id"] in mine
     return page, len(rows) == limit
 
 

@@ -710,11 +710,14 @@ Item {
 
   function rowFor(m) {
     var a = m.attachment || null
+    var q = m.quote || null
     return {
       mid: Number(m.id), messageId: String(m.message_id || ""),
       fromMe: m.from_me === true, senderName: String(m.sender_name || m.push_name || ""),
       ts: String(m.ts || ""), text: String(m.text || ""),
       atype: a ? String(a.type || "") : "", adown: a ? a.downloadable === true : false,
+      aname: a ? String(a.name || "") : "",
+      qname: q ? String(q.sender_name || "") : "", qtext: q ? root.previewText(q.text) : "",
       reacts: Array.isArray(m.reactions) ? m.reactions.join(" ") : ""
     }
   }
@@ -852,7 +855,8 @@ Item {
   function previewText(t) {
     var s = String(t || "").replace(/\n/g, " ")
     var kinds = { "[audio]": "audio", "[imagen]": "image", "[video]": "video", "[sticker]": "sticker", "[gif]": "gif",
-                  "[documento]": "document", "[ubicación]": "ubicación", "[contacto]": "contacto" }
+                  "[documento]": "document", "[ubicación]": "ubicación", "[contacto]": "contacto",
+                  "[document]": "document", "[image]": "image" }  // wa-chat labels a captionless sent file by type
     return kinds[s] ? root.mediaLabel(kinds[s]) : s
   }
 
@@ -927,7 +931,7 @@ Item {
 
   // "Guardar como": a copy out of the cache, wherever the owner picks.
   // Nothing is copied unless asked; the cache itself stays where it is.
-  function saveMedia(path, ts) {
+  function saveMedia(path, ts, name) {
     if (saveProc.running) return
     var ext = (String(path).match(/\.[a-z0-9]+$/) || [""])[0]
     var stamp = String(ts).replace("T", " ").slice(0, 19).replace(/:/g, ".")
@@ -935,7 +939,7 @@ Item {
       'd=$(xdg-user-dir DOWNLOAD 2>/dev/null); [ -d "$d" ] || d="$HOME"; ' +
       'f=$(zenity --file-selection --save --confirm-overwrite --title="Guardar adjunto" --filename="$d/$2") || exit 3; ' +
       'cp -- "$1" "$f" && printf %s "$f"',
-      "sh", path, "WhatsApp " + (stamp || "adjunto") + ext]
+      "sh", path, name || ("WhatsApp " + (stamp || "adjunto") + ext)]
     saveProc.running = true
   }
   Process {
@@ -1313,7 +1317,7 @@ Item {
                     Text {
                       textFormat: Text.PlainText
                       text: (chatRow.modelData.kind === "contact" ? "👤 " : chatRow.modelData.kind === "number" ? "✏️ " : "")
-                            + (chatRow.modelData.muted ? "🔕 " : "") + (chatRow.modelData.name || chatRow.modelData.jid)
+                            + (chatRow.modelData.pinned ? "📌 " : "") + (chatRow.modelData.muted ? "🔕 " : "") + (chatRow.modelData.name || chatRow.modelData.jid)
                       color: root.fg
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.subtitle
@@ -1333,7 +1337,8 @@ Item {
                     spacing: Style.spacing.sm
                     Text {
                       textFormat: Text.PlainText
-                      text: root.previewText(chatRow.modelData.last_text)
+                      text: (chatRow.modelData.last_sender && chatRow.modelData.last_text
+                             ? chatRow.modelData.last_sender + ": " : "") + root.previewText(chatRow.modelData.last_text)
                       color: root.fg
                       opacity: 0.6
                       font.family: root.fontFamily
@@ -1517,6 +1522,9 @@ Item {
                   required property string text
                   required property string atype
                   required property bool adown
+                  required property string aname
+                  required property string qname
+                  required property string qtext
                   required property string reacts
                   readonly property var mstate: root.media[msgRow.messageId] || null
                   readonly property bool ready: msgRow.mstate !== null && msgRow.mstate.state === "ready"
@@ -1566,18 +1574,63 @@ Item {
                         elide: Text.ElideRight
                       }
 
+                      // the message this one replies to, as the phone shows it
+                      Rectangle {
+                        visible: msgRow.qtext !== ""
+                        Layout.fillWidth: true
+                        Layout.maximumWidth: bubble.maxW - Style.spacing.lg * 2
+                        implicitWidth: quoteCol.implicitWidth + Style.spacing.md + Style.spacing.sm
+                        implicitHeight: quoteCol.implicitHeight + Style.spacing.sm * 2
+                        radius: 6
+                        color: Qt.alpha(root.fg, 0.08)
+                        Rectangle { width: 3; height: parent.height; radius: 2; color: root.accent }
+                        ColumnLayout {
+                          id: quoteCol
+                          x: Style.spacing.md
+                          y: Style.spacing.sm
+                          width: parent.width - Style.spacing.md - Style.spacing.sm
+                          spacing: 0
+                          Text {
+                            visible: msgRow.qname !== ""
+                            textFormat: Text.PlainText
+                            text: msgRow.qname
+                            color: root.accent
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            font.bold: true
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                          Text {
+                            textFormat: Text.PlainText
+                            text: msgRow.qtext
+                            color: root.fg
+                            opacity: 0.75
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            wrapMode: Text.Wrap
+                            maximumLineCount: 3
+                            elide: Text.ElideRight
+                            Layout.fillWidth: true
+                          }
+                        }
+                      }
+
                       // attachment
                       Text {
                         visible: msgRow.atype !== "" && !msgRow.hasImage && !msgRow.hasGif
                         textFormat: Text.PlainText
-                        text: !msgRow.adown ? root.mediaLabel(msgRow.atype) + " (no disponible)"
+                        // a file sent from here: wuzapi keeps nothing to fetch, but it went out
+                        text: !msgRow.adown && msgRow.fromMe ? root.mediaLabel(msgRow.atype) + (msgRow.aname !== "" ? " · " + msgRow.aname : "") + " · ✓ enviado"
+                              : !msgRow.adown ? root.mediaLabel(msgRow.atype) + " (no disponible)"
                               : (msgRow.mstate && msgRow.mstate.state === "loading") ? root.mediaLabel(msgRow.atype) + " · descargando…"
                               : (msgRow.mstate && msgRow.mstate.state === "error") ? root.mediaLabel(msgRow.atype) + " · ⚠ " + msgRow.mstate.error + " (clic para reintentar)"
                               : (msgRow.atype === "audio" && root.playingId === msgRow.messageId)
                                 ? ((audioPlayer.playbackState === MediaPlayer.PlayingState ? "⏸ " : "▶ ")
                                    + root.formatDuration(audioPlayer.position) + " / " + root.formatDuration(audioPlayer.duration))
                               : (msgRow.atype === "audio" ? "▶ " : "") + root.mediaLabel(msgRow.atype)
-                        color: msgRow.adown ? root.fg : Color.muted
+                                + (msgRow.aname !== "" ? " · " + msgRow.aname : "")
+                        color: msgRow.adown || msgRow.fromMe ? root.fg : Color.muted
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.body
                         font.underline: msgRow.adown && mediaMouse.containsMouse
@@ -1681,7 +1734,7 @@ Item {
                           anchors.fill: parent
                           hoverEnabled: true
                           cursorShape: Qt.PointingHandCursor
-                          onClicked: root.saveMedia(msgRow.mstate.path, msgRow.ts)
+                          onClicked: root.saveMedia(msgRow.mstate.path, msgRow.ts, msgRow.aname)
                         }
                       }
 

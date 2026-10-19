@@ -12,6 +12,7 @@ the name the sender chose (from the event, else as stored), then the phone
 number, then the raw jid. Any failure to read the store falls back to what
 the event said, so a name lookup can never stop a message being queued.
 """
+import re
 import sqlite3
 from pathlib import Path
 
@@ -64,11 +65,8 @@ def our_ids(wuzdata, instance_name: str) -> set:
     return {our} | ({row[0] + "@lid"} if row and row[0] else set())
 
 
-def muted_chats(wuzdata, instance_name: str, now: float) -> set:
-    """Chats the owner muted on the phone (-1 = forever, else Unix seconds).
-
-    Unreadable store -> empty set: a muted chat notifying beats a lost message.
-    """
+def _chats_where(wuzdata, instance_name: str, cond: str, params=()) -> set:
+    """Chat jids whose phone-side settings match cond. Unreadable store -> empty set."""
     try:
         wuzdata = Path(wuzdata)
         our = _our_jid(wuzdata, instance_name)
@@ -76,14 +74,26 @@ def muted_chats(wuzdata, instance_name: str, now: float) -> set:
             return set()
         conn = _ro(wuzdata / "main.db")
         try:
-            rows = conn.execute(
-                f"SELECT chat_jid FROM whatsmeow_chat_settings WHERE {_OWNER}"
-                " AND (muted_until = -1 OR muted_until > ?)", (*_owner(our), int(now))).fetchall()
+            rows = conn.execute(f"SELECT chat_jid FROM whatsmeow_chat_settings WHERE {_OWNER} AND ({cond})",
+                                (*_owner(our), *params)).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
         return set()
     return {r[0] for r in rows}
+
+
+def muted_chats(wuzdata, instance_name: str, now: float) -> set:
+    """Chats the owner muted on the phone (-1 = forever, else Unix seconds).
+
+    Unreadable store -> empty set: a muted chat notifying beats a lost message.
+    """
+    return _chats_where(wuzdata, instance_name, "muted_until = -1 OR muted_until > ?", (int(now),))
+
+
+def pinned_chats(wuzdata, instance_name: str) -> set:
+    """Chats the owner pinned on the phone."""
+    return _chats_where(wuzdata, instance_name, "pinned")
 
 
 def address_book(wuzdata, instance_name: str) -> list:
@@ -107,12 +117,24 @@ def address_book(wuzdata, instance_name: str) -> list:
 
 
 def with_mention_names(text: str, mentions, name_of) -> str:
-    """'@105189… hola' -> '@Ana hola' for each mentioned jid (name_of(jid))."""
+    """'@105189… hola' -> '@Ana hola' for each mentioned jid (name_of(jid)).
+
+    Messages sent from here are stored without their datajson, so their
+    mention list is lost: a bare '@<digits>' is then tried as a lid and as
+    a phone, and replaced only when that resolves to an actual name."""
     for jid in mentions or ():
         user = str(jid).partition("@")[0].split(":")[0]
         if user and "@" + user in text:
             text = text.replace("@" + user, "@" + name_of(jid))
-    return text
+
+    def guess(m):
+        user = m.group(1)
+        for jid in (user + "@lid", user + "@s.whatsapp.net"):
+            name = name_of(jid)
+            if name and name not in (jid, "+" + user):
+                return "@" + name
+        return m.group(0)
+    return re.sub(r"@(\d{6,})\b", guess, text)
 
 
 def display_name(wuzdata, instance_name: str, chat_jid: str, push_name: str) -> str:

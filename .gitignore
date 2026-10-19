@@ -1,3 +1,5 @@
 .superpowers/
 __pycache__/
 *.pyc
+agents/*
+!agents/respuesta.md

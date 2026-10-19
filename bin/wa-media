@@ -29,6 +29,7 @@ import argparse
 import base64
 import hashlib
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -300,6 +301,11 @@ def _extension(mimetype: str) -> str:
     base = (mimetype or "").split(";", 1)[0].strip().lower()
     if base in EXTENSIONS:
         return EXTENSIONS[base]
+    # stdlib's built-in table (Office, zip, csv, ...); its output still
+    # passes the same filter below so CACHE_NAME_RE holds.
+    guessed = mimetypes.guess_extension(base, strict=False) or ""
+    if re.fullmatch(r"\.[a-z0-9]{1,10}", guessed):
+        return guessed
     # Fallback: the subtype, allowlist-filtered to a short, plain token.
     # Never the raw mimetype string — that is also attacker-influenced
     # (it comes from the same event as the jid) and must not reach a
