@@ -196,17 +196,18 @@ servicio solo lee; nunca envía.
   al teléfono el historial viejo no funcionó. El rodeo es desvincular y
   volver a emparejar la cuenta con `days_to_sync_history`, lo que hace que
   WhatsApp vuelque de nuevo lo que tiene.
-- Enviar eventos, notas de voz o stickers; reacciones; editar o borrar
+- Enviar eventos, notas de voz o reacciones; editar o borrar
   mensajes. (wuzapi no tiene cómo enviar eventos.)
 
 ## Requisitos
 
-`docker`, `curl`, `python3` y `claude` (Claude Code) en el `PATH`.
+Omarchy (Linux, Hyprland, omarchy-shell). `docker`, `curl`, `python3` y
+`claude` (Claude Code) en el `PATH`.
 
 ## Instalación
 
 ```sh
-git clone <este repo>
+git clone https://github.com/CristoSolar/omarchy-wa-assistant
 cd omarchy-wa-assistant
 ./install.sh
 ```

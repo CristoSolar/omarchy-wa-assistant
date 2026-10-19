@@ -185,17 +185,18 @@ only reads; it never sends.
   phone for older history did not work. The workaround is to unlink and
   re-pair the account with `days_to_sync_history` set, which makes WhatsApp
   dump what it has again.
-- Sending events, voice notes or stickers; reactions; editing or deleting
+- Sending events, voice notes or reactions; editing or deleting
   messages. (wuzapi has no endpoint for events.)
 
 ## Requirements
 
-`docker`, `curl`, `python3`, and `claude` (Claude Code) on your `PATH`.
+Omarchy (Linux, Hyprland, omarchy-shell). `docker`, `curl`, `python3`, and
+`claude` (Claude Code) on your `PATH`.
 
 ## Install
 
 ```sh
-git clone <this repo>
+git clone https://github.com/CristoSolar/omarchy-wa-assistant
 cd omarchy-wa-assistant
 ./install.sh
 ```
