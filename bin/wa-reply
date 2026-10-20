@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sink import accounts, history, store  # noqa: E402
+from sink import accounts, contacts, history, store  # noqa: E402
 
 API = os.environ.get("WA_API", "http://127.0.0.1:8080")
 AGENTS_DIR = Path(__file__).resolve().parents[1] / "agents"
@@ -414,7 +414,7 @@ def _is_dry_run(result) -> bool:
     return isinstance(result, dict) and bool(result.get("dry_run"))
 
 
-def send(jid: str, text: str, token: str, mentions=()) -> dict:
+def send(jid: str, text: str, token: str, mentions=(), reply=None) -> dict:
     """POST one message. The token is the caller's, already resolved.
 
     `token` is not optional and is never looked up here: cmd_send derives
@@ -444,6 +444,8 @@ def send(jid: str, text: str, token: str, mentions=()) -> dict:
             raise ValueError(f"refusing to mention {m!r}: not a person")
     if mentions and not jid.endswith("@g.us"):
         raise ValueError("mentions only make sense in a group")
+    if reply and not (reply.get("id") and history.is_chat(reply.get("sender") or "")):
+        raise ValueError("a reply needs the quoted message's id and its sender's jid")
     if os.environ.get("WA_DRY_RUN", "1") != "0":
         return {"dry_run": True, "jid": jid, "text": text, "mentions": mentions}
     if not token:
@@ -451,13 +453,21 @@ def send(jid: str, text: str, token: str, mentions=()) -> dict:
     body = {"Phone": jid, "Body": text}
     if mentions:  # the "@<number>" in Body becomes a real mention
         body["ContextInfo"] = {"MentionedJID": mentions}
+    if reply:  # shown on the phone as a reply to that message
+        body.setdefault("ContextInfo", {}).update(StanzaID=reply["id"], Participant=reply["sender"])
+        body["QuotedText"] = reply.get("text") or ""
     return _post(f"{API}/chat/send/text", body, token)
 
 
 def _mentions(args) -> dict:
-    """send()'s mentions kwarg, only when the window passed --mention."""
+    """send()'s mentions/reply kwargs, only when the window passed them."""
+    out = {}
     m = getattr(args, "mention", None)
-    return {"mentions": m} if m else {}
+    if m:
+        out["mentions"] = m
+    if getattr(args, "reply_id", None):
+        out["reply"] = {"id": args.reply_id, "sender": args.reply_sender, "text": args.reply_text or ""}
+    return out
 
 
 def _entry(d, entry_id):
@@ -937,6 +947,18 @@ def _chat_history(d, account_id, jid, limit=0, new=False):
     return account, msgs
 
 
+def _bare_jid(jid):
+    user, _, server = str(jid or "").partition("@")
+    return f"{user.split(':')[0]}@{server}" if server else ""
+
+
+def _reply_sender(account, sender):
+    """The quoted message's author as WhatsApp keys it: no device part, and
+    the owner's own jid for a message of ours (history says only "me")."""
+    sender = _bare_jid(sender)
+    return sender if history.is_chat(sender) else contacts._our_jid(store.wuzdata_dir(), account["wuzapi_user"])
+
+
 def cmd_chat_draft(args):
     d = store.data_dir()
     account, msgs = _chat_history(d, args.account, args.jid, limit=10, new=getattr(args, "new", False))
@@ -964,10 +986,15 @@ def _set_unknown_mark(d, eid, on):
 def cmd_chat_send(args):
     d = store.data_dir()
     account, _ = _chat_history(d, args.account, args.jid, new=getattr(args, "new", False))
+    if getattr(args, "reply_id", None):
+        args.reply_sender = _reply_sender(account, getattr(args, "reply_sender", ""))
     eid = store.entry_id(account["id"], args.jid)
     if _entry(d, eid) is not None:
         # Queue bookkeeping and the "unknown outcome" guard live in cmd_send.
         return cmd_send(argparse.Namespace(id=eid, text=args.text, mention=getattr(args, "mention", None),
+                                           reply_id=getattr(args, "reply_id", None),
+                                           reply_sender=getattr(args, "reply_sender", None),
+                                           reply_text=getattr(args, "reply_text", None),
                                            acknowledged=args.acknowledged))
     token = account_token(account)
     _deliver(d, eid, getattr(args, "acknowledged", False),
@@ -1166,6 +1193,47 @@ def _remember_file_name(d, result, name):
     # ponytail: grows by one short entry per file sent; trim when it matters.
     store.atomic_write(path, json.dumps(names, ensure_ascii=False))
 
+REACTIONS = "sent_reactions.json"
+
+
+def cmd_chat_react(args):
+    """React to one message of a chat with an emoji.
+
+    No double-send guard: a reaction replaces the owner's previous one on
+    that message, so sending it twice changes nothing. wuzapi keeps no
+    history row for it, so the emoji is noted by message id for the window.
+    """
+    d = store.data_dir()
+    account, _ = _chat_history(d, args.account, args.jid)
+    emoji = (args.emoji or "").strip()
+    if not emoji or len(emoji) > 16 or not re.fullmatch(r"[A-Za-z0-9]{6,64}", args.id or ""):
+        print(json.dumps({"ok": False, "error": "falta el emoji o el id del mensaje"}, ensure_ascii=False))
+        return
+    if not API.startswith("http://127.0.0.1:"):
+        raise ValueError(f"refusing to send: WA_API must stay on 127.0.0.1, got {API!r}")
+    token = account_token(account)
+    if os.environ.get("WA_DRY_RUN", "1") != "0":
+        print(json.dumps({"ok": True, "dry_run": True}, ensure_ascii=False))
+        return
+    # ponytail: no Participant in wuzapi's react body; a group reaction keys the message by id alone.
+    body = {"Phone": args.jid, "Body": emoji, "Id": ("me:" if args.from_me else "") + args.id}
+    try:
+        result = _post(f"{API}/chat/react", body, token)
+    except (SendFailed, SendOutcomeUnknown, urllib.error.HTTPError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return
+    if not _is_confirmed_sent(result):
+        print(json.dumps({"ok": False, "error": json.dumps(result, ensure_ascii=False)}, ensure_ascii=False))
+        return
+    path = Path(d) / REACTIONS
+    mine = store.read_json(path, {})
+    mine = mine if isinstance(mine, dict) else {}
+    mine[args.id] = emoji
+    # ponytail: one short entry per message reacted to; trim when it matters.
+    store.atomic_write(path, json.dumps(mine, ensure_ascii=False))
+    print(json.dumps({"ok": True, "dry_run": False}, ensure_ascii=False))
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1204,7 +1272,14 @@ def main():
     p.add_argument("--acknowledged", action="store_true")
     p.add_argument("--new", action="store_true", help="a chat the owner starts: no history needed")
     p.add_argument("--mention", action="append", help="a group member's jid, whose @number is in the text")
+    p.add_argument("--reply-id", help="message_id this text replies to")
+    p.add_argument("--reply-sender", default="", help="that message's sender jid (empty: one of ours)")
+    p.add_argument("--reply-text", default="", help="that message's text, for the quote preview")
     p.set_defaults(fn=cmd_chat_send)
+    p = sub.add_parser("chat-react"); p.add_argument("account"); p.add_argument("jid")
+    p.add_argument("--id", required=True); p.add_argument("--emoji", required=True)
+    p.add_argument("--from-me", action="store_true", help="the message is one of ours")
+    p.set_defaults(fn=cmd_chat_react)
     p = sub.add_parser("chat-attach"); p.add_argument("account"); p.add_argument("jid")
     p.add_argument("--kind", required=True, choices=["media", "sticker", "gif", "location", "contact", "poll"])
     p.add_argument("--file"); p.add_argument("--caption"); p.add_argument("--url")

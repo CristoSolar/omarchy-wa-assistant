@@ -658,6 +658,8 @@ Item {
     root.attachQueue = []
     root.attachAckArgs = null
     root.mediaQueue = []
+    root.replyTo = null
+    root.reactingId = ""
     root.loadMembers()
     root.fetchMessages(0)
     if (root.curExplicit) root.markRead(c, true)
@@ -713,7 +715,8 @@ Item {
     var q = m.quote || null
     return {
       mid: Number(m.id), messageId: String(m.message_id || ""),
-      fromMe: m.from_me === true, senderName: String(m.sender_name || m.push_name || ""),
+      fromMe: m.from_me === true, sender: String(m.sender || ""),
+      senderName: String(m.sender_name || m.push_name || ""),
       ts: String(m.ts || ""), text: String(m.text || ""),
       atype: a ? String(a.type || "") : "", adown: a ? a.downloadable === true : false,
       aname: a ? String(a.name || "") : "",
@@ -1010,6 +1013,8 @@ Item {
     var wm = root.withMentions(text)
     var cmd = [root.pluginDir + "bin/wa-reply", "chat-send", root.curAcc, root.curJid, "--text=" + wm[0]]
     for (var i = 0; i < wm[1].length; i++) cmd.push("--mention=" + wm[1][i])
+    var rt = root.replyTo
+    if (rt) cmd.push("--reply-id=" + rt.id, "--reply-sender=" + rt.sender, "--reply-text=" + rt.text)
     if (acknowledged) cmd.push("--acknowledged")
     if (root.curNew) cmd.push("--new")
     sendProc.command = cmd
@@ -1043,6 +1048,7 @@ Item {
       root.statusWarn = true
     } else if (r && r.ok) {
       if (composer.text === text) composer.text = ""
+      root.replyTo = null
       root.status = ""
       root.fetchMessages(0)
     } else if (r && r.needs_ack) {
@@ -1056,6 +1062,44 @@ Item {
       root.failedText = text
       root.status = "No salió: " + (r.error || "error desconocido")
       root.statusWarn = true
+    }
+  }
+
+  // ---- reply and react ----------------------------------------------------
+  // Hovering a bubble offers ↩ (the next text goes out as a reply to it,
+  // as on the phone) and 😊 (a reaction; the owner's replaces the last one).
+  // {id, sender, name, text}; sender "" = one of ours, wa-reply knows our jid
+  property var replyTo: null
+  property string reactingId: ""
+  readonly property var reactEmojis: ["👍", "❤️", "😂", "😮", "😢", "🙏"]
+
+  function startReply(row) {
+    root.replyTo = { id: row.messageId, sender: row.fromMe ? "" : row.sender,
+                     name: row.fromMe ? "Tú" : (row.senderName || root.curName),
+                     text: row.showText ? row.text : (row.atype !== "" ? root.mediaLabel(row.atype) : row.text) }
+    root.reactingId = ""
+    composer.forceActiveFocus()
+  }
+  function react(row, emoji) {
+    root.reactingId = ""
+    if (reactProc.running || !row.messageId) return
+    reactProc.key = root.curKey
+    reactProc.command = [root.pluginDir + "bin/wa-reply", "chat-react", root.curAcc, root.curJid,
+                         "--id=" + row.messageId, "--emoji=" + emoji].concat(row.fromMe ? ["--from-me"] : [])
+    reactProc.running = true
+  }
+  Process {
+    id: reactProc
+    property string key: ""
+    stdout: StdioCollector {
+      onStreamFinished: {
+        if (reactProc.key !== root.curKey) return
+        var r = null
+        try { r = JSON.parse(text) } catch (e) { r = null }
+        if (r && r.ok && !r.dry_run) { root.fetchMessages(0); return }
+        root.status = r && r.dry_run ? "DRY RUN: no se envió nada." : "La reacción no salió: " + ((r && r.error) || "sin respuesta")
+        root.statusWarn = true
+      }
     }
   }
 
@@ -1517,6 +1561,7 @@ Item {
                   required property int mid
                   required property string messageId
                   required property bool fromMe
+                  required property string sender
                   required property string senderName
                   required property string ts
                   required property string text
@@ -1539,6 +1584,37 @@ Item {
                   readonly property bool showText: msgRow.text !== "" && !(msgRow.atype !== "" && /^\[[^\]]*\]$/.test(msgRow.text))
                   width: ListView.view.width
                   height: bubble.height
+                  HoverHandler { id: rowHover }
+
+                  // ↩ reply · 😊 react, beside the bubble while hovered
+                  Row {
+                    visible: msgRow.messageId !== "" && !root.curNew
+                             && (rowHover.hovered || root.reactingId === msgRow.messageId)
+                    anchors.verticalCenter: bubble.verticalCenter
+                    anchors.right: msgRow.fromMe ? bubble.left : undefined
+                    anchors.left: msgRow.fromMe ? undefined : bubble.right
+                    anchors.leftMargin: Style.spacing.sm
+                    anchors.rightMargin: Style.spacing.sm
+                    spacing: Style.spacing.xxs
+                    Repeater {
+                      model: root.reactingId === msgRow.messageId ? root.reactEmojis : ["↩", "😊"]
+                      delegate: Button {
+                        required property string modelData
+                        radius: root.round
+                        text: modelData
+                        tooltipText: modelData === "↩" ? "Responder" : modelData === "😊" && root.reactingId !== msgRow.messageId ? "Reaccionar" : ""
+                        foreground: root.fg
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.bodySmall
+                        enabled: !root.sending && !root.drafting && !reactProc.running
+                        onClicked: {
+                          if (root.reactingId === msgRow.messageId) root.react(msgRow, modelData)
+                          else if (modelData === "↩") root.startReply(msgRow)
+                          else root.reactingId = msgRow.messageId
+                        }
+                      }
+                    }
+                  }
 
                   Rectangle {
                     id: bubble
@@ -2187,6 +2263,54 @@ Item {
                 }
               }
 
+              // -- replying to --
+              Rectangle {
+                visible: root.replyTo !== null
+                Layout.fillWidth: true
+                implicitHeight: replyRow.implicitHeight + Style.spacing.sm * 2
+                radius: root.round
+                color: Qt.alpha(root.fg, 0.08)
+                Rectangle { width: 3; height: parent.height; radius: 2; color: root.accent }
+                RowLayout {
+                  id: replyRow
+                  anchors.left: parent.left; anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.spacing.md; anchors.rightMargin: Style.spacing.sm
+                  ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "↩ " + (root.replyTo ? root.replyTo.name : "")
+                      color: root.accent
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      elide: Text.ElideRight
+                      Layout.fillWidth: true
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      text: root.replyTo ? root.previewText(root.replyTo.text) : ""
+                      color: root.fg
+                      opacity: 0.75
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                      elide: Text.ElideRight
+                      Layout.fillWidth: true
+                    }
+                  }
+                  Button {
+                    radius: root.round
+                    text: "✕"
+                    tooltipText: "No responder a ese mensaje (Esc)"
+                    foreground: root.fg; fontFamily: root.fontFamily; fontSize: Style.font.bodySmall
+                    enabled: !root.sending
+                    onClicked: root.replyTo = null
+                  }
+                }
+              }
+
               // -- composer --
               Rectangle {
                 Layout.fillWidth: true
@@ -2226,6 +2350,7 @@ Item {
                           return
                         }
                       }
+                      if (event.key === Qt.Key_Escape && root.replyTo && !root.sending) { root.replyTo = null; event.accepted = true; return }
                       if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
                       if (event.modifiers & Qt.ShiftModifier) return  // newline
                       event.accepted = true

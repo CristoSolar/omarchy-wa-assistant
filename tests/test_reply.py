@@ -2021,5 +2021,49 @@ def test_a_sent_file_keeps_its_name_by_message_id():
         assert json.loads((d / "sent_files.json").read_text()) == {"3EB0AA": "guía final.pdf"}
 
 
+def test_a_reply_quotes_its_message_and_one_of_ours_names_our_jid():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        posted = []
+        original = wa._post
+        wa._post = lambda url, body, token, **k: posted.append(body) or {"data": {"Details": "Sent"}}
+        try:
+            with _live():
+                out = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="sí", acknowledged=False,
+                                reply_id="M1", reply_sender="569111:4@s.whatsapp.net", reply_text="hola")
+                mine = _run_chat(wa.cmd_chat_send, d, account="personal", jid=DM, text="y?", acknowledged=False,
+                                 reply_id="M9", reply_sender="", reply_text="")
+        finally:
+            wa._post = original
+        assert out == mine == {"ok": True, "dry_run": False}
+        assert posted[0] == {"Phone": DM, "Body": "sí", "QuotedText": "hola",
+                             "ContextInfo": {"StanzaID": "M1", "Participant": "569111@s.whatsapp.net"}}
+        assert posted[1]["ContextInfo"] == {"StanzaID": "M9", "Participant": "56900000001@s.whatsapp.net"}
+
+
+def test_a_reaction_goes_to_chat_react_and_is_remembered_for_the_window():
+    with tmpdir() as d:
+        db = _chat_env(d)
+        db.add(DM, "hola")
+        posted = []
+        original = wa._post
+        wa._post = lambda url, body, token, **k: posted.append((url, body)) or {"data": {"Details": "Sent"}}
+        try:
+            dry = _run_chat(wa.cmd_chat_react, d, account="personal", jid=DM, id="3EB0AA11", emoji="👍", from_me=False)
+            with _live():
+                out = _run_chat(wa.cmd_chat_react, d, account="personal", jid=DM, id="3EB0AA11", emoji="❤️", from_me=False)
+                _run_chat(wa.cmd_chat_react, d, account="personal", jid=DM, id="3EB0BB22", emoji="😂", from_me=True)
+                bad = _run_chat(wa.cmd_chat_react, d, account="personal", jid=DM, id="x' OR 1", emoji="😂", from_me=False)
+        finally:
+            wa._post = original
+        assert dry == {"ok": True, "dry_run": True} and out == {"ok": True, "dry_run": False}
+        assert bad["ok"] is False
+        assert [b for _, b in posted] == [{"Phone": DM, "Body": "❤️", "Id": "3EB0AA11"},
+                                          {"Phone": DM, "Body": "😂", "Id": "me:3EB0BB22"}]
+        assert posted[0][0].endswith("/chat/react")
+        assert json.loads((d / "sent_reactions.json").read_text()) == {"3EB0AA11": "❤️", "3EB0BB22": "😂"}
+
+
 if __name__ == "__main__":
     run(dict(globals()))

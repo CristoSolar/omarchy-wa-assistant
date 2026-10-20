@@ -254,9 +254,11 @@ def list_chats(d, wuzdata, post, get=http_get):
 
 def messages_page(d, wuzdata, acc_id, jid, before=None):
     acc = _account(d, acc_id)
+    mine = store.read_json(Path(d) / "sent_reactions.json", {})  # bin/wa-reply chat-react
     conn = history.connect(wuzdata)
     try:
-        msgs, more = history.messages(conn, history.user_ids(conn)[acc["wuzapi_user"]], jid, before=before)
+        msgs, more = history.messages(conn, history.user_ids(conn)[acc["wuzapi_user"]], jid, before=before,
+                                      mine=mine if isinstance(mine, dict) else {})
     finally:
         conn.close()
     seen, name_of = {}, _namer(wuzdata, acc["wuzapi_user"])

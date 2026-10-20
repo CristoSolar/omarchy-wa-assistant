@@ -152,15 +152,16 @@ def chats(conn, uid) -> list:
     return out
 
 
-def messages(conn, uid, jid, before=None, limit=50):
-    """One page, oldest first, plus whether older rows exist."""
+def messages(conn, uid, jid, before=None, limit=50, mine=None):
+    """One page, oldest first, plus whether older rows exist.
+    mine: {message_id: emoji} the owner reacted with through wuzapi, which keeps no row for it."""
     rows = conn.execute(f"{_SELECT} WHERE user_id = ? AND chat_jid = ? AND id < ? ORDER BY id DESC LIMIT ?",
                         (uid, jid, before if before is not None else 2**62, limit)).fetchall()
     # ponytail: `limit` counts hidden rows too, so a page can come back short;
     # `more` still says whether to ask for the next one.
     page = _decoded(reversed(rows))
     if page:
-        found = reactions(conn, uid, jid)
+        found = reactions(conn, uid, jid, mine)
         for m in page:
             if m["message_id"] in found:
                 m["reactions"] = found[m["message_id"]]
@@ -176,7 +177,7 @@ def messages(conn, uid, jid, before=None, limit=50):
     return page, len(rows) == limit
 
 
-def reactions(conn, uid, jid) -> dict:
+def reactions(conn, uid, jid, mine=None) -> dict:
     """target message_id -> its emojis, one per reactor, in arrival order.
     A reactor's newer reaction replaces the older; an empty one takes it back."""
     # ponytail: scans the chat's every reaction per page; index by target if a chat gets huge.
@@ -198,6 +199,11 @@ def reactions(conn, uid, jid) -> dict:
         reactors.pop(who, None)
         if r.get("text"):
             reactors[who] = r["text"]
+    # ponytail: one sent from the window always wins over one made on the phone, even an older one
+    for target, emoji in (mine or {}).items():
+        reactors = by_target.setdefault(target, {})
+        reactors.pop("me", None)
+        reactors["me"] = emoji
     return {t: list(v.values()) for t, v in by_target.items() if v}
 
 

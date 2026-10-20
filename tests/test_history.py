@@ -207,6 +207,9 @@ def test_reactions_attach_to_their_message_newest_per_person_and_can_be_taken_ba
         react("a@s.whatsapp.net", "❤️"); react("b@s.whatsapp.net", "")
         (m,), _ = history.messages(_conn(d), "u1", DM)
         assert m["reactions"] == ["❤️"]
+        react("me", "😢")  # one of ours, then one sent from the window replaces it
+        (m,), _ = history.messages(_conn(d), "u1", DM, mine={"M1": "🙏"})
+        assert m["reactions"] == ["❤️", "🙏"]
 
 
 def test_a_gif_is_its_own_type_and_recent_stickers_skip_repeats():
