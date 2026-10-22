@@ -261,6 +261,35 @@ Item {
       }
     }
   }
+  // Ctrl+V with a file or an image on the clipboard (a screenshot, "copy
+  // image", files copied in the file manager) attaches it like 📎 does;
+  // plain text pastes as always. An image is saved under pasted/ first.
+  function pasteClipboard() {
+    if (clipProc.running) return
+    clipProc.command = ["sh", "-c",
+      't=$(wl-paste --list-types 2>/dev/null) || exit 0; ' +
+      'if printf "%s\\n" "$t" | grep -qx text/uri-list; then wl-paste --no-newline --type text/uri-list; exit 0; fi; ' +
+      'printf "%s\\n" "$t" | grep -q "^text/plain" && exit 0; ' +
+      'img=$(printf "%s\\n" "$t" | grep -m1 "^image/") || exit 0; ' +
+      'mkdir -p -m 700 "$1" && f="$1/Captura $(date +%Y-%m-%d\\ %H.%M.%S).${img#image/}" && ' +
+      'wl-paste --type "$img" > "$f" && printf "file://%s" "$f"',
+      // ponytail: pasted/ keeps every pasted image; clean it when it grows
+      "sh", root.stateRoot + "/pasted"]
+    clipProc.running = true
+  }
+  Process {
+    id: clipProc
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var files = String(text).split(/\r?\n/).filter(function(u) { return u.indexOf("file://") === 0 })
+          .map(function(u) { try { return decodeURIComponent(u.slice(7)) } catch (e) { return u.slice(7) } })
+        if (files.length === 0) { composer.paste(); return }
+        root.attachFiles = (root.attachMode === "media" ? root.attachFiles : []).concat(files)
+        root.attachMode = "media"
+        root.status = ""
+      }
+    }
+  }
   function parseLatLon(t) {
     var m = String(t).match(/(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)/)
     return m ? [m[1], m[2]] : null
@@ -2349,6 +2378,11 @@ Item {
                           event.accepted = true
                           return
                         }
+                      }
+                      if (event.matches(StandardKey.Paste)) {
+                        event.accepted = true
+                        if (!root.sending && !root.drafting) root.pasteClipboard()
+                        return
                       }
                       if (event.key === Qt.Key_Escape && root.replyTo && !root.sending) { root.replyTo = null; event.accepted = true; return }
                       if (event.key !== Qt.Key_Return && event.key !== Qt.Key_Enter) return
