@@ -767,7 +767,7 @@ def cmd_quick_set(args):
 
 def run_claude(prompt) -> dict:
     try:
-        out = subprocess.run(["claude", "-p", prompt], capture_output=True,
+        out = subprocess.run(["claude", "--allowedTools", "WebSearch", "-p", prompt], capture_output=True,
                              text=True, timeout=120)
         if out.returncode != 0:
             draft, error = "", (out.stderr or "claude failed").strip()

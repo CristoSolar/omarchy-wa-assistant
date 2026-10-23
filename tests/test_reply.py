@@ -1667,7 +1667,7 @@ def test_chat_draft_builds_the_prompt_from_the_last_ten_with_yo_for_mine():
             db.add(DM, f"m{i}", from_me=(i == 11))
         prompts = []
         original = wa.subprocess.run
-        wa.subprocess.run = lambda cmd, **k: prompts.append(cmd[2]) or SimpleNamespace(
+        wa.subprocess.run = lambda cmd, **k: prompts.append(cmd[-1]) or SimpleNamespace(
             returncode=0, stdout="```\nlisto\n```", stderr="")
         try:
             out = _run_chat(wa.cmd_chat_draft, d, account="personal", jid=DM, idea="decile si")
